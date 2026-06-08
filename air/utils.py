@@ -3,7 +3,7 @@
 # MAGIC %md
 # MAGIC # AIR fraud fine-tuning utilities
 # MAGIC
-# MAGIC Shared setup and data helpers for the fraud fine-tuning notebook. The training notebook loads this file with `%run ./utils` so configuration loading, prompt construction, dataset writing, and Spark naming are defined in the notebook session.
+# MAGIC Shared setup and data helpers for the fraud fine-tuning notebook. The training notebook loads this file with `%run ./utils` so configuration loading, prompt construction, and Spark naming are defined in the notebook session.
 
 # COMMAND ----------
 
@@ -159,8 +159,3 @@ def make_chat_record(row: pd.Series, suspicious_amount_threshold: float) -> dict
         },
     }
 
-
-def write_jsonl(records: list[dict[str, object]], path: str) -> None:
-    with open(path, "w", encoding="utf-8") as dataset_file:
-        for record in records:
-            dataset_file.write(json.dumps(record, ensure_ascii=True) + "\n")
