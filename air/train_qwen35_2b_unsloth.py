@@ -58,7 +58,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -r ../requirements.txt
+# MAGIC %pip install -r requirements.txt
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -257,6 +257,8 @@ print(f"Ready: {volume_q}")
 # MAGIC The live demo should show the table summary before fine-tuning to anchor the business problem: many credit-card transactions, rare fraud labels, and a need for a real-time decision.
 
 # COMMAND ----------
+
+source_table_q = full_name(UC_CATALOG, UC_SCHEMA, SOURCE_TABLE_NAME)
 
 summary_sql = f"""
 SELECT
@@ -478,6 +480,7 @@ display(pd.DataFrame([scale_config]))
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 21
 from contextlib import contextmanager
 
 
@@ -511,8 +514,8 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
     import mlflow
     import torch
     from datasets import load_dataset
-    from transformers import DataCollatorForSeq2Seq, TrainingArguments
-    from trl import SFTTrainer
+    from transformers import DataCollatorForSeq2Seq
+    from trl import SFTTrainer, SFTConfig
     from unsloth import FastLanguageModel, is_bfloat16_supported
     from unsloth.chat_templates import train_on_responses_only
 
@@ -575,7 +578,7 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
         peft_kwargs.pop("max_seq_length", None)
         model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
 
-    training_args = TrainingArguments(
+    training_args = SFTConfig(
         per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         warmup_steps=5,
@@ -593,17 +596,17 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
         run_name=RUN_NAME,
         save_strategy="steps",
         save_steps=max(5, MAX_STEPS // 2),
+        dataset_text_field="text",
+        max_seq_length=MAX_SEQ_LENGTH,
+        dataset_num_proc=1,
+        packing=False,
     )
 
     trainer = SFTTrainer(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         train_dataset=dataset,
-        dataset_text_field="text",
-        max_seq_length=MAX_SEQ_LENGTH,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
-        dataset_num_proc=1,
-        packing=False,
         args=training_args,
     )
 

@@ -19,6 +19,7 @@ peft>=0.19.1
 safetensors>=0.5.0
 transformers>=5.0.0
 trl>=0.24.0
-unsloth[cu126-torch270]>=2026.4.6
+unsloth
 unsloth_zoo>=2026.4.8
+torchao>=0.16.0
 xformers>=0.0.31.post1
