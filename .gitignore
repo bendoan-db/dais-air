@@ -1,0 +1,29 @@
+.DS_Store
+
+# Databricks local bundle artifacts
+.databricks/
+.databricks-resources.json
+
+# AI dev kit / local agent artifacts
+.ai-dev-kit/
+.agents/
+.claude/
+.codex/
+.mcp.json
+
+# Demo script artifacts
+demo_script/
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.ipynb_checkpoints/
+
+# General local caches
+.cache/
