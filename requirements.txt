@@ -1,0 +1,24 @@
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+# Shared notebook/runtime utilities.
+pyyaml>=6.0.2
+pandas>=2.2.0
+
+# Databricks data access, experiment tracking, and model registration.
+databricks-connect>=17.0.0
+databricks-sdk>=0.50.0
+mlflow>=3.7.0
+
+# Hugging Face and Unsloth fine-tuning stack.
+accelerate>=1.11.0
+bitsandbytes>=0.46.0
+datasets>=3.6.0
+einops>=0.8.1
+hf_transfer>=0.1.9
+peft>=0.19.1
+safetensors>=0.5.0
+transformers>=5.0.0
+trl>=0.24.0
+unsloth[cu126-torch270]>=2026.4.6
+unsloth_zoo>=2026.4.8
+xformers>=0.0.31.post1

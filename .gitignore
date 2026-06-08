@@ -24,6 +24,8 @@ __pycache__/
 .mypy_cache/
 .pyre/
 .ipynb_checkpoints/
+.vscode/
+.github/
 
 # General local caches
 .cache/

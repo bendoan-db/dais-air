@@ -1,0 +1,8 @@
+catalog: doan
+schema: air_dais
+table: fraud_dataset
+staging_volume: setup_assets
+dataset_name: tabformer_credit_card
+source_url: https://github.com/IBM/TabFormer/raw/main/data/credit_card/transactions.tgz
+archive_filename: transactions.tgz
+force_download: false
