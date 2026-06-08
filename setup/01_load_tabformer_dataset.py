@@ -1,8 +1,12 @@
 # Databricks notebook source
 # DBTITLE 1,Load IBM TabFormer Credit Card Dataset
-# This notebook is intended to run on Databricks serverless compute.
-# It stages the TabFormer transactions archive in a Unity Catalog volume,
-# then overwrites the configured Delta table with the extracted transactions.
+# MAGIC %md
+# MAGIC # Load and prepare IBM TabFormer credit-card transactions
+# MAGIC
+# MAGIC This setup notebook downloads the IBM TabFormer credit-card dataset, stages it in a Unity Catalog volume, and overwrites the configured Delta table.
+# MAGIC
+# MAGIC The table is prepared for the AIR fine-tuning notebook by standardizing column names, casting core fields, creating `transaction_ts`, and adding reusable prompt-ready fields such as `amount_usd`, `*_text`, `errors_text`, `has_error_signal`, and `fraud_label`.
+# MAGIC Moving these cleaning steps into ingestion keeps training focused on dataset sampling, prompt assembly, and model fine-tuning.
 
 # COMMAND ----------
 
@@ -301,23 +305,105 @@ if {"year", "month", "day", "time"}.issubset(set(df.columns)):
         ),
     )
 
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Prepare training-ready transaction fields
+# MAGIC
+# MAGIC The training notebook consumes a stable set of cleaned fields from the Delta table instead of applying row-by-row Pandas cleanup.
+# MAGIC These fields preserve the raw columns while providing defaults and consistent text formatting for prompt construction.
+
+# COMMAND ----------
+
+
+def text_value(column_name: str, default: str = "unknown"):
+    value = F.trim(F.col(column_name).cast("string"))
+    return (
+        F.when(F.col(column_name).isNull(), F.lit(default))
+        .when(F.length(value) == 0, F.lit(default))
+        .when(F.lower(value).isin("nan", "none", "null"), F.lit(default))
+        .otherwise(value)
+    )
+
+
+if "amount" in df.columns:
+    df = df.withColumn("amount_usd", F.coalesce(F.col("amount").cast("double"), F.lit(0.0)))
+else:
+    df = df.withColumn("amount_usd", F.lit(0.0))
+
+if "transaction_ts" in df.columns:
+    df = df.withColumn(
+        "transaction_ts_text",
+        F.coalesce(
+            F.date_format(F.col("transaction_ts"), "yyyy-MM-dd HH:mm:ss"),
+            F.lit("unknown"),
+        ),
+    )
+else:
+    df = df.withColumn("transaction_ts_text", F.lit("unknown"))
+
+text_columns = {
+    "user_id": "unknown",
+    "card_id": "unknown",
+    "use_chip": "unknown",
+    "merchant_city": "unknown",
+    "merchant_state": "unknown",
+    "mcc": "unknown",
+}
+for source_column, default_value in text_columns.items():
+    if source_column in df.columns:
+        df = df.withColumn(f"{source_column}_text", text_value(source_column, default_value))
+    else:
+        df = df.withColumn(f"{source_column}_text", F.lit(default_value))
+
+if "errors" in df.columns:
+    df = df.withColumn("errors_text", text_value("errors", "none"))
+else:
+    df = df.withColumn("errors_text", F.lit("none"))
+
+df = df.withColumn(
+    "has_error_signal",
+    ~F.lower(F.col("errors_text")).isin("none", "unknown", "nan", ""),
+)
+
+if "is_fraud" in df.columns:
+    df = df.withColumn("is_fraud", F.coalesce(F.col("is_fraud").cast("int"), F.lit(0)))
+else:
+    df = df.withColumn("is_fraud", F.lit(0))
+
+df = df.withColumn(
+    "fraud_label",
+    F.when(F.col("is_fraud") == 1, F.lit("fraud")).otherwise(F.lit("non_fraud")),
+)
+
 preferred_order = [
     "user_id",
+    "user_id_text",
     "card_id",
+    "card_id_text",
     "year",
     "month",
     "day",
     "time",
     "transaction_ts",
+    "transaction_ts_text",
     "amount",
+    "amount_usd",
     "use_chip",
+    "use_chip_text",
     "merchant_name",
     "merchant_city",
+    "merchant_city_text",
     "merchant_state",
+    "merchant_state_text",
     "zip_code",
     "mcc",
+    "mcc_text",
     "errors",
+    "errors_text",
+    "has_error_signal",
     "is_fraud",
+    "fraud_label",
 ]
 ordered_columns = [column_name for column_name in preferred_order if column_name in df.columns]
 ordered_columns.extend(column_name for column_name in df.columns if column_name not in ordered_columns)

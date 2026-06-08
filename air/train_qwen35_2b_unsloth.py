@@ -1,20 +1,26 @@
 # Databricks notebook source
-# DBTITLE 1,AIR DAIS demo - Qwen3.5 2B fraud fine-tuning with Unsloth
+# DBTITLE 1,AI Runtime fraud fine-tuning with Qwen3.5 2B and Unsloth
 # MAGIC %md
-# MAGIC # AIR DAIS demo: Qwen3.5 2B fraud fine-tuning with Unsloth
+# MAGIC # Fine-tune Qwen3.5 2B for fraud decisions with AI Runtime
 # MAGIC
-# MAGIC This notebook follows the demo story in `demo_script/AIR DAIS Demo Script (go_air-dais-demo).pdf`:
+# MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime.
+# MAGIC It is designed to stand alone for an external technical audience: each section explains what is happening, why it matters, and how the step contributes to a production AI workflow.
 # MAGIC
-# MAGIC 1. Start with the fraud-detection business problem.
-# MAGIC 2. Attach to AI Runtime serverless GPU compute.
-# MAGIC 3. Validate the workload on a single GPU.
-# MAGIC 4. Scale the training path by changing one demo integer.
-# MAGIC 5. Use Genie Code guidance to tune throughput.
-# MAGIC 6. Register the trained model for production serving and autoscaling.
+# MAGIC The workflow uses the IBM TabFormer credit-card dataset loaded and prepared by `setup/01_load_tabformer_dataset.py`.
+# MAGIC The setup table provides cleaned prompt-ready transaction fields. This notebook samples those rows, converts them into supervised chat examples, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
+# MAGIC
+# MAGIC **AI Runtime value drivers demonstrated in this notebook**
+# MAGIC
+# MAGIC - **On-demand GPU access:** run deep learning workloads on serverless GPU compute without provisioning or maintaining GPU clusters.
+# MAGIC - **Managed AI environment:** use the AI Runtime base environment with common model-training libraries already available.
+# MAGIC - **Unified data and governance:** read source transactions from Unity Catalog Delta tables and write checkpoints, datasets, and models to governed Unity Catalog assets.
+# MAGIC - **Simple scaling path:** start with a single-GPU validation run, then use the same notebook and configuration to move into a multi-GPU training path.
+# MAGIC - **Operational handoff:** use MLflow and Unity Catalog to move from experimentation toward managed serving and autoscaling.
 # MAGIC
 # MAGIC References:
 # MAGIC
 # MAGIC - Databricks AI Runtime: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/
+# MAGIC - Serverless GPU H100 starter: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-api-h100-starter
 # MAGIC - Databricks Unsloth example: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-finetune-llama-unsloth
 # MAGIC - Unsloth Qwen3.5: https://unsloth.ai/docs/models/qwen3.5
 # MAGIC - Unsloth Qwen3.5 fine-tuning: https://unsloth.ai/docs/models/qwen3.5/fine-tune
@@ -22,39 +28,44 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 0:00-0:45 - Scenario
+# MAGIC ## Business scenario and model contract
 # MAGIC
-# MAGIC We are training a fraud decision model for a high-volume credit-card transaction business.
-# MAGIC The setup notebook in `setup/01_load_tabformer_dataset.py` loads IBM TabFormer credit-card transactions into a Unity Catalog Delta table.
-# MAGIC This notebook turns those transactions into supervised chat examples and fine-tunes `unsloth/Qwen3.5-2B` to emit structured fraud decisions.
+# MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it.
+# MAGIC
+# MAGIC The setup notebook loads IBM TabFormer credit-card transactions into a Unity Catalog Delta table and adds cleaned fields for prompt construction.
+# MAGIC This training notebook turns those prepared rows into supervised chat examples and fine-tunes `unsloth/Qwen3.5-2B` to emit a structured fraud decision.
 # MAGIC
 # MAGIC The output contract is a compact JSON object with:
 # MAGIC
 # MAGIC - `risk`: `legitimate`, `suspicious`, or `likely_fraud`
 # MAGIC - `action`: downstream routing guidance
 # MAGIC - `reason`: a short analyst-facing explanation
+# MAGIC
+# MAGIC Keeping the response schema explicit makes the model easier to evaluate, serve, and integrate into downstream applications.
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 0:45-1:45 - WOW Moment 1: instant access to H100 compute
+# MAGIC ## Compute: attach to AI Runtime serverless GPU
 # MAGIC
-# MAGIC Attach this notebook to **Serverless GPU** from the notebook compute picker.
+# MAGIC Attach this notebook to **Serverless GPU** from the notebook compute picker and choose the **AI v5** environment.
+# MAGIC AI Runtime is designed for deep learning workloads on Databricks serverless GPU compute, so the notebook can focus on model development instead of cluster provisioning, driver setup, or GPU library management.
 # MAGIC
-# MAGIC Recommended demo compute:
+# MAGIC Recommended compute:
 # MAGIC
 # MAGIC - Accelerator: `1xH100` for the single-GPU validation path, or `8xH100` for the distributed path.
 # MAGIC - Base environment: `AI v5`.
 # MAGIC
-# MAGIC If `1xH100` is not available in the workspace preview, `1xA10` is enough for this 2B bf16 LoRA demo.
-# MAGIC Qwen3.5 2B LoRA is intentionally small so the workflow focuses on platform experience rather than model size.
+# MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 2B bf16 LoRA workflow.
+# MAGIC The model is intentionally small so the notebook highlights the platform workflow: governed data, GPU-backed training, experiment tracking, and production handoff.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Install notebook requirements
 # MAGIC
-# MAGIC The path below is relative to this `air/` notebook source file and installs the top-level project requirements for both ingestion and training.
+# MAGIC Install the Python packages required by the notebook.
+# MAGIC AI Runtime already includes many common AI and ML libraries; this cell makes the notebook reproducible when package versions need to be pinned for the project.
 
 # COMMAND ----------
 
@@ -83,7 +94,8 @@ print("Environment flags configured before importing Unsloth.")
 # MAGIC %restart_python
 # MAGIC ```
 # MAGIC
-# MAGIC Unsloth recommends current Unsloth packages and Transformers v5 support for Qwen3.5. The demo keeps `%pip` out of the default execution path so an already-compatible AI v5 image is not unnecessarily modified.
+# MAGIC Unsloth recommends current Unsloth packages and Transformers v5 support for Qwen3.5.
+# MAGIC The notebook keeps unnecessary package mutation out of the default execution path when the selected AI Runtime image is already compatible.
 
 # COMMAND ----------
 
@@ -106,12 +118,17 @@ for package_name in [
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Demo configuration
+# MAGIC ## Training configuration
 # MAGIC
-# MAGIC Training settings are loaded from `air/training.yaml`, matching the setup notebook's YAML-driven ingestion pattern.
-# MAGIC The PDF's second wow moment is the `num_nodes = 1 -> num_nodes = 4` change. Current AI Runtime training is selected from serverless GPU accelerators; the distributed notebook path maps the scaled demo mode to an `8xH100` multi-GPU run through the `serverless_gpu` API.
+# MAGIC Training settings are loaded from `air/training.yaml`.
+# MAGIC This keeps the notebook body stable while making the experiment easy to tune:
 # MAGIC
-# MAGIC For a live five-minute DAIS demo, keep `max_steps` low. Increase it for a real experiment.
+# MAGIC - `catalog`, `schema`, and `source_table` point to the governed Delta table.
+# MAGIC - `checkpoint_volume` controls where datasets, adapters, and model artifacts are written.
+# MAGIC - `num_nodes` selects the validation path (`1`) or the scaled training path (`4`).
+# MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
+# MAGIC
+# MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare runs in MLflow.
 
 # COMMAND ----------
 
@@ -199,7 +216,7 @@ RUN_NAME = f"air-demo-{UC_MODEL_NAME}-{TRAINING_MODE}-steps{MAX_STEPS}"
 print(f"Training config: {config_path}")
 print(f"Source table: {SOURCE_TABLE}")
 print(f"Base model: {MODEL_NAME}")
-print(f"Demo num_nodes: {NUM_NODES}")
+print(f"Configured num_nodes: {NUM_NODES}")
 print(f"Training mode: {TRAINING_MODE}")
 print(f"Output dir: {OUTPUT_DIR}")
 print(f"SFT dataset: {DATASET_JSONL}")
@@ -210,7 +227,14 @@ print(f"Register model: {REGISTER_MODEL}")
 # MAGIC %md
 # MAGIC ## Unity Catalog and Spark Connect setup
 # MAGIC
-# MAGIC AI Runtime uses Unity Catalog for data and volume access. This cell creates the checkpoint volume if needed and opens a Spark session for reading the transaction Delta table.
+# MAGIC This cell creates the target schema and checkpoint volume if needed, then opens a Spark session for reading the transaction table.
+# MAGIC
+# MAGIC Unity Catalog is central to the workflow:
+# MAGIC
+# MAGIC - The source dataset is a governed Delta table.
+# MAGIC - The generated supervised fine-tuning dataset is written to a governed volume.
+# MAGIC - Training checkpoints and model artifacts are stored in the same catalog and schema.
+# MAGIC - The final registered model can inherit the same governance boundary as the data used to train it.
 
 # COMMAND ----------
 
@@ -254,7 +278,10 @@ print(f"Ready: {volume_q}")
 # MAGIC %md
 # MAGIC ## Read and summarize the fraud data
 # MAGIC
-# MAGIC The live demo should show the table summary before fine-tuning to anchor the business problem: many credit-card transactions, rare fraud labels, and a need for a real-time decision.
+# MAGIC Start by summarizing the transaction table.
+# MAGIC Fraud datasets are typically highly imbalanced, so the row count, fraud count, fraud rate, and time range provide useful context before any modeling work starts.
+# MAGIC
+# MAGIC This step also verifies that the ingestion notebook has successfully loaded the data before GPU time is used for training.
 
 # COMMAND ----------
 
@@ -278,63 +305,47 @@ display(summary_pdf)
 # MAGIC %md
 # MAGIC ## Build a supervised fine-tuning dataset
 # MAGIC
-# MAGIC This cell samples fraudulent and legitimate TabFormer transactions, converts each row into a fraud analyst instruction, and writes JSONL to a Unity Catalog volume. The training loop reads from this local volume path with Hugging Face Datasets.
+# MAGIC This cell samples fraudulent and legitimate transactions from the prepared Delta table, converts each row into a fraud analyst instruction, and writes JSONL to a Unity Catalog volume.
+# MAGIC The training loop reads the JSONL file with Hugging Face Datasets.
+# MAGIC
+# MAGIC Data cleaning has already happened in the ingestion notebook. This cell only assembles prompts from stable fields such as `amount_usd`, `transaction_ts_text`, `errors_text`, and `fraud_label`.
+# MAGIC Prompt construction does two important things:
+# MAGIC
+# MAGIC - It presents structured transaction attributes in a stable format.
+# MAGIC - It teaches the assistant response to follow the JSON contract used later for serving.
+# MAGIC
+# MAGIC Writing the generated dataset to a volume makes the training data inspectable and reusable across reruns.
 
 # COMMAND ----------
 
 import json
-from typing import Any
 
 import pandas as pd
 
 
-def clean_value(value: Any, default: str = "unknown") -> str:
-    if value is None:
-        return default
-    try:
-        if pd.isna(value):
-            return default
-    except TypeError:
-        pass
-    text = str(value).strip()
-    return text if text else default
-
-
-def clean_float(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    try:
-        if pd.isna(value):
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def transaction_prompt(row: pd.Series) -> str:
-    amount = clean_float(row.get("amount"))
+    amount = float(row["amount_usd"])
     return (
         "You are a fraud decision model for a credit-card transaction stream. "
         "Classify the transaction as legitimate, suspicious, or likely_fraud. "
         "Return only compact JSON with keys risk, action, and reason.\n\n"
         "Transaction:\n"
-        f"- user_id: {clean_value(row.get('user_id'))}\n"
-        f"- card_id: {clean_value(row.get('card_id'))}\n"
-        f"- timestamp: {clean_value(row.get('transaction_ts'))}\n"
+        f"- user_id: {row['user_id_text']}\n"
+        f"- card_id: {row['card_id_text']}\n"
+        f"- timestamp: {row['transaction_ts_text']}\n"
         f"- amount_usd: {amount:.2f}\n"
-        f"- use_chip: {clean_value(row.get('use_chip'))}\n"
-        f"- merchant_city: {clean_value(row.get('merchant_city'))}\n"
-        f"- merchant_state: {clean_value(row.get('merchant_state'))}\n"
-        f"- merchant_category_code: {clean_value(row.get('mcc'))}\n"
-        f"- errors: {clean_value(row.get('errors'), default='none')}"
+        f"- use_chip: {row['use_chip_text']}\n"
+        f"- merchant_city: {row['merchant_city_text']}\n"
+        f"- merchant_state: {row['merchant_state_text']}\n"
+        f"- merchant_category_code: {row['mcc_text']}\n"
+        f"- errors: {row['errors_text']}"
     )
 
 
 def transaction_answer(row: pd.Series) -> str:
-    is_fraud = int(clean_float(row.get("is_fraud")))
-    amount = clean_float(row.get("amount"))
-    errors = clean_value(row.get("errors"), default="none")
-    has_error_signal = errors.lower() not in {"none", "nan", "unknown", ""}
+    is_fraud = int(row["is_fraud"])
+    amount = float(row["amount_usd"])
+    has_error_signal = bool(row["has_error_signal"])
 
     if is_fraud == 1:
         payload = {
@@ -358,21 +369,21 @@ def transaction_answer(row: pd.Series) -> str:
     return json.dumps(payload, separators=(",", ": "))
 
 
-def make_chat_record(row: pd.Series) -> dict[str, Any]:
+def make_chat_record(row: pd.Series) -> dict[str, object]:
     return {
         "messages": [
             {"role": "user", "content": transaction_prompt(row)},
             {"role": "assistant", "content": transaction_answer(row)},
         ],
-        "label": "fraud" if int(clean_float(row.get("is_fraud"))) == 1 else "non_fraud",
+        "label": row["fraud_label"],
         "transaction": {
-            "user_id": clean_value(row.get("user_id")),
-            "card_id": clean_value(row.get("card_id")),
-            "amount": clean_float(row.get("amount")),
-            "merchant_city": clean_value(row.get("merchant_city")),
-            "merchant_state": clean_value(row.get("merchant_state")),
-            "mcc": clean_value(row.get("mcc")),
-            "is_fraud": int(clean_float(row.get("is_fraud"))),
+            "user_id": row["user_id_text"],
+            "card_id": row["card_id_text"],
+            "amount": float(row["amount_usd"]),
+            "merchant_city": row["merchant_city_text"],
+            "merchant_state": row["merchant_state_text"],
+            "mcc": row["mcc_text"],
+            "is_fraud": int(row["is_fraud"]),
         },
     }
 
@@ -380,15 +391,17 @@ def make_chat_record(row: pd.Series) -> dict[str, Any]:
 dataset_sql = f"""
 WITH fraud AS (
   SELECT
-    user_id,
-    card_id,
-    CAST(transaction_ts AS STRING) AS transaction_ts,
-    amount,
-    use_chip,
-    merchant_city,
-    merchant_state,
-    mcc,
-    errors,
+    user_id_text,
+    card_id_text,
+    transaction_ts_text,
+    amount_usd,
+    use_chip_text,
+    merchant_city_text,
+    merchant_state_text,
+    mcc_text,
+    errors_text,
+    has_error_signal,
+    fraud_label,
     is_fraud
   FROM {source_table_q}
   WHERE is_fraud = 1
@@ -397,15 +410,17 @@ WITH fraud AS (
 ),
 legit AS (
   SELECT
-    user_id,
-    card_id,
-    CAST(transaction_ts AS STRING) AS transaction_ts,
-    amount,
-    use_chip,
-    merchant_city,
-    merchant_state,
-    mcc,
-    errors,
+    user_id_text,
+    card_id_text,
+    transaction_ts_text,
+    amount_usd,
+    use_chip_text,
+    merchant_city_text,
+    merchant_state_text,
+    mcc_text,
+    errors_text,
+    has_error_signal,
+    fraud_label,
     is_fraud
   FROM {source_table_q}
   WHERE is_fraud = 0
@@ -447,14 +462,16 @@ display(pd.DataFrame(preview_records))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 1:45-2:45 - WOW Moment 2: scale by changing one integer
+# MAGIC ## Scale the training path with configuration
 # MAGIC
-# MAGIC The `num_nodes` value in `air/training.yaml` is the demo control:
+# MAGIC Start with `num_nodes: 1` to validate the data pipeline, prompt formatting, model loading, and LoRA training loop on a single GPU.
+# MAGIC After the workflow is correct, change `num_nodes` in `air/training.yaml` to use the scaled path:
 # MAGIC
-# MAGIC - `num_nodes = 1`: train on the attached single GPU.
-# MAGIC - `num_nodes = 4`: run the distributed demo path using AI Runtime `8xH100` and the `serverless_gpu` API.
+# MAGIC - `num_nodes: 1`: train on the attached single GPU.
+# MAGIC - `num_nodes: 4`: run the distributed path using AI Runtime `8xH100` and the `serverless_gpu` API.
 # MAGIC
-# MAGIC For the live demo, show this cell, change `num_nodes` in `training.yaml` from `1` to `4`, and rerun from the demo configuration cell on an `8xH100` AI Runtime notebook.
+# MAGIC The value driver is operational simplicity: the notebook keeps the same data access pattern, training function, MLflow logging, and artifact locations while the compute shape changes.
+# MAGIC This lets teams validate cheaply, then scale when the workload is ready.
 
 # COMMAND ----------
 
@@ -474,9 +491,15 @@ display(pd.DataFrame([scale_config]))
 # MAGIC %md
 # MAGIC ## Fine-tune Qwen3.5 2B with Unsloth
 # MAGIC
-# MAGIC This uses bf16/16-bit LoRA instead of QLoRA. Unsloth's Qwen3.5 guide calls out that QLoRA is not recommended for this model family because quantization differences are higher than normal.
+# MAGIC This section fine-tunes `unsloth/Qwen3.5-2B` with LoRA adapters.
+# MAGIC It uses bf16/16-bit LoRA instead of QLoRA because Unsloth's Qwen3.5 guidance does not recommend QLoRA for this model family.
 # MAGIC
-# MAGIC The trainer logs to MLflow, saves checkpoints to the Unity Catalog volume, and optionally registers the merged model in Unity Catalog.
+# MAGIC The implementation highlights the production workflow around training:
+# MAGIC
+# MAGIC - MLflow records parameters, metrics, and run metadata.
+# MAGIC - Checkpoints and adapters are saved to a Unity Catalog volume.
+# MAGIC - If enabled, the merged model is registered to Unity Catalog for downstream serving.
+# MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare single-GPU and scaled runs.
 
 # COMMAND ----------
 
@@ -680,7 +703,14 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
 # MAGIC %md
 # MAGIC ## Run training
 # MAGIC
-# MAGIC Keep `num_nodes = 1` in `training.yaml` for the initial validation pass. Switch to `num_nodes = 4` and attach `8xH100` compute to show the scaled path.
+# MAGIC Execute the training function selected by `training.yaml`.
+# MAGIC A single-GPU run calls the trainer directly. A scaled run uses the `serverless_gpu` distributed API to launch the same trainer across H100 GPUs.
+# MAGIC
+# MAGIC The recommended operating pattern is:
+# MAGIC
+# MAGIC 1. Run `num_nodes: 1` first to catch data, dependency, and prompt-format issues quickly.
+# MAGIC 2. Review MLflow metrics and sample outputs.
+# MAGIC 3. Move to the scaled path when the training loop is stable and the workload needs more throughput.
 
 # COMMAND ----------
 
@@ -710,17 +740,19 @@ print(f"MLflow run ID: {RUN_ID}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2:45-4:15 - WOW Moment 3: agent-first performance optimization
+# MAGIC ## Performance optimization loop
 # MAGIC
-# MAGIC At this point in the live demo, open Genie Code and ask:
+# MAGIC After a successful baseline run, compare runtime, loss, and GPU utilization in MLflow and the notebook resource panels.
+# MAGIC For distributed training, a common first bottleneck is an effective batch size that is too small to keep the GPUs busy.
 # MAGIC
-# MAGIC > Why is my distributed training job not scaling as expected?
-# MAGIC
-# MAGIC If Genie Code identifies small batch size as the throughput bottleneck, update the YAML values and rerun training:
+# MAGIC Use the suggested configuration below as a starting point for the next experiment:
 # MAGIC
 # MAGIC - Increase `per_device_train_batch_size` if memory allows.
 # MAGIC - Otherwise increase `gradient_accumulation_steps`.
-# MAGIC - Watch the GPU resources pane and MLflow metrics for higher utilization and stable loss.
+# MAGIC - Keep `learning_rate`, `max_steps`, and dataset size controlled while comparing runs.
+# MAGIC - Use MLflow metrics and system telemetry to confirm that throughput improves without destabilizing training.
+# MAGIC
+# MAGIC AI Runtime keeps this loop inside the same platform experience: data, GPU compute, metrics, artifacts, and registered models remain connected.
 
 # COMMAND ----------
 
@@ -729,7 +761,7 @@ genie_suggested_config = {
     "current_gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
     "suggested_per_device_train_batch_size": max(PER_DEVICE_TRAIN_BATCH_SIZE, 4),
     "suggested_gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
-    "rerun_instruction": "Update training.yaml, rerun from Demo configuration, and compare MLflow loss/runtime/GPU metrics.",
+    "rerun_instruction": "Update training.yaml, rerun from Training configuration, and compare MLflow loss/runtime/GPU metrics.",
 }
 
 display(pd.DataFrame([genie_suggested_config]))
@@ -741,15 +773,16 @@ display(pd.DataFrame([genie_suggested_config]))
 # MAGIC
 # MAGIC The fine-tuned model is registered to the Unity Catalog name printed in the next cell when `register_model = true`.
 # MAGIC
-# MAGIC For the final demo beat:
+# MAGIC From there, the production path is:
 # MAGIC
 # MAGIC 1. Open the registered model in Unity Catalog.
 # MAGIC 2. Click **Serve this model**.
 # MAGIC 3. Create a Mosaic AI Model Serving endpoint with autoscaling enabled.
 # MAGIC 4. Send a sample transaction request.
-# MAGIC 5. Start the load generator and show replicas scaling while the endpoint remains healthy.
+# MAGIC 5. Increase request traffic and observe endpoint health and autoscaling behavior.
 # MAGIC
 # MAGIC The request payload should keep the same prompt contract used during fine-tuning: ask for compact JSON with `risk`, `action`, and `reason`.
+# MAGIC This keeps development and serving aligned around the same interface.
 
 # COMMAND ----------
 
@@ -786,12 +819,14 @@ print(json.dumps(serving_payload, indent=2))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4:15-5:00 - Conclusion
+# MAGIC ## Summary
 # MAGIC
-# MAGIC In one notebook:
+# MAGIC This notebook demonstrates an end-to-end AI Runtime fine-tuning workflow for fraud decisions:
 # MAGIC
-# MAGIC - The fraud use case is anchored in a Unity Catalog Delta table.
-# MAGIC - AI Runtime supplies serverless GPU access.
-# MAGIC - The same notebook validates single-GPU training and exposes the scaled training path.
-# MAGIC - Genie Code provides a concrete performance tuning moment.
-# MAGIC - MLflow and Unity Catalog prepare the fine-tuned Qwen3.5 2B model for autoscaled serving.
+# MAGIC - Ingested transactions are governed in Unity Catalog.
+# MAGIC - Supervised chat records are generated from real table rows and stored in a Unity Catalog volume.
+# MAGIC - AI Runtime provides managed serverless GPU compute for model training.
+# MAGIC - The same training logic supports single-GPU validation and a scaled multi-GPU path.
+# MAGIC - MLflow captures the experiment record, and Unity Catalog provides the handoff point for serving.
+# MAGIC
+# MAGIC The main platform outcome is speed with control: teams can move from governed data to GPU fine-tuning to registered model artifacts without leaving Databricks or stitching together separate infrastructure.
