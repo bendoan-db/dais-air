@@ -3,10 +3,10 @@
 # MAGIC %md
 # MAGIC # Load and prepare IBM TabFormer credit-card transactions
 # MAGIC
-# MAGIC This setup notebook downloads the IBM TabFormer credit-card dataset, stages it in a Unity Catalog volume, and overwrites the configured Delta table.
+# MAGIC This setup notebook downloads the IBM TabFormer credit-card dataset, stages it in a Unity Catalog volume, and overwrites the configured Delta tables.
 # MAGIC
 # MAGIC The table is prepared for the AIR fine-tuning notebook by standardizing column names, casting core fields, creating `transaction_ts`, and adding reusable prompt-ready fields such as `amount_usd`, `*_text`, `errors_text`, `has_error_signal`, and `fraud_label`.
-# MAGIC Moving these cleaning steps into ingestion keeps training focused on dataset sampling, prompt assembly, and model fine-tuning.
+# MAGIC The setup also creates a supervised fine-tuning table with prompt/response columns and stable shard IDs. Moving these steps into ingestion keeps training focused on data selection, GPU execution, and model fine-tuning.
 
 # COMMAND ----------
 
@@ -45,11 +45,20 @@ with config_path.open("r", encoding="utf-8") as config_file:
 catalog = str(config["catalog"]).strip()
 schema = str(config["schema"]).strip()
 table = str(config["table"]).strip()
+sft_table = str(config["sft_table"]).strip()
 staging_volume = str(config["staging_volume"]).strip()
 dataset_name = str(config["dataset_name"]).strip()
 source_url = str(config["source_url"]).strip()
 archive_filename = str(config["archive_filename"]).strip()
 force_download = config["force_download"]
+suspicious_amount_threshold = float(config["suspicious_amount_threshold"])
+sft_shards = int(config["sft_shards"])
+
+
+if "spark" not in globals():
+    from databricks.connect import DatabricksSession
+
+    spark = DatabricksSession.builder.serverless().getOrCreate()
 
 
 def quote_identifier(identifier: str) -> str:
@@ -59,10 +68,12 @@ def quote_identifier(identifier: str) -> str:
 catalog_q = quote_identifier(catalog)
 schema_q = quote_identifier(schema)
 table_q = quote_identifier(table)
+sft_table_q = quote_identifier(sft_table)
 volume_q = quote_identifier(staging_volume)
 
 full_schema_name = f"{catalog_q}.{schema_q}"
 full_table_name = f"{full_schema_name}.{table_q}"
+full_sft_table_name = f"{full_schema_name}.{sft_table_q}"
 full_volume_name = f"{full_schema_name}.{volume_q}"
 
 # COMMAND ----------
@@ -79,6 +90,7 @@ dataset_root.mkdir(parents=True, exist_ok=True)
 
 print(f"Config path: {config_path}")
 print(f"Target table: {full_table_name}")
+print(f"Target SFT table: {full_sft_table_name}")
 print(f"Staging path: {dataset_root}")
 
 # COMMAND ----------
@@ -433,7 +445,160 @@ print(f"Overwrote Delta table {full_table_name}")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Create supervised fine-tuning records
+# MAGIC
+# MAGIC The training notebook reads this table directly instead of building prompts row by row in Python.
+# MAGIC Prompt text, assistant JSON, and `shard_id` are generated with Spark expressions so the work runs in parallel during ingestion.
+# MAGIC
+# MAGIC `shard_id` lets distributed training assign data slices by `rt.get_global_rank()` and `rt.get_world_size()` without loading the full table into every GPU worker.
+
+# COMMAND ----------
+
+prompt_col = F.concat(
+    F.lit("You are a fraud decision model for a credit-card transaction stream. "),
+    F.lit("Classify the transaction as legitimate, suspicious, or likely_fraud. "),
+    F.lit("Return only compact JSON with keys risk, action, and reason.\n\n"),
+    F.lit("Transaction:\n"),
+    F.lit("- user_id: "),
+    F.col("user_id_text"),
+    F.lit("\n- card_id: "),
+    F.col("card_id_text"),
+    F.lit("\n- timestamp: "),
+    F.col("transaction_ts_text"),
+    F.lit("\n- amount_usd: "),
+    F.format_string("%.2f", F.col("amount_usd")),
+    F.lit("\n- use_chip: "),
+    F.col("use_chip_text"),
+    F.lit("\n- merchant_city: "),
+    F.col("merchant_city_text"),
+    F.lit("\n- merchant_state: "),
+    F.col("merchant_state_text"),
+    F.lit("\n- merchant_category_code: "),
+    F.col("mcc_text"),
+    F.lit("\n- errors: "),
+    F.col("errors_text"),
+)
+
+risk_col = (
+    F.when(F.col("is_fraud") == 1, F.lit("likely_fraud"))
+    .when(
+        F.col("has_error_signal") | (F.col("amount_usd") >= F.lit(suspicious_amount_threshold)),
+        F.lit("suspicious"),
+    )
+    .otherwise(F.lit("legitimate"))
+)
+action_col = (
+    F.when(F.col("is_fraud") == 1, F.lit("decline_and_escalate"))
+    .when(
+        F.col("has_error_signal") | (F.col("amount_usd") >= F.lit(suspicious_amount_threshold)),
+        F.lit("step_up_authentication"),
+    )
+    .otherwise(F.lit("approve"))
+)
+reason_col = (
+    F.when(
+        F.col("is_fraud") == 1,
+        F.lit("The historical label marks this transaction as fraud."),
+    )
+    .when(
+        F.col("has_error_signal") | (F.col("amount_usd") >= F.lit(suspicious_amount_threshold)),
+        F.lit("The transaction is not labeled fraud, but amount or error signals warrant review."),
+    )
+    .otherwise(F.lit("The historical label is non-fraud and no strong review signal is present."))
+)
+
+assistant_response_col = F.to_json(
+    F.struct(
+        risk_col.alias("risk"),
+        action_col.alias("action"),
+        reason_col.alias("reason"),
+    )
+)
+
+training_id_col = F.sha2(
+    F.concat_ws(
+        "||",
+        F.col("user_id_text"),
+        F.col("card_id_text"),
+        F.col("transaction_ts_text"),
+        F.format_string("%.2f", F.col("amount_usd")),
+        F.col("merchant_city_text"),
+        F.col("merchant_state_text"),
+        F.col("mcc_text"),
+    ),
+    256,
+)
+
+shard_expr = f"""
+pmod(
+  xxhash64(
+    user_id_text,
+    card_id_text,
+    transaction_ts_text,
+    amount_usd,
+    merchant_city_text,
+    merchant_state_text,
+    mcc_text
+  ),
+  {sft_shards}
+)
+"""
+
+sft_df = (
+    df.withColumn("training_id", training_id_col)
+    .withColumn("prompt", prompt_col)
+    .withColumn("assistant_response", assistant_response_col)
+    .withColumn("shard_id", F.expr(shard_expr).cast("int"))
+    .withColumn(
+        "messages_json",
+        F.to_json(
+            F.array(
+                F.struct(F.lit("user").alias("role"), F.col("prompt").alias("content")),
+                F.struct(F.lit("assistant").alias("role"), F.col("assistant_response").alias("content")),
+            )
+        ),
+    )
+    .select(
+        "training_id",
+        "shard_id",
+        "prompt",
+        "assistant_response",
+        "messages_json",
+        "fraud_label",
+        "is_fraud",
+        "amount_usd",
+        "user_id_text",
+        "card_id_text",
+        "transaction_ts_text",
+        "merchant_city_text",
+        "merchant_state_text",
+        "mcc_text",
+        "errors_text",
+        "has_error_signal",
+    )
+)
+
+(
+    sft_df.write.format("delta")
+    .mode("overwrite")
+    .option("overwriteSchema", "true")
+    .saveAsTable(full_sft_table_name)
+)
+
+spark.sql(
+    f"""
+    COMMENT ON TABLE {full_sft_table_name}
+    IS 'Prompt/response supervised fine-tuning records for the AIR fraud demo'
+    """
+)
+
+print(f"Overwrote SFT Delta table {full_sft_table_name}")
+
+# COMMAND ----------
+
 loaded_df = spark.sql(f"SELECT * FROM {full_table_name}")
+sft_loaded_df = spark.sql(f"SELECT * FROM {full_sft_table_name}")
 
 summary_expressions = [F.count("*").alias("row_count")]
 if "is_fraud" in loaded_df.columns:
@@ -453,3 +618,20 @@ if "transaction_ts" in loaded_df.columns:
 
 display(loaded_df.agg(*summary_expressions))
 display(loaded_df.limit(10))
+
+sft_summary_expressions = [
+    F.count("*").alias("row_count"),
+    F.countDistinct("shard_id").alias("shard_count"),
+    F.min("shard_id").alias("min_shard_id"),
+    F.max("shard_id").alias("max_shard_id"),
+]
+if "is_fraud" in sft_loaded_df.columns:
+    sft_summary_expressions.extend(
+        [
+            F.sum("is_fraud").alias("fraud_row_count"),
+            F.avg("is_fraud").alias("fraud_rate"),
+        ]
+    )
+
+display(sft_loaded_df.agg(*sft_summary_expressions))
+display(sft_loaded_df.select("training_id", "shard_id", "prompt", "assistant_response").limit(10))

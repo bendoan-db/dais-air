@@ -7,14 +7,14 @@
 # MAGIC It is designed to stand alone for an external technical audience: each section explains what is happening, why it matters, and how the step contributes to a production AI workflow.
 # MAGIC
 # MAGIC The workflow uses the IBM TabFormer credit-card dataset loaded and prepared by `setup/01_load_tabformer_dataset.py`.
-# MAGIC The setup table provides cleaned prompt-ready transaction fields. This notebook samples those rows, converts them into supervised chat examples, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
+# MAGIC The setup notebook creates both a cleaned transaction table and a supervised fine-tuning table with prompt/response records. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
 # MAGIC
 # MAGIC **AI Runtime value drivers demonstrated in this notebook**
 # MAGIC
 # MAGIC - **On-demand GPU access:** run deep learning workloads on serverless GPU compute without provisioning or maintaining GPU clusters.
 # MAGIC - **Managed AI environment:** use the AI Runtime base environment with common model-training libraries already available.
 # MAGIC - **Unified data and governance:** read source transactions from Unity Catalog Delta tables and write checkpoints, adapters, and models to governed Unity Catalog assets.
-# MAGIC - **Simple scaling path:** start with a single-node run on 10% of the data, then use the same training function on the full training dataset with a distributed multi-GPU strategy.
+# MAGIC - **Simple scaling path:** start with a single-node run on a small SFT-table sample, then use the same training function on rank-sharded SFT data with a distributed multi-GPU strategy.
 # MAGIC - **Operational handoff:** use MLflow and Unity Catalog to move from experimentation toward managed serving and autoscaling.
 # MAGIC
 # MAGIC References:
@@ -32,8 +32,8 @@
 # MAGIC
 # MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it.
 # MAGIC
-# MAGIC The setup notebook loads IBM TabFormer credit-card transactions into a Unity Catalog Delta table and adds cleaned fields for prompt construction.
-# MAGIC This training notebook turns those prepared rows into supervised chat examples and fine-tunes `unsloth/Qwen3.5-2B` to emit a structured fraud decision.
+# MAGIC The setup notebook loads IBM TabFormer credit-card transactions into Unity Catalog Delta tables and builds prompt/response records for supervised fine-tuning.
+# MAGIC This training notebook reads those prepared SFT records and fine-tunes `unsloth/Qwen3.5-2B` to emit a structured fraud decision.
 # MAGIC
 # MAGIC The output contract is a compact JSON object with:
 # MAGIC
@@ -53,7 +53,7 @@
 # MAGIC
 # MAGIC Recommended compute:
 # MAGIC
-# MAGIC - Accelerator: `1xH100` or `1xA10` for the single-node 10% validation path, or `8xH100` for the distributed full-dataset path.
+# MAGIC - Accelerator: `1xH100` or `1xA10` for the single-node validation path, or `8xH100` for the distributed full-dataset path.
 # MAGIC - Base environment: `AI v5`.
 # MAGIC
 # MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 2B bf16 LoRA workflow.
@@ -89,15 +89,16 @@
 # MAGIC Training settings are loaded from `air/training.yaml`.
 # MAGIC This keeps the notebook body stable while making the experiment easy to tune:
 # MAGIC
-# MAGIC - `catalog`, `schema`, and `source_table` point to the governed Delta table.
+# MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
+# MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
 # MAGIC - `distributed_gpus` and `distributed_gpu_type` define the scaled training strategy.
 # MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
 # MAGIC
 # MAGIC The notebook intentionally runs two training phases:
 # MAGIC
-# MAGIC 1. **Part 1:** train on one node with a 10% random Delta sample to validate the workflow cheaply.
-# MAGIC 2. **Part 2:** train on the full prepared Delta table with distributed GPUs to show the scale-up path.
+# MAGIC 1. **Part 1:** train on one node with a small random SFT-table sample to validate the workflow cheaply.
+# MAGIC 2. **Part 2:** train on rank-sharded SFT-table data with distributed GPUs to show the scale-up path.
 # MAGIC
 # MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare both phases in MLflow.
 
@@ -122,6 +123,7 @@ config_path, training_config = load_yaml_config("training.yaml")
 UC_CATALOG = config_str(training_config, "catalog")
 UC_SCHEMA = config_str(training_config, "schema")
 SOURCE_TABLE_NAME = config_str(training_config, "source_table")
+SFT_TABLE_NAME = config_str(training_config, "sft_table")
 UC_VOLUME = config_str(training_config, "checkpoint_volume")
 UC_MODEL_NAME = config_str(training_config, "uc_model_name")
 
@@ -133,20 +135,21 @@ MAX_STEPS = config_int(training_config, "max_steps")
 PER_DEVICE_TRAIN_BATCH_SIZE = config_int(training_config, "per_device_train_batch_size")
 GRADIENT_ACCUMULATION_STEPS = config_int(training_config, "gradient_accumulation_steps")
 LEARNING_RATE = config_float(training_config, "learning_rate")
-SUSPICIOUS_AMOUNT_THRESHOLD = config_float(training_config, "suspicious_amount_threshold")
 REGISTER_MODEL = config_bool(training_config, "register_model")
 SEED = config_int(training_config, "seed")
 
 SOURCE_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SOURCE_TABLE_NAME}"
+SFT_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}"
 FULL_MODEL_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_MODEL_NAME}"
 OUTPUT_ROOT = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}/{UC_MODEL_NAME}"
-SINGLE_NODE_OUTPUT_DIR = f"{OUTPUT_ROOT}/single_node_10pct"
+SINGLE_NODE_OUTPUT_DIR = f"{OUTPUT_ROOT}/single_node_sample"
 DISTRIBUTED_OUTPUT_DIR = f"{OUTPUT_ROOT}/distributed_full"
-SINGLE_NODE_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-single-node-10pct-steps{MAX_STEPS}"
+SINGLE_NODE_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-single-node-sample-steps{MAX_STEPS}"
 DISTRIBUTED_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-distributed-full-steps{MAX_STEPS}"
 
 print(f"Training config: {config_path}")
 print(f"Source table: {SOURCE_TABLE}")
+print(f"SFT table: {SFT_TABLE}")
 print(f"Base model: {MODEL_NAME}")
 print(f"Distributed strategy: {DISTRIBUTED_GPUS}x{DISTRIBUTED_GPU_TYPE}")
 print(f"Single-node output dir: {SINGLE_NODE_OUTPUT_DIR}")
@@ -163,7 +166,7 @@ print(f"Register model: {REGISTER_MODEL}")
 # MAGIC Unity Catalog is central to the workflow:
 # MAGIC
 # MAGIC - The source dataset is a governed Delta table.
-# MAGIC - The generated supervised fine-tuning records are built from governed table rows.
+# MAGIC - The supervised fine-tuning table is a governed Delta table built during ingestion.
 # MAGIC - Training checkpoints and model artifacts are stored in the same catalog and schema.
 # MAGIC - The final registered model can inherit the same governance boundary as the data used to train it.
 
@@ -174,6 +177,7 @@ spark = get_spark_session()
 schema_q = full_name(UC_CATALOG, UC_SCHEMA)
 volume_q = full_name(UC_CATALOG, UC_SCHEMA, UC_VOLUME)
 source_table_q = full_name(UC_CATALOG, UC_SCHEMA, SOURCE_TABLE_NAME)
+sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_q}")
@@ -183,20 +187,19 @@ Path(DISTRIBUTED_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 print(f"Ready: {schema_q}")
 print(f"Ready: {volume_q}")
+print(f"SFT table: {sft_table_q}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Read and summarize the fraud data
 # MAGIC
-# MAGIC Start by summarizing the transaction table.
-# MAGIC Fraud datasets are typically highly imbalanced, so the row count, fraud count, fraud rate, and time range provide useful context before any modeling work starts.
+# MAGIC Start by summarizing the transaction table and the prepared SFT table.
+# MAGIC Fraud datasets are typically highly imbalanced, so the row count, fraud count, fraud rate, time range, and SFT shard coverage provide useful context before any modeling work starts.
 # MAGIC
 # MAGIC This step also verifies that the ingestion notebook has successfully loaded the data before GPU time is used for training.
 
 # COMMAND ----------
-
-source_table_q = full_name(UC_CATALOG, UC_SCHEMA, SOURCE_TABLE_NAME)
 
 summary_sql = f"""
 SELECT
@@ -211,16 +214,30 @@ FROM {source_table_q}
 summary_pdf = spark.sql(summary_sql).toPandas()
 display(summary_pdf)
 
+sft_summary_sql = f"""
+SELECT
+  COUNT(*) AS row_count,
+  COUNT(DISTINCT shard_id) AS shard_count,
+  MIN(shard_id) AS min_shard_id,
+  MAX(shard_id) AS max_shard_id,
+  SUM(CASE WHEN is_fraud = 1 THEN 1 ELSE 0 END) AS fraud_row_count,
+  AVG(CAST(is_fraud AS DOUBLE)) AS fraud_rate
+FROM {sft_table_q}
+"""
+
+sft_summary_pdf = spark.sql(sft_summary_sql).toPandas()
+display(sft_summary_pdf)
+
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Scale plan
 # MAGIC
-# MAGIC The notebook loads training records directly from the prepared Delta table inside each training section.
-# MAGIC This creates a little duplicated code, but keeps the demo readable:
+# MAGIC The notebook loads training records directly from the prepared SFT Delta table inside each training section.
+# MAGIC Prompt and response generation already happened in ingestion, so the training path avoids row-by-row prompt construction on the driver:
 # MAGIC
-# MAGIC - **Part 1:** load a 10% random sample from Delta and train on one node.
-# MAGIC - **Part 2:** load the full prepared Delta table and train with the distributed strategy.
+# MAGIC - **Part 1:** load a small random sample from the SFT table and train on one node.
+# MAGIC - **Part 2:** load rank-assigned SFT shards inside the `@distributed` function and train with the distributed strategy.
 # MAGIC
 # MAGIC Both parts use the same model, prompt contract, LoRA setup, MLflow logging, and Unity Catalog artifact layout.
 # MAGIC The main change is the record count and compute strategy, which makes the scale-up path explicit and easy to compare.
@@ -229,9 +246,9 @@ display(summary_pdf)
 
 scale_config = {
     "part_1_strategy": "single node",
-    "part_1_delta_load": "10% random sample",
+    "part_1_delta_load": "small random SFT-table sample",
     "part_2_strategy": f"distributed {DISTRIBUTED_GPUS}x{DISTRIBUTED_GPU_TYPE}",
-    "part_2_delta_load": "full prepared Delta table",
+    "part_2_delta_load": "rank-sharded SFT table",
     "intermediate_dataset_files": "none",
     "per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
     "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
@@ -296,7 +313,7 @@ def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
 
 def train_qwen35_unsloth(
     *,
-    records: list[dict[str, object]],
+    examples_pdf: pd.DataFrame,
     output_dir: str,
     run_name: str,
     training_mode: str,
@@ -311,7 +328,10 @@ def train_qwen35_unsloth(
 
     mlflow.set_registry_uri("databricks-uc")
 
-    dataset = Dataset.from_list(records)
+    dataset = Dataset.from_pandas(
+        examples_pdf[["prompt", "assistant_response"]],
+        preserve_index=False,
+    )
 
     load_kwargs = {
         "model_name": MODEL_NAME,
@@ -332,7 +352,19 @@ def train_qwen35_unsloth(
         model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
 
     def formatting_prompts_func(examples):
-        texts = [render_chat_messages(tokenizer, messages) for messages in examples["messages"]]
+        texts = [
+            render_chat_messages(
+                tokenizer,
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": assistant_response},
+                ],
+            )
+            for prompt, assistant_response in zip(
+                examples["prompt"],
+                examples["assistant_response"],
+            )
+        ]
         return {"text": texts}
 
     dataset = dataset.map(
@@ -418,8 +450,9 @@ def train_qwen35_unsloth(
                 "num_gpus": num_gpus,
                 "max_seq_length": MAX_SEQ_LENGTH,
                 "max_steps": MAX_STEPS,
-                "training_record_count": len(records),
+                "training_record_count": len(examples_pdf),
                 "source_table": SOURCE_TABLE,
+                "sft_table": SFT_TABLE,
                 "lora_r": 16,
                 "lora_alpha": 16,
             }
@@ -468,38 +501,36 @@ def train_qwen35_unsloth(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Part 1: single-node training on 10% of the data
+# MAGIC ## Part 1: single-node training on a small sample
 # MAGIC
-# MAGIC First, validate the full training workflow on one node with a 10% random sample loaded from Delta.
+# MAGIC First, validate the full training workflow on one node with a small random sample loaded from the prepared SFT Delta table.
 # MAGIC This run catches data, dependency, prompt-format, and model-loading issues before using larger GPU capacity.
 # MAGIC
 # MAGIC This is the low-cost development pass:
 # MAGIC
-# MAGIC - Dataset: 10% random Delta sample converted to chat records in notebook memory
+# MAGIC - Dataset: small random SFT-table sample with precomputed prompt/response columns
 # MAGIC - Compute: attached single-node AI Runtime GPU compute
 # MAGIC - Model registration: skipped, because this is a validation run
 # MAGIC - Output: LoRA adapters and checkpoints under the single-node output directory
 
 # COMMAND ----------
 
-source_table_q
-
-# COMMAND ----------
-
-
-single_node_pdf = spark.table(source_table_q).sample(0.0001).toPandas()
-single_node_records = [
-    make_chat_record(row, SUSPICIOUS_AMOUNT_THRESHOLD)
-    for _, row in single_node_pdf.iterrows()
-]
+single_node_pdf = (
+    spark.table(sft_table_q)
+    .sample(0.0001)
+    .select("training_id", "shard_id", "prompt", "assistant_response", "fraud_label", "is_fraud")
+    .toPandas()
+)
+if single_node_pdf.empty:
+    raise ValueError(f"No single-node training rows were sampled from {SFT_TABLE}. Run setup/01_load_tabformer_dataset.py first.")
 
 
 single_node_preview_records = [
     {
-        "prompt": record["messages"][0]["content"][:700],
-        "assistant": record["messages"][1]["content"],
+        "prompt": row["prompt"][:700],
+        "assistant": row["assistant_response"],
     }
-    for record in single_node_records[:3]
+    for _, row in single_node_pdf.head(3).iterrows()
 ]
 
 # COMMAND ----------
@@ -509,10 +540,10 @@ display(pd.DataFrame(single_node_preview_records))
 # COMMAND ----------
 
 SINGLE_NODE_RUN_ID = train_qwen35_unsloth(
-    records=single_node_records,
+    examples_pdf=single_node_pdf,
     output_dir=SINGLE_NODE_OUTPUT_DIR,
     run_name=SINGLE_NODE_RUN_NAME,
-    training_mode="single_node_10pct",
+    training_mode="single_node_sample",
     num_gpus=1,
     register_model=False,
 )
@@ -524,17 +555,18 @@ print(f"Single-node MLflow run ID: {SINGLE_NODE_RUN_ID}")
 # MAGIC %md
 # MAGIC ## Part 2: distributed training on the full dataset
 # MAGIC
-# MAGIC After the single-node pass succeeds, load the full prepared Delta table and run the same training function with the distributed AI Runtime strategy.
+# MAGIC After the single-node pass succeeds, load rank-assigned shards from the prepared SFT Delta table and run the same training function with the distributed AI Runtime strategy.
 # MAGIC This section demonstrates the scale-up path: the data contract, LoRA configuration, MLflow logging, and Unity Catalog artifact locations stay the same, while the compute strategy changes.
 # MAGIC
 # MAGIC This is the production-oriented training pass:
 # MAGIC
-# MAGIC - Dataset: full prepared Delta table converted to chat records in notebook memory
+# MAGIC - Dataset: precomputed SFT Delta rows assigned by `shard_id`
 # MAGIC - Compute: distributed `serverless_gpu` execution using the configured GPU count and type
 # MAGIC - Model registration: controlled by `register_model` in `training.yaml`
 # MAGIC - Output: full-run adapters, checkpoints, and optional Unity Catalog registered model
 # MAGIC
-# MAGIC The full-data load happens inside the decorated function. This follows the `serverless_gpu` best practice: keep large datasets out of the function closure so the launcher does not need to pickle and ship them to workers.
+# MAGIC The SFT-table load happens inside the decorated function. This follows the `serverless_gpu` best practice: keep large datasets out of the function closure so the launcher does not need to pickle and ship them to workers.
+# MAGIC In production, `rt.get_global_rank()` and `rt.get_world_size()` let each worker read a different set of table shards instead of having every worker load the full dataset.
 
 # COMMAND ----------
 
@@ -548,46 +580,38 @@ def run_distributed_train():
     from serverless_gpu import runtime as rt
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = rt.get_global_rank()
+    world_size = rt.get_world_size()
     torch.cuda.set_device(local_rank)
 
     distributed_sql = f"""
     SELECT
-      user_id_text,
-      card_id_text,
-      transaction_ts_text,
-      amount_usd,
-      use_chip_text,
-      merchant_city_text,
-      merchant_state_text,
-      mcc_text,
-      errors_text,
-      has_error_signal,
+      training_id,
+      shard_id,
+      prompt,
+      assistant_response,
       fraud_label,
       is_fraud
-    FROM {source_table_q}
+    FROM {sft_table_q}
+    WHERE pmod(shard_id, {world_size}) = {rank}
     """
 
     distributed_pdf = get_spark_session().sql(distributed_sql).toPandas()
     if distributed_pdf.empty:
-        raise ValueError(f"No distributed training rows were loaded from {SOURCE_TABLE}. Run setup/01_load_tabformer_dataset.py first.")
+        raise ValueError(f"No distributed training rows were loaded from {SFT_TABLE}. Run setup/01_load_tabformer_dataset.py first.")
 
-    distributed_records = [
-        make_chat_record(row, SUSPICIOUS_AMOUNT_THRESHOLD)
-        for _, row in distributed_pdf.iterrows()
-    ]
-
-    if rt.get_global_rank() == 0:
-        print(f"Prepared {len(distributed_records)} distributed examples from the full Delta table")
+    if rank == 0:
+        print(f"Prepared {len(distributed_pdf)} distributed examples for rank {rank} of {world_size}")
         print(
             distributed_pdf.groupby("is_fraud")
             .size()
             .reset_index(name="row_count")
-            .assign(dataset="distributed_full")
+            .assign(dataset="distributed_rank_shard")
             .to_string(index=False)
         )
 
     return train_qwen35_unsloth(
-        records=distributed_records,
+        examples_pdf=distributed_pdf,
         output_dir=DISTRIBUTED_OUTPUT_DIR,
         run_name=DISTRIBUTED_RUN_NAME,
         training_mode=f"distributed_{DISTRIBUTED_GPUS}x{DISTRIBUTED_GPU_TYPE}_full",
@@ -690,7 +714,7 @@ print(json.dumps(serving_payload, indent=2))
 # MAGIC This notebook demonstrates an end-to-end AI Runtime fine-tuning workflow for fraud decisions:
 # MAGIC
 # MAGIC - Ingested transactions are governed in Unity Catalog.
-# MAGIC - Supervised chat records are generated from real table rows and passed directly into the training loops.
+# MAGIC - Supervised chat records are generated from real table rows during ingestion and stored in the prepared SFT Delta table.
 # MAGIC - AI Runtime provides managed serverless GPU compute for model training.
 # MAGIC - The same training logic supports single-node validation and a scaled multi-GPU path.
 # MAGIC - MLflow captures the experiment record, and Unity Catalog provides the handoff point for serving.
