@@ -69,67 +69,17 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -r requirements.txt
+# MAGIC %pip install -qqq -r requirements.txt
 # MAGIC %restart_python
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Load shared utilities
-# MAGIC
-# MAGIC The `utils` notebook defines reusable setup and data helpers for YAML loading, Unity Catalog object naming, Spark session setup, and prompt construction.
-# MAGIC It is loaded after `%restart_python` so the helper definitions are available in the restarted Python process.
 
 # COMMAND ----------
 
 # MAGIC %run ./utils
-
-# COMMAND ----------
-
-import json
-import os
-from pathlib import Path
-
-import pandas as pd
-
-os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-
-print("Environment flags configured before importing Unsloth.")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Dependency note
-# MAGIC
-# MAGIC AI Runtime `AI v5` includes Unsloth and common ML dependencies. If the version check below shows an older stack or Qwen3.5 load errors, run this once at the top of the notebook and restart Python:
-# MAGIC
-# MAGIC ```python
-# MAGIC %pip install --upgrade --force-reinstall --no-cache-dir unsloth unsloth_zoo
-# MAGIC %restart_python
-# MAGIC ```
-# MAGIC
-# MAGIC Unsloth recommends current Unsloth packages and Transformers v5 support for Qwen3.5.
-# MAGIC The notebook keeps unnecessary package mutation out of the default execution path when the selected AI Runtime image is already compatible.
-
-# COMMAND ----------
-
-import importlib.metadata as metadata
-
-for package_name in [
-    "unsloth",
-    "unsloth_zoo",
-    "transformers",
-    "trl",
-    "peft",
-    "bitsandbytes",
-    "mlflow",
-]:
-    try:
-        print(f"{package_name}: {metadata.version(package_name)}")
-    except metadata.PackageNotFoundError:
-        print(f"{package_name}: not installed")
 
 # COMMAND ----------
 
@@ -150,6 +100,20 @@ for package_name in [
 # MAGIC 2. **Part 2:** train on the full prepared Delta table with distributed GPUs to show the scale-up path.
 # MAGIC
 # MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare both phases in MLflow.
+
+# COMMAND ----------
+
+import json
+import os
+from pathlib import Path
+
+import pandas as pd
+
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+
+print("Environment flags configured before importing Unsloth.")
 
 # COMMAND ----------
 
@@ -295,7 +259,13 @@ display(pd.DataFrame([scale_config]))
 
 # COMMAND ----------
 
+# DBTITLE 1,Cell 18
 from contextlib import contextmanager
+
+from unsloth import FastLanguageModel, is_bfloat16_supported
+from unsloth.chat_templates import train_on_responses_only
+from transformers import DataCollatorForSeq2Seq
+from trl import SFTTrainer, SFTConfig
 
 
 @contextmanager
@@ -338,10 +308,6 @@ def train_qwen35_unsloth(
     import mlflow
     import torch
     from datasets import Dataset
-    from transformers import DataCollatorForSeq2Seq
-    from trl import SFTTrainer, SFTConfig
-    from unsloth import FastLanguageModel, is_bfloat16_supported
-    from unsloth.chat_templates import train_on_responses_only
 
     mlflow.set_registry_uri("databricks-uc")
 
@@ -516,41 +482,17 @@ def train_qwen35_unsloth(
 
 # COMMAND ----------
 
-single_node_sql = f"""
-SELECT
-  user_id_text,
-  card_id_text,
-  transaction_ts_text,
-  amount_usd,
-  use_chip_text,
-  merchant_city_text,
-  merchant_state_text,
-  mcc_text,
-  errors_text,
-  has_error_signal,
-  fraud_label,
-  is_fraud
-FROM {source_table_q}
-WHERE rand({SEED}) < 0.10
-"""
+source_table_q
 
-single_node_pdf = spark.sql(single_node_sql).toPandas()
-if single_node_pdf.empty:
-    raise ValueError(f"No single-node training rows were sampled from {SOURCE_TABLE}. Run setup/01_load_tabformer_dataset.py first.")
+# COMMAND ----------
 
-single_node_pdf = single_node_pdf.sample(frac=1.0, random_state=SEED).reset_index(drop=True)
+
+single_node_pdf = spark.table(source_table_q).sample(0.0001).toPandas()
 single_node_records = [
     make_chat_record(row, SUSPICIOUS_AMOUNT_THRESHOLD)
     for _, row in single_node_pdf.iterrows()
 ]
 
-print(f"Prepared {len(single_node_records)} single-node examples from a 10% Delta sample")
-display(
-    single_node_pdf.groupby("is_fraud")
-    .size()
-    .reset_index(name="row_count")
-    .assign(dataset="single_node_10pct")
-)
 
 single_node_preview_records = [
     {
@@ -559,6 +501,8 @@ single_node_preview_records = [
     }
     for record in single_node_records[:3]
 ]
+
+# COMMAND ----------
 
 display(pd.DataFrame(single_node_preview_records))
 
