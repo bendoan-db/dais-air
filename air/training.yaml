@@ -5,7 +5,9 @@ checkpoint_volume: checkpoints
 uc_model_name: qwen35_2b_fraud_air
 
 model_name: unsloth/Qwen3.5-2B
-num_nodes: 1
+single_node_fraction: 0.10
+distributed_gpus: 8
+distributed_gpu_type: h100
 fraud_examples: 512
 legit_examples: 512
 max_seq_length: 2048

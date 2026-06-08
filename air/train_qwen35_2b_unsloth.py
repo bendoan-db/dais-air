@@ -14,7 +14,7 @@
 # MAGIC - **On-demand GPU access:** run deep learning workloads on serverless GPU compute without provisioning or maintaining GPU clusters.
 # MAGIC - **Managed AI environment:** use the AI Runtime base environment with common model-training libraries already available.
 # MAGIC - **Unified data and governance:** read source transactions from Unity Catalog Delta tables and write checkpoints, datasets, and models to governed Unity Catalog assets.
-# MAGIC - **Simple scaling path:** start with a single-GPU validation run, then use the same notebook and configuration to move into a multi-GPU training path.
+# MAGIC - **Simple scaling path:** start with a single-node run on 10% of the data, then use the same training function on the full training dataset with a distributed multi-GPU strategy.
 # MAGIC - **Operational handoff:** use MLflow and Unity Catalog to move from experimentation toward managed serving and autoscaling.
 # MAGIC
 # MAGIC References:
@@ -53,7 +53,7 @@
 # MAGIC
 # MAGIC Recommended compute:
 # MAGIC
-# MAGIC - Accelerator: `1xH100` for the single-GPU validation path, or `8xH100` for the distributed path.
+# MAGIC - Accelerator: `1xH100` or `1xA10` for the single-node 10% validation path, or `8xH100` for the distributed full-dataset path.
 # MAGIC - Base environment: `AI v5`.
 # MAGIC
 # MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 2B bf16 LoRA workflow.
@@ -74,7 +74,21 @@
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Load shared utilities
+# MAGIC
+# MAGIC The `utils` notebook defines reusable setup and data helpers for YAML loading, Unity Catalog object naming, Spark session setup, prompt construction, and JSONL writing.
+# MAGIC It is loaded after `%restart_python` so the helper definitions are available in the restarted Python process.
+
+# COMMAND ----------
+
+# MAGIC %run ./utils
+
+# COMMAND ----------
+
+import json
 import os
+from pathlib import Path
 
 os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -125,101 +139,65 @@ for package_name in [
 # MAGIC
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed Delta table.
 # MAGIC - `checkpoint_volume` controls where datasets, adapters, and model artifacts are written.
-# MAGIC - `num_nodes` selects the validation path (`1`) or the scaled training path (`4`).
+# MAGIC - `single_node_fraction` controls the first pass over 10% of the generated SFT data.
+# MAGIC - `distributed_gpus` and `distributed_gpu_type` define the scaled training strategy.
 # MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
 # MAGIC
-# MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare runs in MLflow.
+# MAGIC The notebook intentionally runs two training phases:
+# MAGIC
+# MAGIC 1. **Part 1:** train on one node with a 10% stratified subset to validate the workflow cheaply.
+# MAGIC 2. **Part 2:** train on the full generated SFT dataset with distributed GPUs to show the scale-up path.
+# MAGIC
+# MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare both phases in MLflow.
 
 # COMMAND ----------
 
-from pathlib import Path
+config_path, training_config = load_yaml_config("training.yaml")
 
-import yaml
+UC_CATALOG = config_str(training_config, "catalog")
+UC_SCHEMA = config_str(training_config, "schema")
+SOURCE_TABLE_NAME = config_str(training_config, "source_table")
+UC_VOLUME = config_str(training_config, "checkpoint_volume")
+UC_MODEL_NAME = config_str(training_config, "uc_model_name")
 
-try:
-    notebook_dir = Path(__file__).resolve().parent
-except NameError:
-    notebook_context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-    notebook_path = notebook_context.notebookPath().get()
-    notebook_dir = Path("/Workspace") / notebook_path.lstrip("/").rsplit("/", 1)[0]
+MODEL_NAME = config_str(training_config, "model_name")
+SINGLE_NODE_FRACTION = config_float(training_config, "single_node_fraction")
+DISTRIBUTED_GPUS = config_int(training_config, "distributed_gpus")
+DISTRIBUTED_GPU_TYPE = config_str(training_config, "distributed_gpu_type")
+FRAUD_EXAMPLES = config_int(training_config, "fraud_examples")
+LEGIT_EXAMPLES = config_int(training_config, "legit_examples")
+MAX_SEQ_LENGTH = config_int(training_config, "max_seq_length")
+MAX_STEPS = config_int(training_config, "max_steps")
+PER_DEVICE_TRAIN_BATCH_SIZE = config_int(training_config, "per_device_train_batch_size")
+GRADIENT_ACCUMULATION_STEPS = config_int(training_config, "gradient_accumulation_steps")
+LEARNING_RATE = config_float(training_config, "learning_rate")
+SUSPICIOUS_AMOUNT_THRESHOLD = config_float(training_config, "suspicious_amount_threshold")
+REGISTER_MODEL = config_bool(training_config, "register_model")
+SEED = config_int(training_config, "seed")
 
-config_path = notebook_dir / "training.yaml"
-
-with config_path.open("r", encoding="utf-8") as config_file:
-    training_config = yaml.safe_load(config_file)
-
-if not isinstance(training_config, dict):
-    raise ValueError(f"Expected YAML mapping in {config_path}, got {type(training_config).__name__}")
-
-
-def config_value(key: str):
-    if key not in training_config:
-        raise KeyError(f"Missing required training config key: {key}")
-    return training_config[key]
-
-
-def config_str(key: str) -> str:
-    value = str(config_value(key)).strip()
-    if not value:
-        raise ValueError(f"Training config key cannot be empty: {key}")
-    return value
-
-
-def config_int(key: str) -> int:
-    return int(config_value(key))
-
-
-def config_float(key: str) -> float:
-    return float(config_value(key))
-
-
-def config_bool(key: str) -> bool:
-    value = config_value(key)
-    if isinstance(value, bool):
-        return value
-
-    normalized = str(value).strip().lower()
-    if normalized in {"true", "1", "yes", "y"}:
-        return True
-    if normalized in {"false", "0", "no", "n"}:
-        return False
-    raise ValueError(f"Training config key must be boolean-like: {key}")
-
-
-UC_CATALOG = config_str("catalog")
-UC_SCHEMA = config_str("schema")
-SOURCE_TABLE_NAME = config_str("source_table")
-UC_VOLUME = config_str("checkpoint_volume")
-UC_MODEL_NAME = config_str("uc_model_name")
-
-MODEL_NAME = config_str("model_name")
-NUM_NODES = config_int("num_nodes")
-FRAUD_EXAMPLES = config_int("fraud_examples")
-LEGIT_EXAMPLES = config_int("legit_examples")
-MAX_SEQ_LENGTH = config_int("max_seq_length")
-MAX_STEPS = config_int("max_steps")
-PER_DEVICE_TRAIN_BATCH_SIZE = config_int("per_device_train_batch_size")
-GRADIENT_ACCUMULATION_STEPS = config_int("gradient_accumulation_steps")
-LEARNING_RATE = config_float("learning_rate")
-SUSPICIOUS_AMOUNT_THRESHOLD = config_float("suspicious_amount_threshold")
-REGISTER_MODEL = config_bool("register_model")
-SEED = config_int("seed")
-TRAINING_MODE = "single_gpu" if NUM_NODES == 1 else "distributed_8xh100"
+if not 0 < SINGLE_NODE_FRACTION <= 1:
+    raise ValueError("single_node_fraction must be greater than 0 and less than or equal to 1.")
 
 SOURCE_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SOURCE_TABLE_NAME}"
 FULL_MODEL_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_MODEL_NAME}"
-OUTPUT_DIR = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}/{UC_MODEL_NAME}"
+OUTPUT_ROOT = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}/{UC_MODEL_NAME}"
+SINGLE_NODE_OUTPUT_DIR = f"{OUTPUT_ROOT}/single_node_10pct"
+DISTRIBUTED_OUTPUT_DIR = f"{OUTPUT_ROOT}/distributed_full"
 DATASET_DIR = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}/datasets/{UC_MODEL_NAME}"
-DATASET_JSONL = f"{DATASET_DIR}/train.jsonl"
-RUN_NAME = f"air-demo-{UC_MODEL_NAME}-{TRAINING_MODE}-steps{MAX_STEPS}"
+SINGLE_NODE_DATASET_JSONL = f"{DATASET_DIR}/train_single_node_10pct.jsonl"
+DISTRIBUTED_DATASET_JSONL = f"{DATASET_DIR}/train_distributed_full.jsonl"
+SINGLE_NODE_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-single-node-10pct-steps{MAX_STEPS}"
+DISTRIBUTED_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-distributed-full-steps{MAX_STEPS}"
 
 print(f"Training config: {config_path}")
 print(f"Source table: {SOURCE_TABLE}")
 print(f"Base model: {MODEL_NAME}")
-print(f"Configured num_nodes: {NUM_NODES}")
-print(f"Training mode: {TRAINING_MODE}")
-print(f"Output dir: {OUTPUT_DIR}")
-print(f"SFT dataset: {DATASET_JSONL}")
+print(f"Single-node subset fraction: {SINGLE_NODE_FRACTION:.2%}")
+print(f"Distributed strategy: {DISTRIBUTED_GPUS}x{DISTRIBUTED_GPU_TYPE}")
+print(f"Single-node output dir: {SINGLE_NODE_OUTPUT_DIR}")
+print(f"Distributed output dir: {DISTRIBUTED_OUTPUT_DIR}")
+print(f"Single-node SFT dataset: {SINGLE_NODE_DATASET_JSONL}")
+print(f"Distributed SFT dataset: {DISTRIBUTED_DATASET_JSONL}")
 print(f"Register model: {REGISTER_MODEL}")
 
 # COMMAND ----------
@@ -238,26 +216,6 @@ print(f"Register model: {REGISTER_MODEL}")
 
 # COMMAND ----------
 
-from pathlib import Path
-
-
-def quote_identifier(identifier: str) -> str:
-    return f"`{identifier.replace('`', '``')}`"
-
-
-def full_name(*parts: str) -> str:
-    return ".".join(quote_identifier(part) for part in parts)
-
-
-def get_spark_session():
-    if "spark" in globals():
-        return globals()["spark"]
-
-    from databricks.connect import DatabricksSession
-
-    return DatabricksSession.builder.serverless().getOrCreate()
-
-
 spark = get_spark_session()
 
 schema_q = full_name(UC_CATALOG, UC_SCHEMA)
@@ -268,7 +226,8 @@ spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_q}")
 
 Path(DATASET_DIR).mkdir(parents=True, exist_ok=True)
-Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+Path(SINGLE_NODE_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+Path(DISTRIBUTED_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 print(f"Ready: {schema_q}")
 print(f"Ready: {volume_q}")
@@ -305,8 +264,8 @@ display(summary_pdf)
 # MAGIC %md
 # MAGIC ## Build a supervised fine-tuning dataset
 # MAGIC
-# MAGIC This cell samples fraudulent and legitimate transactions from the prepared Delta table, converts each row into a fraud analyst instruction, and writes JSONL to a Unity Catalog volume.
-# MAGIC The training loop reads the JSONL file with Hugging Face Datasets.
+# MAGIC This cell samples fraudulent and legitimate transactions from the prepared Delta table, converts each row into a fraud analyst instruction, and writes two JSONL files to a Unity Catalog volume.
+# MAGIC The training loops read these files with Hugging Face Datasets.
 # MAGIC
 # MAGIC Data cleaning has already happened in the ingestion notebook. This cell only assembles prompts from stable fields such as `amount_usd`, `transaction_ts_text`, `errors_text`, and `fraud_label`.
 # MAGIC Prompt construction does two important things:
@@ -314,78 +273,16 @@ display(summary_pdf)
 # MAGIC - It presents structured transaction attributes in a stable format.
 # MAGIC - It teaches the assistant response to follow the JSON contract used later for serving.
 # MAGIC
-# MAGIC Writing the generated dataset to a volume makes the training data inspectable and reusable across reruns.
+# MAGIC The generated datasets are:
+# MAGIC
+# MAGIC - **Part 1 dataset:** a stratified 10% subset for single-node validation.
+# MAGIC - **Part 2 dataset:** the full generated SFT dataset for distributed training.
+# MAGIC
+# MAGIC Writing both datasets to a volume makes the training inputs inspectable and reusable across reruns.
 
 # COMMAND ----------
 
-import json
-
 import pandas as pd
-
-
-def transaction_prompt(row: pd.Series) -> str:
-    amount = float(row["amount_usd"])
-    return (
-        "You are a fraud decision model for a credit-card transaction stream. "
-        "Classify the transaction as legitimate, suspicious, or likely_fraud. "
-        "Return only compact JSON with keys risk, action, and reason.\n\n"
-        "Transaction:\n"
-        f"- user_id: {row['user_id_text']}\n"
-        f"- card_id: {row['card_id_text']}\n"
-        f"- timestamp: {row['transaction_ts_text']}\n"
-        f"- amount_usd: {amount:.2f}\n"
-        f"- use_chip: {row['use_chip_text']}\n"
-        f"- merchant_city: {row['merchant_city_text']}\n"
-        f"- merchant_state: {row['merchant_state_text']}\n"
-        f"- merchant_category_code: {row['mcc_text']}\n"
-        f"- errors: {row['errors_text']}"
-    )
-
-
-def transaction_answer(row: pd.Series) -> str:
-    is_fraud = int(row["is_fraud"])
-    amount = float(row["amount_usd"])
-    has_error_signal = bool(row["has_error_signal"])
-
-    if is_fraud == 1:
-        payload = {
-            "risk": "likely_fraud",
-            "action": "decline_and_escalate",
-            "reason": "The historical label marks this transaction as fraud.",
-        }
-    elif has_error_signal or amount >= SUSPICIOUS_AMOUNT_THRESHOLD:
-        payload = {
-            "risk": "suspicious",
-            "action": "step_up_authentication",
-            "reason": "The transaction is not labeled fraud, but amount or error signals warrant review.",
-        }
-    else:
-        payload = {
-            "risk": "legitimate",
-            "action": "approve",
-            "reason": "The historical label is non-fraud and no strong review signal is present.",
-        }
-
-    return json.dumps(payload, separators=(",", ": "))
-
-
-def make_chat_record(row: pd.Series) -> dict[str, object]:
-    return {
-        "messages": [
-            {"role": "user", "content": transaction_prompt(row)},
-            {"role": "assistant", "content": transaction_answer(row)},
-        ],
-        "label": row["fraud_label"],
-        "transaction": {
-            "user_id": row["user_id_text"],
-            "card_id": row["card_id_text"],
-            "amount": float(row["amount_usd"]),
-            "merchant_city": row["merchant_city_text"],
-            "merchant_state": row["merchant_state_text"],
-            "mcc": row["mcc_text"],
-            "is_fraud": int(row["is_fraud"]),
-        },
-    }
 
 
 dataset_sql = f"""
@@ -437,14 +334,42 @@ if training_pdf.empty:
     raise ValueError(f"No training rows were sampled from {SOURCE_TABLE}. Run setup/01_load_tabformer_dataset.py first.")
 
 training_pdf = training_pdf.sample(frac=1.0, random_state=SEED).reset_index(drop=True)
-records = [make_chat_record(row) for _, row in training_pdf.iterrows()]
 
-with open(DATASET_JSONL, "w", encoding="utf-8") as dataset_file:
-    for record in records:
-        dataset_file.write(json.dumps(record, ensure_ascii=True) + "\n")
+subset_frames = []
+for _, group_pdf in training_pdf.groupby("is_fraud"):
+    subset_size = max(1, round(len(group_pdf) * SINGLE_NODE_FRACTION))
+    subset_frames.append(group_pdf.sample(n=subset_size, random_state=SEED))
 
-print(f"Wrote {len(records)} supervised chat examples to {DATASET_JSONL}")
-display(training_pdf.groupby("is_fraud").size().reset_index(name="row_count"))
+single_node_pdf = (
+    pd.concat(subset_frames, ignore_index=True)
+    .sample(frac=1.0, random_state=SEED)
+    .reset_index(drop=True)
+)
+
+distributed_records = [
+    make_chat_record(row, SUSPICIOUS_AMOUNT_THRESHOLD)
+    for _, row in training_pdf.iterrows()
+]
+single_node_records = [
+    make_chat_record(row, SUSPICIOUS_AMOUNT_THRESHOLD)
+    for _, row in single_node_pdf.iterrows()
+]
+
+
+write_jsonl(single_node_records, SINGLE_NODE_DATASET_JSONL)
+write_jsonl(distributed_records, DISTRIBUTED_DATASET_JSONL)
+
+print(f"Wrote {len(single_node_records)} single-node subset examples to {SINGLE_NODE_DATASET_JSONL}")
+print(f"Wrote {len(distributed_records)} full SFT examples to {DISTRIBUTED_DATASET_JSONL}")
+
+dataset_counts = pd.concat(
+    [
+        single_node_pdf.groupby("is_fraud").size().reset_index(name="row_count").assign(dataset="single_node_10pct"),
+        training_pdf.groupby("is_fraud").size().reset_index(name="row_count").assign(dataset="distributed_full"),
+    ],
+    ignore_index=True,
+)
+display(dataset_counts[["dataset", "is_fraud", "row_count"]])
 
 # COMMAND ----------
 
@@ -454,7 +379,7 @@ preview_records = [
         "prompt": record["messages"][0]["content"][:700],
         "assistant": record["messages"][1]["content"],
     }
-    for record in records[:3]
+    for record in distributed_records[:3]
 ]
 
 display(pd.DataFrame(preview_records))
@@ -462,23 +387,25 @@ display(pd.DataFrame(preview_records))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Scale the training path with configuration
+# MAGIC ## Scale plan
 # MAGIC
-# MAGIC Start with `num_nodes: 1` to validate the data pipeline, prompt formatting, model loading, and LoRA training loop on a single GPU.
-# MAGIC After the workflow is correct, change `num_nodes` in `air/training.yaml` to use the scaled path:
+# MAGIC The rest of the notebook is split into two training parts:
 # MAGIC
-# MAGIC - `num_nodes: 1`: train on the attached single GPU.
-# MAGIC - `num_nodes: 4`: run the distributed path using AI Runtime `8xH100` and the `serverless_gpu` API.
+# MAGIC - **Part 1:** single-node training on 10% of the generated SFT dataset.
+# MAGIC - **Part 2:** distributed training on the full generated SFT dataset.
 # MAGIC
-# MAGIC The value driver is operational simplicity: the notebook keeps the same data access pattern, training function, MLflow logging, and artifact locations while the compute shape changes.
-# MAGIC This lets teams validate cheaply, then scale when the workload is ready.
+# MAGIC Both parts use the same model, prompt contract, LoRA setup, MLflow logging, and Unity Catalog artifact layout.
+# MAGIC The main change is the dataset path and compute strategy, which makes the scale-up path explicit and easy to compare.
 
 # COMMAND ----------
 
 scale_config = {
-    "num_nodes": NUM_NODES,
-    "training_mode": TRAINING_MODE,
-    "gpu_accelerator_to_select": "1xH100 or 1xA10" if TRAINING_MODE == "single_gpu" else "8xH100",
+    "part_1_strategy": "single node",
+    "part_1_dataset": "10% stratified subset",
+    "part_1_dataset_jsonl": SINGLE_NODE_DATASET_JSONL,
+    "part_2_strategy": f"distributed {DISTRIBUTED_GPUS}x{DISTRIBUTED_GPU_TYPE}",
+    "part_2_dataset": "full generated SFT dataset",
+    "part_2_dataset_jsonl": DISTRIBUTED_DATASET_JSONL,
     "per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
     "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
     "effective_micro_batch_per_step": PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
@@ -499,11 +426,12 @@ display(pd.DataFrame([scale_config]))
 # MAGIC - MLflow records parameters, metrics, and run metadata.
 # MAGIC - Checkpoints and adapters are saved to a Unity Catalog volume.
 # MAGIC - If enabled, the merged model is registered to Unity Catalog for downstream serving.
-# MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare single-GPU and scaled runs.
+# MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the single-node and distributed runs.
+# MAGIC
+# MAGIC The training implementation is kept inline below so readers can inspect the Unsloth, TRL, MLflow, and distributed execution code directly.
 
 # COMMAND ----------
 
-# DBTITLE 1,Cell 21
 from contextlib import contextmanager
 
 
@@ -533,7 +461,17 @@ def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
         )
 
 
-def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
+def train_qwen35_unsloth(
+    *,
+    dataset_jsonl: str,
+    output_dir: str,
+    run_name: str,
+    training_mode: str,
+    num_gpus: int,
+    register_model: bool,
+    device_map=None,
+    save_artifacts: bool = True,
+) -> str:
     import mlflow
     import torch
     from datasets import load_dataset
@@ -544,7 +482,7 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
 
     mlflow.set_registry_uri("databricks-uc")
 
-    dataset = load_dataset("json", data_files={"train": DATASET_JSONL}, split="train")
+    dataset = load_dataset("json", data_files={"train": dataset_jsonl}, split="train")
 
     load_kwargs = {
         "model_name": MODEL_NAME,
@@ -614,9 +552,9 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
         weight_decay=0.01,
         lr_scheduler_type="linear",
         seed=SEED,
-        output_dir=OUTPUT_DIR,
+        output_dir=output_dir,
         report_to="mlflow",
-        run_name=RUN_NAME,
+        run_name=run_name,
         save_strategy="steps",
         save_steps=max(5, MAX_STEPS // 2),
         dataset_text_field="text",
@@ -643,15 +581,15 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
     except Exception as exc:
         print(f"Response-only masking was skipped: {exc}")
 
-    with start_mlflow_run(mlflow, RUN_NAME) as run:
+    with start_mlflow_run(mlflow, run_name) as run:
         mlflow.log_params(
             {
                 "base_model": MODEL_NAME,
-                "training_mode": TRAINING_MODE,
-                "num_nodes": NUM_NODES,
+                "training_mode": training_mode,
+                "num_gpus": num_gpus,
                 "max_seq_length": MAX_SEQ_LENGTH,
                 "max_steps": MAX_STEPS,
-                "dataset_jsonl": DATASET_JSONL,
+                "dataset_jsonl": dataset_jsonl,
                 "source_table": SOURCE_TABLE,
                 "lora_r": 16,
                 "lora_alpha": 16,
@@ -665,11 +603,11 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
                 mlflow.log_metric(f"trainer_{metric_name}", float(metric_value))
 
         if save_artifacts:
-            trainer.save_model(OUTPUT_DIR)
-            tokenizer.save_pretrained(OUTPUT_DIR)
-            mlflow.log_param("adapter_output_dir", OUTPUT_DIR)
+            trainer.save_model(output_dir)
+            tokenizer.save_pretrained(output_dir)
+            mlflow.log_param("adapter_output_dir", output_dir)
 
-            if REGISTER_MODEL:
+            if register_model:
                 try:
                     merged_model = model.merge_and_unload()
                     model_info = mlflow.transformers.log_model(
@@ -689,7 +627,7 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
                     print(f"MLflow model URI: {model_info.model_uri}")
                 except Exception as exc:
                     print(f"Model registration skipped or failed: {exc}")
-                    print(f"LoRA adapters remain saved at: {OUTPUT_DIR}")
+                    print(f"LoRA adapters remain saved at: {output_dir}")
 
         if torch.cuda.is_available():
             peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
@@ -698,44 +636,78 @@ def train_qwen35_unsloth(device_map=None, save_artifacts: bool = True) -> str:
 
         return run.info.run_id
 
+
+def run_distributed_train():
+    import os
+    import torch
+    from serverless_gpu import runtime as rt
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    return train_qwen35_unsloth(
+        dataset_jsonl=DISTRIBUTED_DATASET_JSONL,
+        output_dir=DISTRIBUTED_OUTPUT_DIR,
+        run_name=DISTRIBUTED_RUN_NAME,
+        training_mode=f"distributed_{DISTRIBUTED_GPUS}x{DISTRIBUTED_GPU_TYPE}_full",
+        num_gpus=DISTRIBUTED_GPUS,
+        register_model=REGISTER_MODEL,
+        device_map={"": local_rank},
+        save_artifacts=rt.get_global_rank() == 0,
+    )
+
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Run training
+# MAGIC ## Part 1: single-node training on 10% of the data
 # MAGIC
-# MAGIC Execute the training function selected by `training.yaml`.
-# MAGIC A single-GPU run calls the trainer directly. A scaled run uses the `serverless_gpu` distributed API to launch the same trainer across H100 GPUs.
+# MAGIC First, validate the full training workflow on one node with the 10% stratified subset.
+# MAGIC This run catches data, dependency, prompt-format, and model-loading issues before using larger GPU capacity.
 # MAGIC
-# MAGIC The recommended operating pattern is:
+# MAGIC This is the low-cost development pass:
 # MAGIC
-# MAGIC 1. Run `num_nodes: 1` first to catch data, dependency, and prompt-format issues quickly.
-# MAGIC 2. Review MLflow metrics and sample outputs.
-# MAGIC 3. Move to the scaled path when the training loop is stable and the workload needs more throughput.
+# MAGIC - Dataset: `train_single_node_10pct.jsonl`
+# MAGIC - Compute: attached single-node AI Runtime GPU compute
+# MAGIC - Model registration: skipped, because this is a validation run
+# MAGIC - Output: LoRA adapters and checkpoints under the single-node output directory
 
 # COMMAND ----------
 
-if TRAINING_MODE == "single_gpu":
-    RUN_ID = train_qwen35_unsloth()
-else:
-    from serverless_gpu import distributed
+SINGLE_NODE_RUN_ID = train_qwen35_unsloth(
+    dataset_jsonl=SINGLE_NODE_DATASET_JSONL,
+    output_dir=SINGLE_NODE_OUTPUT_DIR,
+    run_name=SINGLE_NODE_RUN_NAME,
+    training_mode="single_node_10pct",
+    num_gpus=1,
+    register_model=False,
+)
 
-    @distributed(gpus=8, gpu_type="h100")
-    def run_distributed_train():
-        import os
-        import torch
-        from serverless_gpu import runtime as rt
+print(f"Single-node MLflow run ID: {SINGLE_NODE_RUN_ID}")
 
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        torch.cuda.set_device(local_rank)
-        return train_qwen35_unsloth(
-            device_map={"": local_rank},
-            save_artifacts=rt.get_global_rank() == 0,
-        )
+# COMMAND ----------
 
-    distributed_run_ids = run_distributed_train.distributed()
-    RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
+# MAGIC %md
+# MAGIC ## Part 2: distributed training on the full dataset
+# MAGIC
+# MAGIC After the single-node pass succeeds, run the same training function on the full generated SFT dataset with the distributed AI Runtime strategy.
+# MAGIC This section demonstrates the scale-up path: the data contract, LoRA configuration, MLflow logging, and Unity Catalog artifact locations stay the same, while the compute strategy changes.
+# MAGIC
+# MAGIC This is the production-oriented training pass:
+# MAGIC
+# MAGIC - Dataset: `train_distributed_full.jsonl`
+# MAGIC - Compute: distributed `serverless_gpu` execution using the configured GPU count and type
+# MAGIC - Model registration: controlled by `register_model` in `training.yaml`
+# MAGIC - Output: full-run adapters, checkpoints, and optional Unity Catalog registered model
 
-print(f"MLflow run ID: {RUN_ID}")
+# COMMAND ----------
+
+from serverless_gpu import distributed
+
+
+distributed_train = distributed(gpus=DISTRIBUTED_GPUS, gpu_type=DISTRIBUTED_GPU_TYPE)(run_distributed_train)
+distributed_run_ids = distributed_train.distributed()
+DISTRIBUTED_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
+
+print(f"Distributed MLflow run ID: {DISTRIBUTED_RUN_ID}")
 
 # COMMAND ----------
 
@@ -826,7 +798,7 @@ print(json.dumps(serving_payload, indent=2))
 # MAGIC - Ingested transactions are governed in Unity Catalog.
 # MAGIC - Supervised chat records are generated from real table rows and stored in a Unity Catalog volume.
 # MAGIC - AI Runtime provides managed serverless GPU compute for model training.
-# MAGIC - The same training logic supports single-GPU validation and a scaled multi-GPU path.
+# MAGIC - The same training logic supports single-node validation and a scaled multi-GPU path.
 # MAGIC - MLflow captures the experiment record, and Unity Catalog provides the handoff point for serving.
 # MAGIC
 # MAGIC The main platform outcome is speed with control: teams can move from governed data to GPU fine-tuning to registered model artifacts without leaving Databricks or stitching together separate infrastructure.
