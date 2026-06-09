@@ -12,69 +12,6 @@
 
 # COMMAND ----------
 
-# DBTITLE 1,AI Runtime fraud fine-tuning with Qwen3.5 2B and Unsloth
-# MAGIC %md
-# MAGIC # Fine-tune Qwen3.5 2B for fraud decisions with AI Runtime
-# MAGIC
-# MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime.
-# MAGIC It is designed to stand alone for an external technical audience: each section explains what is happening, why it matters, and how the step contributes to a production AI workflow.
-# MAGIC
-# MAGIC The workflow uses the IBM TabFormer credit-card dataset loaded and prepared by `setup/01_load_tabformer_dataset.py`.
-# MAGIC The setup notebook creates both a cleaned transaction table and a supervised fine-tuning table with prompt/response records. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
-# MAGIC
-# MAGIC **AI Runtime value drivers demonstrated in this notebook**
-# MAGIC
-# MAGIC - **On-demand GPU access:** run deep learning workloads on serverless GPU compute without provisioning or maintaining GPU clusters.
-# MAGIC - **Managed AI environment:** use the AI Runtime base environment with common model-training libraries already available.
-# MAGIC - **Unified data and governance:** read source transactions from Unity Catalog Delta tables and write checkpoints, adapters, and models to governed Unity Catalog assets.
-# MAGIC - **Simple scaling path:** start with `@distributed(gpus=1)`, then change that single decorator parameter to use multiple GPUs while the training code stays the same.
-# MAGIC - **Operational handoff:** use MLflow and Unity Catalog to move from experimentation toward managed custom LLM serving.
-# MAGIC
-# MAGIC References:
-# MAGIC
-# MAGIC - Databricks AI Runtime: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/
-# MAGIC - Serverless GPU H100 starter: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-api-h100-starter
-# MAGIC - Databricks Unsloth example: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-finetune-llama-unsloth
-# MAGIC - Custom LLM serving with vLLM: https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms
-# MAGIC - Unsloth Qwen3.5: https://unsloth.ai/docs/models/qwen3.5
-# MAGIC - Unsloth Qwen3.5 fine-tuning: https://unsloth.ai/docs/models/qwen3.5/fine-tune
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Business scenario and model contract
-# MAGIC
-# MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it.
-# MAGIC
-# MAGIC The setup notebook loads IBM TabFormer credit-card transactions into Unity Catalog Delta tables and builds prompt/response records for supervised fine-tuning.
-# MAGIC This training notebook reads those prepared SFT records and fine-tunes `unsloth/Qwen3.5-2B` to emit a structured fraud decision.
-# MAGIC
-# MAGIC The output contract is a compact JSON object with:
-# MAGIC
-# MAGIC - `risk`: `legitimate`, `suspicious`, or `likely_fraud`
-# MAGIC - `action`: downstream routing guidance
-# MAGIC - `reason`: a short analyst-facing explanation
-# MAGIC
-# MAGIC Keeping the response schema explicit makes the model easier to evaluate, serve, and integrate into downstream applications.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Compute: attach to AI Runtime serverless GPU
-# MAGIC
-# MAGIC Attach this notebook to **Serverless GPU** from the notebook compute picker and choose the **AI v5** environment.
-# MAGIC AI Runtime is designed for deep learning workloads on Databricks serverless GPU compute, so the notebook can focus on model development instead of cluster provisioning, driver setup, or GPU library management.
-# MAGIC
-# MAGIC Recommended compute:
-# MAGIC
-# MAGIC - Accelerator: `1xH100` or `1xA10` for the validation path, or `8xH100` to demonstrate multi-GPU scaling.
-# MAGIC - Base environment: `AI v5`.
-# MAGIC
-# MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 2B bf16 LoRA workflow.
-# MAGIC The model is intentionally small so the notebook highlights the platform workflow: governed data, GPU-backed training, experiment tracking, and production handoff.
-
-# COMMAND ----------
-
 # MAGIC %run ./utils
 
 # COMMAND ----------
@@ -162,14 +99,52 @@ volume_q = full_name(UC_CATALOG, UC_SCHEMA, UC_VOLUME)
 source_table_q = full_name(UC_CATALOG, UC_SCHEMA, SOURCE_TABLE_NAME)
 sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
-spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_q}")
+#spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
+#spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_q}")
 
 Path(TRAINING_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 print(f"Ready: {schema_q}")
 print(f"Ready: {volume_q}")
 print(f"SFT table: {sft_table_q}")
+
+# COMMAND ----------
+
+# DBTITLE 1,AI Runtime fraud fine-tuning with Qwen3.5 2B and Unsloth
+# MAGIC %md
+# MAGIC # Fine-tune Qwen3.5 2B for fraud decisions with AI Runtime
+# MAGIC
+# MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime.
+# MAGIC It is designed to stand alone for an external technical audience: each section explains what is happening, why it matters, and how the step contributes to a production AI workflow.
+# MAGIC
+# MAGIC The workflow uses the IBM TabFormer credit-card dataset loaded and prepared by `setup/01_load_tabformer_dataset.py`.
+# MAGIC The setup notebook creates both a cleaned transaction table and a supervised fine-tuning table with prompt/response records. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
+# MAGIC
+# MAGIC **AI Runtime value drivers demonstrated in this notebook**
+# MAGIC
+# MAGIC - **On-demand GPU access:** run deep learning workloads on serverless GPU compute without provisioning or maintaining GPU clusters.
+# MAGIC - **Managed AI environment:** use the AI Runtime base environment with common model-training libraries already available.
+# MAGIC - **Unified data and governance:** read source transactions from Unity Catalog Delta tables and write checkpoints, adapters, and models to governed Unity Catalog assets.
+# MAGIC - **Simple scaling path:** start with `@distributed(gpus=1)`, then change that single decorator parameter to use multiple GPUs while the training code stays the same.
+# MAGIC - **Operational handoff:** use MLflow and Unity Catalog to move from experimentation toward managed custom LLM serving.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Business scenario and model contract
+# MAGIC
+# MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it.
+# MAGIC
+# MAGIC The setup notebook loads IBM TabFormer credit-card transactions into Unity Catalog Delta tables and builds prompt/response records for supervised fine-tuning.
+# MAGIC This training notebook reads those prepared SFT records and fine-tunes `unsloth/Qwen3.5-2B` to emit a structured fraud decision.
+# MAGIC
+# MAGIC The output contract is a compact JSON object with:
+# MAGIC
+# MAGIC - `risk`: `legitimate`, `suspicious`, or `likely_fraud`
+# MAGIC - `action`: downstream routing guidance
+# MAGIC - `reason`: a short analyst-facing explanation
+# MAGIC
+# MAGIC Keeping the response schema explicit makes the model easier to evaluate, serve, and integrate into downstream applications.
 
 # COMMAND ----------
 
@@ -211,6 +186,24 @@ FROM {sft_table_q}
 
 sft_summary_pdf = spark.sql(sft_summary_sql).toPandas()
 display(sft_summary_pdf)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Compute: attach to AI Runtime serverless GPU
+# MAGIC
+# MAGIC Attach this notebook to **Serverless GPU** from the notebook compute picker and choose the **AI v5** environment.
+# MAGIC AI Runtime is designed for deep learning workloads on Databricks serverless GPU compute, so the notebook can focus on model development instead of cluster provisioning, driver setup, or GPU library management.
+# MAGIC
+# MAGIC Recommended compute:
+# MAGIC
+# MAGIC - Accelerator: `1xH100` or `1xA10` for the validation path, or `8xH100` to demonstrate multi-GPU scaling.
+# MAGIC - Base environment: `AI v5`.
+# MAGIC
+# MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 2B bf16 LoRA workflow.
+# MAGIC The model is intentionally small so the notebook highlights the platform workflow: governed data, GPU-backed training, experiment tracking, and production handoff.
+# MAGIC
+# MAGIC ** Call out that we can run Spark on GPUs **
 
 # COMMAND ----------
 
@@ -608,16 +601,20 @@ def save_merged_hf_model(merged_model, tokenizer, model_dir: Path) -> None:
 def local_model_work_dir() -> Path:
     import tempfile
 
-    local_disk = Path("/local_disk0")
-    if local_disk.exists():
-        return Path(tempfile.mkdtemp(prefix="air-custom-llm-", dir=local_disk))
+    local_disk_tmp = Path("/local_disk0/tmp")
+    if local_disk_tmp.exists():
+        return Path(tempfile.mkdtemp(prefix="air-custom-llm-", dir=local_disk_tmp))
     return Path(tempfile.mkdtemp(prefix="air-custom-llm-"))
 
 
 def register_custom_llm_model(adapter_output_dir: str, run_name: str):
+    import os
     import shutil
 
     import mlflow
+
+    os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] = "1200"
+    os.environ["MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT"] = "1200"
 
     mlflow.set_registry_uri("databricks-uc")
 
@@ -714,7 +711,7 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 model_uri=model_info.model_uri,
                 name=FULL_MODEL_NAME,
                 await_registration_for=3600,
-                env_pack="databricks_model_serving",
+
             )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -919,3 +916,12 @@ print(json.dumps(serving_payload, indent=2))
 # MAGIC - MLflow captures the experiment record, Unity Catalog stores the registered model version, and the deployment cell creates or updates a custom LLM serving endpoint.
 # MAGIC
 # MAGIC The main platform outcome is speed with control: teams can move from governed data to GPU fine-tuning to registered model artifacts without leaving Databricks or stitching together separate infrastructure.
+# MAGIC
+# MAGIC References:
+# MAGIC
+# MAGIC - Databricks AI Runtime: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/
+# MAGIC - Serverless GPU H100 starter: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-api-h100-starter
+# MAGIC - Databricks Unsloth example: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-finetune-llama-unsloth
+# MAGIC - Custom LLM serving with vLLM: https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms
+# MAGIC - Unsloth Qwen3.5: https://unsloth.ai/docs/models/qwen3.5
+# MAGIC - Unsloth Qwen3.5 fine-tuning: https://unsloth.ai/docs/models/qwen3.5/fine-tune
