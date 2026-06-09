@@ -158,20 +158,6 @@ print(f"Register model: {REGISTER_MODEL}")
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## Unity Catalog and Spark Connect setup
-# MAGIC
-# MAGIC This cell creates the target schema and checkpoint volume if needed, then opens a Spark session for reading the transaction table.
-# MAGIC
-# MAGIC Unity Catalog is central to the workflow:
-# MAGIC
-# MAGIC - The source dataset is a governed Delta table.
-# MAGIC - The supervised fine-tuning table is a governed Delta table built during ingestion.
-# MAGIC - Training checkpoints and model artifacts are stored in the same catalog and schema.
-# MAGIC - The final registered model can inherit the same governance boundary as the data used to train it.
-
-# COMMAND ----------
-
 spark = get_spark_session()
 
 schema_q = full_name(UC_CATALOG, UC_SCHEMA)
@@ -200,6 +186,8 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC This step also verifies that the ingestion notebook has successfully loaded the data before GPU time is used for training.
 
 # COMMAND ----------
+
+spark.table(sft_table_q)
 
 summary_sql = f"""
 SELECT
@@ -283,33 +271,6 @@ from unsloth import FastLanguageModel, is_bfloat16_supported
 from unsloth.chat_templates import train_on_responses_only
 from transformers import DataCollatorForSeq2Seq
 from trl import SFTTrainer, SFTConfig
-
-
-@contextmanager
-def start_mlflow_run(mlflow_module, run_name: str):
-    try:
-        with mlflow_module.start_run(run_name=run_name, log_system_metrics=True) as run:
-            yield run
-    except TypeError:
-        with mlflow_module.start_run(run_name=run_name) as run:
-            yield run
-
-
-def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-            enable_thinking=False,
-        )
-    except TypeError:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-
 
 def train_qwen35_unsloth(
     *,
@@ -501,54 +462,56 @@ def train_qwen35_unsloth(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Part 1: single-node training on a small sample
-# MAGIC
-# MAGIC First, validate the full training workflow on one node with a small random sample loaded from the prepared SFT Delta table.
-# MAGIC This run catches data, dependency, prompt-format, and model-loading issues before using larger GPU capacity.
-# MAGIC
-# MAGIC This is the low-cost development pass:
-# MAGIC
-# MAGIC - Dataset: small random SFT-table sample with precomputed prompt/response columns
-# MAGIC - Compute: attached single-node AI Runtime GPU compute
-# MAGIC - Model registration: skipped, because this is a validation run
-# MAGIC - Output: LoRA adapters and checkpoints under the single-node output directory
+# MAGIC # Switching from Single Node to Multi-node Training with a Single Parmameter
 
 # COMMAND ----------
 
-single_node_pdf = (
-    spark.table(sft_table_q)
-    .sample(0.0001)
-    .select("training_id", "shard_id", "prompt", "assistant_response", "fraud_label", "is_fraud")
-    .toPandas()
+import mlflow
+mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen_2b_training")
+
+# COMMAND ----------
+
+from serverless_gpu import distributed
+from serverless_gpu import runtime as rt
+
+@distributed(gpus=8, gpu_type="h100")
+def run_training_job():
+    import os
+    import torch
+    from serverless_gpu import runtime as rt
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    rank = rt.get_global_rank()
+    world_size = rt.get_world_size()
+    torch.cuda.set_device(local_rank)
+
+    distributed_sql = f"""
+    SELECT
+      training_id,
+      shard_id,
+      prompt,
+      assistant_response,
+      fraud_label,
+      is_fraud
+    FROM {sft_table_q}
+    WHERE pmod(shard_id, {world_size}) = {rank}
+    """
+
+    dataset = get_spark_session().sql(distributed_sql).sample(0.001).toPandas()
+
+    return train_qwen35_unsloth(
+        examples_pdf=dataset,
+        output_dir=SINGLE_NODE_OUTPUT_DIR,
+        run_name="unsloth_distributed",
+        training_mode="single_node_sample",
+        num_gpus=8,
+        register_model=True,
 )
-if single_node_pdf.empty:
-    raise ValueError(f"No single-node training rows were sampled from {SFT_TABLE}. Run setup/01_load_tabformer_dataset.py first.")
 
+distributed_run_ids = run_training_job.distributed()
+DISTRIBUTED_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
 
-single_node_preview_records = [
-    {
-        "prompt": row["prompt"][:700],
-        "assistant": row["assistant_response"],
-    }
-    for _, row in single_node_pdf.head(3).iterrows()
-]
-
-# COMMAND ----------
-
-display(pd.DataFrame(single_node_preview_records))
-
-# COMMAND ----------
-
-SINGLE_NODE_RUN_ID = train_qwen35_unsloth(
-    examples_pdf=single_node_pdf,
-    output_dir=SINGLE_NODE_OUTPUT_DIR,
-    run_name=SINGLE_NODE_RUN_NAME,
-    training_mode="single_node_sample",
-    num_gpus=1,
-    register_model=False,
-)
-
-print(f"Single-node MLflow run ID: {SINGLE_NODE_RUN_ID}")
+print(f"Distributed MLflow run ID: {DISTRIBUTED_RUN_ID}")
 
 # COMMAND ----------
 
@@ -597,9 +560,6 @@ def run_distributed_train():
     """
 
     distributed_pdf = get_spark_session().sql(distributed_sql).toPandas()
-    if distributed_pdf.empty:
-        raise ValueError(f"No distributed training rows were loaded from {SFT_TABLE}. Run setup/01_load_tabformer_dataset.py first.")
-
     if rank == 0:
         print(f"Prepared {len(distributed_pdf)} distributed examples for rank {rank} of {world_size}")
         print(

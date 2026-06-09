@@ -86,3 +86,40 @@ def get_spark_session():
     from databricks.connect import DatabricksSession
 
     return DatabricksSession.builder.serverless().getOrCreate()
+
+# COMMAND ----------
+
+from contextlib import contextmanager
+
+from unsloth import FastLanguageModel, is_bfloat16_supported
+from unsloth.chat_templates import train_on_responses_only
+from transformers import DataCollatorForSeq2Seq
+from trl import SFTTrainer, SFTConfig
+
+import mlflow
+
+@contextmanager
+def start_mlflow_run(mlflow_module, run_name: str):
+    try:
+        with mlflow_module.start_run(run_name=run_name, log_system_metrics=True) as run:
+            yield run
+    except TypeError:
+        with mlflow_module.start_run(run_name=run_name) as run:
+            yield run
+
+
+def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
