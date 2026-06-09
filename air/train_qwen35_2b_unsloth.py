@@ -711,6 +711,7 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 model_uri=model_info.model_uri,
                 name=FULL_MODEL_NAME,
                 await_registration_for=3600,
+                env_pack="databricks_model_serving"
 
             )
     finally:
@@ -794,7 +795,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_version=str(model_version),
         workload_type=workload_type,
         workload_size=SERVING_WORKLOAD_SIZE,
-        scale_to_zero_enabled=SERVING_SCALE_TO_ZERO,
+        scale_to_zero_enabled=False,
     )
     traffic_config = TrafficConfig(
         routes=[

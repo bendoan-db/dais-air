@@ -3,8 +3,8 @@ schema: air_dais
 source_table: fraud_dataset
 sft_table: fraud_sft_dataset
 checkpoint_volume: checkpoints
-uc_model_name: qwen35_2b_fraud_air
-endpoint_name: qwen35_2b_fraud_air
+uc_model_name: qwen35_2b_finetuned
+endpoint_name: qwen35_2b_finetuned
 
 model_name: unsloth/Qwen3.5-2B
 max_seq_length: 2048
