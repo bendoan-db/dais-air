@@ -3,10 +3,10 @@ schema: air_dais
 source_table: fraud_dataset
 sft_table: fraud_sft_dataset
 checkpoint_volume: checkpoints
-uc_model_name: qwen35_2b_finetuned
-endpoint_name: qwen35_2b_finetuned
+uc_model_name: qwen3_4b_finetuned
+endpoint_name: qwen3_4b_finetuned
 
-model_name: unsloth/Qwen3.5-2B
+model_name: unsloth/Qwen3-4B
 max_seq_length: 2048
 max_steps: 10
 per_device_train_batch_size: 2
@@ -17,7 +17,7 @@ deploy_endpoint: true
 serving_workload_type: GPU_MEDIUM
 serving_workload_size: Small
 serving_scale_to_zero: true
-served_model_name: qwen35_2b_fraud_air
+served_model_name: qwen3_4b_fraud_air
 vllm_dtype: float16
 vllm_max_model_len: 2048
 vllm_gpu_memory_utilization: 0.85

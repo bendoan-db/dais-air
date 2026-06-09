@@ -10,7 +10,7 @@ The demo uses the IBM TabFormer credit-card dataset and prepares a supervised fi
 | --- | --- |
 | `setup/01_load_tabformer_dataset.py` | Databricks notebook that downloads TabFormer, cleans transaction data, and overwrites Delta tables. |
 | `setup/setup.yaml` | Ingestion configuration: catalog, schema, table names, staging volume, source URL, and SFT shard count. |
-| `air/train_qwen35_2b_unsloth.py` | Databricks notebook for AIR fine-tuning with Unsloth, MLflow registration, and Model Serving deployment. |
+| `air/train_qwen3_4b_unsloth.py` | Databricks notebook for AIR fine-tuning with Unsloth, MLflow registration, and Model Serving deployment. |
 | `air/training.yaml` | Training, registration, and serving configuration. |
 | `air/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
 | `air/serving_load_test.yaml` | Load-test configuration. |
@@ -70,11 +70,11 @@ Update these files before running the demo:
 
 2. Fine-tune with AI Runtime.
 
-   Run `air/train_qwen35_2b_unsloth.py` on Databricks Serverless GPU with AI Runtime. The notebook:
+   Run `air/train_qwen3_4b_unsloth.py` on Databricks Serverless GPU with AI Runtime. The notebook:
 
    - Installs `air/requirements.txt`.
    - Reads the prepared SFT Delta table.
-   - Fine-tunes `unsloth/Qwen3.5-2B` with Unsloth LoRA.
+   - Fine-tunes `unsloth/Qwen3-4B` with Unsloth LoRA.
    - Uses the `@distributed` decorator so the same training cell can run on one GPU or multiple GPUs by changing the `gpus` parameter.
    - Saves rank-0 adapter artifacts to a Unity Catalog volume.
    - Logs training metrics to MLflow.

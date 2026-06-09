@@ -110,9 +110,9 @@ print(f"SFT table: {sft_table_q}")
 
 # COMMAND ----------
 
-# DBTITLE 1,AI Runtime fraud fine-tuning with Qwen3.5 2B and Unsloth
+# DBTITLE 1,AI Runtime fraud fine-tuning with Qwen3 4B and Unsloth
 # MAGIC %md
-# MAGIC # Fine-tune Qwen3.5 2B for fraud decisions with AI Runtime
+# MAGIC # Fine-tune Qwen3 4B for fraud decisions with AI Runtime
 # MAGIC
 # MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime.
 # MAGIC It is designed to stand alone for an external technical audience: each section explains what is happening, why it matters, and how the step contributes to a production AI workflow.
@@ -136,7 +136,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it.
 # MAGIC
 # MAGIC The setup notebook loads IBM TabFormer credit-card transactions into Unity Catalog Delta tables and builds prompt/response records for supervised fine-tuning.
-# MAGIC This training notebook reads those prepared SFT records and fine-tunes `unsloth/Qwen3.5-2B` to emit a structured fraud decision.
+# MAGIC This training notebook reads those prepared SFT records and fine-tunes `unsloth/Qwen3-4B` to emit a structured fraud decision.
 # MAGIC
 # MAGIC The output contract is a compact JSON object with:
 # MAGIC
@@ -200,7 +200,7 @@ display(sft_summary_pdf)
 # MAGIC - Accelerator: `1xH100` or `1xA10` for the validation path, or `8xH100` to demonstrate multi-GPU scaling.
 # MAGIC - Base environment: `AI v5`.
 # MAGIC
-# MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 2B bf16 LoRA workflow.
+# MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 4B bf16 LoRA workflow.
 # MAGIC The model is intentionally small so the notebook highlights the platform workflow: governed data, GPU-backed training, experiment tracking, and production handoff.
 # MAGIC
 # MAGIC ** Call out that we can run Spark on GPUs **
@@ -236,10 +236,10 @@ display(pd.DataFrame([scale_config]))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Fine-tune Qwen3.5 2B with Unsloth
+# MAGIC ## Fine-tune Qwen3 4B with Unsloth
 # MAGIC
-# MAGIC This section fine-tunes `unsloth/Qwen3.5-2B` with LoRA adapters.
-# MAGIC It uses bf16/16-bit LoRA instead of QLoRA because Unsloth's Qwen3.5 guidance does not recommend QLoRA for this model family.
+# MAGIC This section fine-tunes `unsloth/Qwen3-4B` with LoRA adapters.
+# MAGIC It uses bf16/16-bit LoRA for accuracy; the 4B model fits comfortably in GPU memory without quantization.
 # MAGIC
 # MAGIC The implementation highlights the production workflow around training:
 # MAGIC
@@ -287,7 +287,7 @@ def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
         )
 
 
-def train_qwen35_unsloth(
+def train_qwen3_unsloth(
     *,
     examples_pdf: pd.DataFrame,
     output_dir: str,
@@ -477,7 +477,7 @@ def train_qwen35_unsloth(
 # COMMAND ----------
 
 import mlflow
-mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen_2b_training")
+mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen3_4b_training")
 
 # COMMAND ----------
 
@@ -514,7 +514,7 @@ def run_training_job():
     training_mode = f"{world_size}_gpu_rank_sharded_sample"
 
     try:
-        return train_qwen35_unsloth(
+        return train_qwen3_unsloth(
             examples_pdf=dataset,
             output_dir=run_output_dir,
             run_name=run_name,
@@ -580,14 +580,14 @@ display(pd.DataFrame([genie_suggested_config]))
 # MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
 # MAGIC - The entrypoint launches from the MLflow model's `artifacts/` folder, so the `--model` path is the bare artifact name relative to that folder.
 # MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
-# MAGIC - The serving container installs vLLM from `pip_requirements`, not from `requirements.txt`. Qwen3.5's `Qwen3_5ForConditionalGeneration` architecture needs `vllm==0.19.1` and `transformers>=5.4`, and the entrypoint passes `--language-model-only` so vLLM skips the vision encoder for this text-only fine-tune.
+# MAGIC - The serving container installs vLLM from `pip_requirements`, not from `requirements.txt`. The pin `vllm==0.11.0` is the express-serving tested version, and the base model architecture (`Qwen3ForCausalLM`) is in its supported model list.
 # MAGIC
 # MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration or deployment fails, rerun only this section.
 
 # COMMAND ----------
 
 CUSTOM_LLM_TASK = "llm/v1/chat"
-CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen35_fraud_model"
+CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen3_fraud_model"
 CUSTOM_LLM_MODEL_ARTIFACT_PATH = CUSTOM_LLM_MODEL_ARTIFACT_NAME
 
 
@@ -641,7 +641,6 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
             f"--model {CUSTOM_LLM_MODEL_ARTIFACT_PATH} "
             f"--served-model-name {SERVED_MODEL_NAME} "
             "--host 0.0.0.0 --port 8080 "
-            "--language-model-only "
             f"--dtype {VLLM_DTYPE} "
             f"--max-model-len {VLLM_MAX_MODEL_LEN} "
             f"--gpu-memory-utilization {VLLM_GPU_MEMORY_UTILIZATION}"
@@ -701,10 +700,11 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 input_example=input_example,
                 pip_requirements=[
                     "mlflow>=3.12.0",
-                    # Qwen3.5 (Qwen3_5ForConditionalGeneration) requires vllm>=0.17;
-                    # 0.19.1 is the version validated internally for Qwen3.5 serving.
-                    "vllm==0.19.1",
-                    "transformers>=5.4.0",
+                    # vllm 0.11.0 is the tested express-serving version. Newer vLLM
+                    # (needed for e.g. Qwen3.5) pulls opencv-python-headless>=4.13,
+                    # whose bundled OpenSSL fails the FIPS self-test on serving pods.
+                    "vllm==0.11.0",
+                    "transformers>=5.0.0",
                     "accelerate>=1.11.0",
                     "safetensors>=0.5.0",
                     "torch",
@@ -928,5 +928,5 @@ print(json.dumps(serving_payload, indent=2))
 # MAGIC - Serverless GPU H100 starter: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-api-h100-starter
 # MAGIC - Databricks Unsloth example: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-finetune-llama-unsloth
 # MAGIC - Custom LLM serving with vLLM: https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms
-# MAGIC - Unsloth Qwen3.5: https://unsloth.ai/docs/models/qwen3.5
-# MAGIC - Unsloth Qwen3.5 fine-tuning: https://unsloth.ai/docs/models/qwen3.5/fine-tune
+# MAGIC - Unsloth Qwen3: https://unsloth.ai/docs/models/qwen3
+# MAGIC - Unsloth Qwen3 fine-tuning: https://unsloth.ai/docs/models/qwen3/fine-tune
