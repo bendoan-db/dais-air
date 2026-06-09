@@ -366,7 +366,10 @@ def train_qwen3_unsloth(
         "lora_alpha": 16,
         "lora_dropout": 0,
         "bias": "none",
-        "use_gradient_checkpointing": "unsloth",
+        # Unsloth's custom checkpointing is reentrant and fires DDP gradient hooks
+        # twice per LoRA param under multi-GPU @distributed runs; non-reentrant HF
+        # checkpointing is enabled through SFTConfig below instead.
+        "use_gradient_checkpointing": False,
         "random_state": SEED,
         "use_rslora": False,
         "loftq_config": None,
@@ -387,6 +390,8 @@ def train_qwen3_unsloth(
         learning_rate=LEARNING_RATE,
         fp16=not is_bfloat16_supported(),
         bf16=is_bfloat16_supported(),
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=1,
         optim="adamw_8bit",
         weight_decay=0.01,
