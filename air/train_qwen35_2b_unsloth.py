@@ -578,7 +578,7 @@ display(pd.DataFrame([genie_suggested_config]))
 # MAGIC
 # MAGIC - `task` is `llm/v1/chat`, matching the chat request contract used by the serving endpoint.
 # MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
-# MAGIC - The model path in the entrypoint is relative to the MLflow model artifact directory.
+# MAGIC - The entrypoint launches from the MLflow model's `artifacts/` folder, so the `--model` path is the bare artifact name relative to that folder.
 # MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
 # MAGIC
 # MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration or deployment fails, rerun only this section.
@@ -587,7 +587,7 @@ display(pd.DataFrame([genie_suggested_config]))
 
 CUSTOM_LLM_TASK = "llm/v1/chat"
 CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen35_fraud_model"
-CUSTOM_LLM_MODEL_ARTIFACT_PATH = f"artifacts/{CUSTOM_LLM_MODEL_ARTIFACT_NAME}"
+CUSTOM_LLM_MODEL_ARTIFACT_PATH = CUSTOM_LLM_MODEL_ARTIFACT_NAME
 
 
 def save_merged_hf_model(merged_model, tokenizer, model_dir: Path) -> None:
