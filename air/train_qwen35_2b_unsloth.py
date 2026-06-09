@@ -28,13 +28,14 @@
 # MAGIC - **Managed AI environment:** use the AI Runtime base environment with common model-training libraries already available.
 # MAGIC - **Unified data and governance:** read source transactions from Unity Catalog Delta tables and write checkpoints, adapters, and models to governed Unity Catalog assets.
 # MAGIC - **Simple scaling path:** start with `@distributed(gpus=1)`, then change that single decorator parameter to use multiple GPUs while the training code stays the same.
-# MAGIC - **Operational handoff:** use MLflow and Unity Catalog to move from experimentation toward managed serving and autoscaling.
+# MAGIC - **Operational handoff:** use MLflow and Unity Catalog to move from experimentation toward managed custom LLM serving.
 # MAGIC
 # MAGIC References:
 # MAGIC
 # MAGIC - Databricks AI Runtime: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/
 # MAGIC - Serverless GPU H100 starter: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-api-h100-starter
 # MAGIC - Databricks Unsloth example: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-finetune-llama-unsloth
+# MAGIC - Custom LLM serving with vLLM: https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms
 # MAGIC - Unsloth Qwen3.5: https://unsloth.ai/docs/models/qwen3.5
 # MAGIC - Unsloth Qwen3.5 fine-tuning: https://unsloth.ai/docs/models/qwen3.5/fine-tune
 
@@ -116,6 +117,7 @@ SOURCE_TABLE_NAME = config_str(training_config, "source_table")
 SFT_TABLE_NAME = config_str(training_config, "sft_table")
 UC_VOLUME = config_str(training_config, "checkpoint_volume")
 UC_MODEL_NAME = config_str(training_config, "uc_model_name")
+ENDPOINT_NAME = config_str(training_config, "endpoint_name")
 
 MODEL_NAME = config_str(training_config, "model_name")
 MAX_SEQ_LENGTH = config_int(training_config, "max_seq_length")
@@ -124,6 +126,14 @@ PER_DEVICE_TRAIN_BATCH_SIZE = config_int(training_config, "per_device_train_batc
 GRADIENT_ACCUMULATION_STEPS = config_int(training_config, "gradient_accumulation_steps")
 LEARNING_RATE = config_float(training_config, "learning_rate")
 REGISTER_MODEL = config_bool(training_config, "register_model")
+DEPLOY_ENDPOINT = config_bool(training_config, "deploy_endpoint")
+SERVING_WORKLOAD_TYPE = config_str(training_config, "serving_workload_type")
+SERVING_WORKLOAD_SIZE = config_str(training_config, "serving_workload_size")
+SERVING_SCALE_TO_ZERO = config_bool(training_config, "serving_scale_to_zero")
+SERVED_MODEL_NAME = config_str(training_config, "served_model_name")
+VLLM_DTYPE = config_str(training_config, "vllm_dtype")
+VLLM_MAX_MODEL_LEN = config_int(training_config, "vllm_max_model_len")
+VLLM_GPU_MEMORY_UTILIZATION = config_float(training_config, "vllm_gpu_memory_utilization")
 SEED = config_int(training_config, "seed")
 
 SOURCE_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SOURCE_TABLE_NAME}"
@@ -139,6 +149,9 @@ print(f"SFT table: {SFT_TABLE}")
 print(f"Base model: {MODEL_NAME}")
 print(f"Training output dir: {TRAINING_OUTPUT_DIR}")
 print(f"Register model: {REGISTER_MODEL}")
+print(f"Deploy endpoint: {DEPLOY_ENDPOINT}")
+print(f"Serving endpoint: {ENDPOINT_NAME}")
+print(f"Serving workload: {SERVING_WORKLOAD_TYPE} / {SERVING_WORKLOAD_SIZE}")
 
 # COMMAND ----------
 
@@ -563,73 +576,171 @@ display(pd.DataFrame([genie_suggested_config]))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Register the trained model
+# MAGIC ## Register the trained model for custom LLM serving
 # MAGIC
 # MAGIC Registration is separate from training so the distributed training cell stays focused on GPU optimization and adapter checkpointing.
-# MAGIC This cell loads the rank-0 adapter artifacts saved by training, merges them with the base model, and registers the merged model to Unity Catalog for serving.
+# MAGIC This cell loads the rank-0 adapter artifacts saved by training, merges them with the base model, packages the merged Hugging Face weights into an MLflow model artifact, and registers that model to Unity Catalog.
 # MAGIC
-# MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration fails, rerun only this section.
+# MAGIC Databricks custom LLM serving runs a vLLM OpenAI-compatible server from a custom MLflow entrypoint. The important serving choices are visible below:
+# MAGIC
+# MAGIC - `task` is `llm/v1/chat`, matching the chat request contract used by the serving endpoint.
+# MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
+# MAGIC - The model path in the entrypoint is relative to the MLflow model artifact directory.
+# MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
+# MAGIC
+# MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration or deployment fails, rerun only this section.
 
 # COMMAND ----------
 
-def register_trained_qwen35_model(adapter_output_dir: str, run_name: str):
+CUSTOM_LLM_TASK = "llm/v1/chat"
+CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen35_fraud_model"
+CUSTOM_LLM_MODEL_ARTIFACT_PATH = f"artifacts/{CUSTOM_LLM_MODEL_ARTIFACT_NAME}"
+
+
+def save_merged_hf_model(merged_model, tokenizer, model_dir: Path) -> None:
+    try:
+        merged_model.save_pretrained(model_dir, safe_serialization=True)
+    except TypeError:
+        merged_model.save_pretrained(model_dir)
+    tokenizer.save_pretrained(model_dir)
+
+
+def local_model_work_dir() -> Path:
+    import tempfile
+
+    local_disk = Path("/local_disk0")
+    if local_disk.exists():
+        return Path(tempfile.mkdtemp(prefix="air-custom-llm-", dir=local_disk))
+    return Path(tempfile.mkdtemp(prefix="air-custom-llm-"))
+
+
+def register_custom_llm_model(adapter_output_dir: str, run_name: str):
+    import shutil
+
     import mlflow
 
     mlflow.set_registry_uri("databricks-uc")
 
-    load_kwargs = {
-        "model_name": adapter_output_dir,
-        "max_seq_length": MAX_SEQ_LENGTH,
-        "dtype": None,
-        "load_in_4bit": False,
-        "load_in_16bit": True,
-    }
-    try:
-        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
-    except TypeError:
-        load_kwargs.pop("load_in_16bit", None)
-        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
-
-    merged_model = model.merge_and_unload()
-
-    with start_mlflow_run(mlflow, run_name) as run:
-        mlflow.log_params(
-            {
-                "base_model": MODEL_NAME,
-                "adapter_output_dir": adapter_output_dir,
-                "registered_model_name": FULL_MODEL_NAME,
-                "source_training_run_id": TRAINING_RUN_ID,
+    class CustomLlmEntrypointPlaceholder(mlflow.pyfunc.PythonModel):
+        def predict(self, context, model_input, params=None):
+            return {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "Inference is handled by the custom vLLM entrypoint.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ]
             }
-        )
-        model_info = mlflow.transformers.log_model(
-            transformers_model={"model": merged_model, "tokenizer": tokenizer},
-            name="model",
-            task="llm/v1/chat",
-            registered_model_name=FULL_MODEL_NAME,
-            await_registration_for=3600,
-            metadata={
-                "task": "llm/v1/chat",
-                "pretrained_model_name": MODEL_NAME,
-                "databricks_model_family": "Qwen3.5",
-                "demo": "AIR DAIS fraud detection",
-            },
-        )
+
+    metadata = {
+        "task": CUSTOM_LLM_TASK,
+        "entrypoint": (
+            "python -u -m vllm.entrypoints.openai.api_server "
+            f"--model {CUSTOM_LLM_MODEL_ARTIFACT_PATH} "
+            f"--served-model-name {SERVED_MODEL_NAME} "
+            "--host 0.0.0.0 --port 8080 "
+            f"--dtype {VLLM_DTYPE} "
+            f"--max-model-len {VLLM_MAX_MODEL_LEN} "
+            f"--gpu-memory-utilization {VLLM_GPU_MEMORY_UTILIZATION}"
+        ),
+    }
+
+    input_example = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Classify this card transaction and return compact JSON.",
+            }
+        ],
+        "max_tokens": 128,
+        "temperature": 0.0,
+    }
+
+    temp_dir = local_model_work_dir()
+    try:
+        merged_model_dir = temp_dir / CUSTOM_LLM_MODEL_ARTIFACT_NAME
+
+        load_kwargs = {
+            "model_name": adapter_output_dir,
+            "max_seq_length": MAX_SEQ_LENGTH,
+            "dtype": None,
+            "load_in_4bit": False,
+            "load_in_16bit": True,
+        }
+        try:
+            model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+        except TypeError:
+            load_kwargs.pop("load_in_16bit", None)
+            model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+
+        merged_model = model.merge_and_unload()
+        save_merged_hf_model(merged_model, tokenizer, merged_model_dir)
+
+        with start_mlflow_run(mlflow, run_name) as run:
+            mlflow.log_params(
+                {
+                    "base_model": MODEL_NAME,
+                    "adapter_output_dir": adapter_output_dir,
+                    "registered_model_name": FULL_MODEL_NAME,
+                    "source_training_run_id": TRAINING_RUN_ID,
+                    "custom_llm_task": CUSTOM_LLM_TASK,
+                    "custom_llm_model_artifact": CUSTOM_LLM_MODEL_ARTIFACT_PATH,
+                    "served_model_name": SERVED_MODEL_NAME,
+                    "vllm_dtype": VLLM_DTYPE,
+                    "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
+                    "vllm_gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
+                }
+            )
+            model_info = mlflow.pyfunc.log_model(
+                name="model",
+                python_model=CustomLlmEntrypointPlaceholder(),
+                artifacts={CUSTOM_LLM_MODEL_ARTIFACT_NAME: str(merged_model_dir)},
+                input_example=input_example,
+                pip_requirements=[
+                    "mlflow>=3.12.0",
+                    "vllm>=0.10.0",
+                    "transformers>=5.0.0",
+                    "accelerate>=1.11.0",
+                    "safetensors>=0.5.0",
+                    "torch",
+                ],
+                metadata=metadata,
+            )
+            model_version = mlflow.register_model(
+                model_uri=model_info.model_uri,
+                name=FULL_MODEL_NAME,
+                await_registration_for=3600,
+                env_pack="databricks_model_serving",
+            )
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
     return {
         "registration_run_id": run.info.run_id,
         "registered_model_name": FULL_MODEL_NAME,
+        "model_version": model_version.version,
         "model_uri": model_info.model_uri,
+        "custom_llm_task": CUSTOM_LLM_TASK,
+        "entrypoint": metadata["entrypoint"],
     }
 
+
+registration_result = None
+REGISTERED_MODEL_VERSION = None
 
 if REGISTER_MODEL:
     if "TRAINED_ADAPTER_OUTPUT_DIR" not in globals() or not TRAINED_ADAPTER_OUTPUT_DIR:
         raise ValueError("Run the training cell before registering the model.")
 
-    registration_result = register_trained_qwen35_model(
+    registration_result = register_custom_llm_model(
         adapter_output_dir=TRAINED_ADAPTER_OUTPUT_DIR,
         run_name=f"{TRAINING_RUN_NAME}-registration",
     )
+    REGISTERED_MODEL_VERSION = str(registration_result["model_version"])
     display(pd.DataFrame([registration_result]))
 else:
     print("Model registration skipped because register_model is false in training.yaml.")
@@ -637,20 +748,129 @@ else:
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Production handoff: model serving and autoscaling
+# MAGIC ## Deploy the custom LLM endpoint
 # MAGIC
-# MAGIC The previous section registers the fine-tuned model to Unity Catalog when `register_model = true`.
+# MAGIC This cell creates or updates a Mosaic AI Model Serving endpoint for the registered custom LLM.
+# MAGIC The deployment uses the Databricks SDK so the demo can be run end to end from the notebook instead of switching to the UI.
 # MAGIC
-# MAGIC From there, the production path is:
+# MAGIC The endpoint configuration is controlled by `training.yaml`:
 # MAGIC
-# MAGIC 1. Open the registered model in Unity Catalog.
-# MAGIC 2. Click **Serve this model**.
-# MAGIC 3. Create a Mosaic AI Model Serving endpoint with autoscaling enabled.
-# MAGIC 4. Send a sample transaction request.
-# MAGIC 5. Increase request traffic and observe endpoint health and autoscaling behavior.
+# MAGIC - `endpoint_name` is the serving endpoint name used by the load-test notebook.
+# MAGIC - `serving_workload_type` selects the GPU class, such as `GPU_MEDIUM` for A10 or `GPU_XLARGE` for H100.
+# MAGIC - `serving_workload_size` controls provisioned capacity behind the endpoint.
+# MAGIC - `serving_scale_to_zero` is useful for demos and development, but should be disabled for latency-sensitive production traffic.
 # MAGIC
-# MAGIC The request payload should keep the same prompt contract used during fine-tuning: ask for compact JSON with `risk`, `action`, and `reason`.
-# MAGIC This keeps development and serving aligned around the same interface.
+# MAGIC Custom LLM serving is currently a fixed-capacity serving path during beta. Size the workload for the traffic target before running a high-QPS load test.
+
+# COMMAND ----------
+
+def served_entity_name_for_version(model_name: str, version: str) -> str:
+    clean_name = model_name.rsplit(".", 1)[-1].replace("_", "-").replace(".", "-")
+    return f"{clean_name}-{version}"[:64]
+
+
+def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
+    if SERVING_WORKLOAD_TYPE == "GPU_XLARGE" and SERVING_SCALE_TO_ZERO:
+        raise ValueError(
+            "Custom LLM serving beta does not support scale-to-zero for GPU_XLARGE. "
+            "Set serving_scale_to_zero: false in training.yaml."
+        )
+
+    from datetime import timedelta
+
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.errors import NotFound, ResourceDoesNotExist
+    from databricks.sdk.service.serving import (
+        EndpointCoreConfigInput,
+        Route,
+        ServedEntityInput,
+        ServingModelWorkloadType,
+        TrafficConfig,
+    )
+
+    w = WorkspaceClient()
+    workload_type = ServingModelWorkloadType(SERVING_WORKLOAD_TYPE)
+    served_entity_name = served_entity_name_for_version(FULL_MODEL_NAME, model_version)
+    served_entity = ServedEntityInput(
+        name=served_entity_name,
+        entity_name=FULL_MODEL_NAME,
+        entity_version=str(model_version),
+        workload_type=workload_type,
+        workload_size=SERVING_WORKLOAD_SIZE,
+        scale_to_zero_enabled=SERVING_SCALE_TO_ZERO,
+    )
+    traffic_config = TrafficConfig(
+        routes=[
+            Route(
+                served_entity_name=served_entity_name,
+                traffic_percentage=100,
+            )
+        ]
+    )
+
+    try:
+        w.serving_endpoints.get(ENDPOINT_NAME)
+        endpoint = w.serving_endpoints.update_config_and_wait(
+            name=ENDPOINT_NAME,
+            served_entities=[served_entity],
+            traffic_config=traffic_config,
+            timeout=timedelta(minutes=60),
+        )
+        deployment_action = "updated"
+    except (NotFound, ResourceDoesNotExist):
+        endpoint = w.serving_endpoints.create_and_wait(
+            name=ENDPOINT_NAME,
+            config=EndpointCoreConfigInput(
+                name=ENDPOINT_NAME,
+                served_entities=[served_entity],
+                traffic_config=traffic_config,
+            ),
+            description="AIR demo custom LLM endpoint for TabFormer fraud decisions.",
+            timeout=timedelta(minutes=60),
+        )
+        deployment_action = "created"
+
+    endpoint_state = getattr(endpoint, "state", None)
+    workspace_url = (w.config.host or "").rstrip("/")
+    endpoint_url = (
+        f"{workspace_url}/serving-endpoints/{ENDPOINT_NAME}"
+        if workspace_url
+        else f"/serving-endpoints/{ENDPOINT_NAME}"
+    )
+
+    return {
+        "deployment_action": deployment_action,
+        "endpoint_name": ENDPOINT_NAME,
+        "endpoint_url": endpoint_url,
+        "registered_model_name": FULL_MODEL_NAME,
+        "model_version": str(model_version),
+        "served_entity_name": served_entity_name,
+        "workload_type": SERVING_WORKLOAD_TYPE,
+        "workload_size": SERVING_WORKLOAD_SIZE,
+        "scale_to_zero_enabled": SERVING_SCALE_TO_ZERO,
+        "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
+        "config_update": str(getattr(endpoint_state, "config_update", None)),
+    }
+
+
+deployment_result = None
+
+if DEPLOY_ENDPOINT:
+    if not REGISTERED_MODEL_VERSION:
+        raise ValueError("Deployment requires register_model: true so a model version is available.")
+
+    deployment_result = create_or_update_custom_llm_endpoint(REGISTERED_MODEL_VERSION)
+    display(pd.DataFrame([deployment_result]))
+else:
+    print("Endpoint deployment skipped because deploy_endpoint is false in training.yaml.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Query payload for validation and load testing
+# MAGIC
+# MAGIC The request payload keeps the same prompt contract used during fine-tuning: ask for compact JSON with `risk`, `action`, and `reason`.
+# MAGIC This keeps training, serving validation, and the load-test notebook aligned around the same interface.
 
 # COMMAND ----------
 
@@ -682,6 +902,7 @@ serving_payload = {
 }
 
 print(f"Registered model name: {FULL_MODEL_NAME}")
+print(f"Serving endpoint name: {ENDPOINT_NAME}")
 print(json.dumps(serving_payload, indent=2))
 
 # COMMAND ----------
@@ -695,6 +916,6 @@ print(json.dumps(serving_payload, indent=2))
 # MAGIC - Supervised chat records are generated from real table rows during ingestion and stored in the prepared SFT Delta table.
 # MAGIC - AI Runtime provides managed serverless GPU compute for model training.
 # MAGIC - The same training cell supports `gpus=1` validation and a scaled multi-GPU path.
-# MAGIC - MLflow captures the experiment record, and Unity Catalog provides the handoff point for serving.
+# MAGIC - MLflow captures the experiment record, Unity Catalog stores the registered model version, and the deployment cell creates or updates a custom LLM serving endpoint.
 # MAGIC
 # MAGIC The main platform outcome is speed with control: teams can move from governed data to GPU fine-tuning to registered model artifacts without leaving Databricks or stitching together separate infrastructure.
