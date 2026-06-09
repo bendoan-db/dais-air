@@ -14,7 +14,7 @@
 # MAGIC - **On-demand GPU access:** run deep learning workloads on serverless GPU compute without provisioning or maintaining GPU clusters.
 # MAGIC - **Managed AI environment:** use the AI Runtime base environment with common model-training libraries already available.
 # MAGIC - **Unified data and governance:** read source transactions from Unity Catalog Delta tables and write checkpoints, adapters, and models to governed Unity Catalog assets.
-# MAGIC - **Simple scaling path:** start with a single-node run on a small SFT-table sample, then use the same training function on rank-sharded SFT data with a distributed multi-GPU strategy.
+# MAGIC - **Simple scaling path:** start with `@distributed(gpus=1)`, then change that single decorator parameter to use multiple GPUs while the training code stays the same.
 # MAGIC - **Operational handoff:** use MLflow and Unity Catalog to move from experimentation toward managed serving and autoscaling.
 # MAGIC
 # MAGIC References:
@@ -53,7 +53,7 @@
 # MAGIC
 # MAGIC Recommended compute:
 # MAGIC
-# MAGIC - Accelerator: `1xH100` or `1xA10` for the single-node validation path, or `8xH100` for the distributed full-dataset path.
+# MAGIC - Accelerator: `1xH100` or `1xA10` for the validation path, or `8xH100` to demonstrate multi-GPU scaling.
 # MAGIC - Base environment: `AI v5`.
 # MAGIC
 # MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 2B bf16 LoRA workflow.
@@ -92,15 +92,10 @@
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
-# MAGIC - `distributed_gpus` and `distributed_gpu_type` define the scaled training strategy.
 # MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
 # MAGIC
-# MAGIC The notebook intentionally runs two training phases:
-# MAGIC
-# MAGIC 1. **Part 1:** train on one node with a small random SFT-table sample to validate the workflow cheaply.
-# MAGIC 2. **Part 2:** train on rank-sharded SFT-table data with distributed GPUs to show the scale-up path.
-# MAGIC
-# MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare both phases in MLflow.
+# MAGIC The demo uses one training cell. Run it first with `@distributed(gpus=1, gpu_type="h100")`, then change only `gpus` to a larger value such as `8` to distribute the same training workflow.
+# MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare runs in MLflow.
 
 # COMMAND ----------
 
@@ -128,8 +123,6 @@ UC_VOLUME = config_str(training_config, "checkpoint_volume")
 UC_MODEL_NAME = config_str(training_config, "uc_model_name")
 
 MODEL_NAME = config_str(training_config, "model_name")
-DISTRIBUTED_GPUS = config_int(training_config, "distributed_gpus")
-DISTRIBUTED_GPU_TYPE = config_str(training_config, "distributed_gpu_type")
 MAX_SEQ_LENGTH = config_int(training_config, "max_seq_length")
 MAX_STEPS = config_int(training_config, "max_steps")
 PER_DEVICE_TRAIN_BATCH_SIZE = config_int(training_config, "per_device_train_batch_size")
@@ -142,18 +135,14 @@ SOURCE_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SOURCE_TABLE_NAME}"
 SFT_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}"
 FULL_MODEL_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_MODEL_NAME}"
 OUTPUT_ROOT = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}/{UC_MODEL_NAME}"
-SINGLE_NODE_OUTPUT_DIR = f"{OUTPUT_ROOT}/single_node_sample"
-DISTRIBUTED_OUTPUT_DIR = f"{OUTPUT_ROOT}/distributed_full"
-SINGLE_NODE_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-single-node-sample-steps{MAX_STEPS}"
-DISTRIBUTED_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-distributed-full-steps{MAX_STEPS}"
+TRAINING_OUTPUT_DIR = f"{OUTPUT_ROOT}/training_demo"
+TRAINING_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-training-steps{MAX_STEPS}"
 
 print(f"Training config: {config_path}")
 print(f"Source table: {SOURCE_TABLE}")
 print(f"SFT table: {SFT_TABLE}")
 print(f"Base model: {MODEL_NAME}")
-print(f"Distributed strategy: {DISTRIBUTED_GPUS}x{DISTRIBUTED_GPU_TYPE}")
-print(f"Single-node output dir: {SINGLE_NODE_OUTPUT_DIR}")
-print(f"Distributed output dir: {DISTRIBUTED_OUTPUT_DIR}")
+print(f"Training output dir: {TRAINING_OUTPUT_DIR}")
 print(f"Register model: {REGISTER_MODEL}")
 
 # COMMAND ----------
@@ -168,8 +157,7 @@ sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_q}")
 
-Path(SINGLE_NODE_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
-Path(DISTRIBUTED_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+Path(TRAINING_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 print(f"Ready: {schema_q}")
 print(f"Ready: {volume_q}")
@@ -186,8 +174,6 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC This step also verifies that the ingestion notebook has successfully loaded the data before GPU time is used for training.
 
 # COMMAND ----------
-
-spark.table(sft_table_q)
 
 summary_sql = f"""
 SELECT
@@ -221,22 +207,21 @@ display(sft_summary_pdf)
 # MAGIC %md
 # MAGIC ## Scale plan
 # MAGIC
-# MAGIC The notebook loads training records directly from the prepared SFT Delta table inside each training section.
+# MAGIC The notebook loads training records directly from the prepared SFT Delta table inside the `@distributed` training function.
 # MAGIC Prompt and response generation already happened in ingestion, so the training path avoids row-by-row prompt construction on the driver:
 # MAGIC
-# MAGIC - **Part 1:** load a small random sample from the SFT table and train on one node.
-# MAGIC - **Part 2:** load rank-assigned SFT shards inside the `@distributed` function and train with the distributed strategy.
+# MAGIC - With `gpus=1`, one worker reads the sample and validates the end-to-end flow.
+# MAGIC - With `gpus>1`, each worker reads a different set of SFT shards by rank.
 # MAGIC
-# MAGIC Both parts use the same model, prompt contract, LoRA setup, MLflow logging, and Unity Catalog artifact layout.
-# MAGIC The main change is the record count and compute strategy, which makes the scale-up path explicit and easy to compare.
+# MAGIC The model, prompt contract, LoRA setup, MLflow logging, and Unity Catalog artifact layout stay fixed.
+# MAGIC The main change during the demo is the `gpus` value in the decorator.
 
 # COMMAND ----------
 
 scale_config = {
-    "part_1_strategy": "single node",
-    "part_1_delta_load": "small random SFT-table sample",
-    "part_2_strategy": f"distributed {DISTRIBUTED_GPUS}x{DISTRIBUTED_GPU_TYPE}",
-    "part_2_delta_load": "rank-sharded SFT table",
+    "initial_strategy": "@distributed(gpus=1, gpu_type=\"h100\")",
+    "scale_up_strategy": "change only the decorator to @distributed(gpus=8, gpu_type=\"h100\")",
+    "delta_load": "rank-sharded SFT table inside the distributed function",
     "intermediate_dataset_files": "none",
     "per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
     "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
@@ -258,19 +243,46 @@ display(pd.DataFrame([scale_config]))
 # MAGIC - MLflow records parameters, metrics, and run metadata.
 # MAGIC - Checkpoints and adapters are saved to a Unity Catalog volume.
 # MAGIC - If enabled, the merged model is registered to Unity Catalog for downstream serving.
-# MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the single-node and distributed runs.
+# MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the `gpus=1` and `gpus>1` runs.
 # MAGIC
 # MAGIC The training implementation is kept inline below so readers can inspect the Unsloth, TRL, MLflow, and distributed execution code directly.
 
 # COMMAND ----------
 
 # DBTITLE 1,Cell 18
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from unsloth.chat_templates import train_on_responses_only
 from transformers import DataCollatorForSeq2Seq
 from trl import SFTTrainer, SFTConfig
+
+
+@contextmanager
+def start_mlflow_run(mlflow_module, run_name: str):
+    try:
+        with mlflow_module.start_run(run_name=run_name, log_system_metrics=True) as run:
+            yield run
+    except TypeError:
+        with mlflow_module.start_run(run_name=run_name) as run:
+            yield run
+
+
+def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+
 
 def train_qwen35_unsloth(
     *,
@@ -282,12 +294,16 @@ def train_qwen35_unsloth(
     register_model: bool,
     device_map=None,
     save_artifacts: bool = True,
-) -> str:
+    rank: int = 0,
+    world_size: int = 1,
+) -> str | None:
     import mlflow
     import torch
     from datasets import Dataset
 
     mlflow.set_registry_uri("databricks-uc")
+    is_main_process = rank == 0
+    save_artifacts = save_artifacts and is_main_process
 
     dataset = Dataset.from_pandas(
         examples_pdf[["prompt", "assistant_response"]],
@@ -375,7 +391,7 @@ def train_qwen35_unsloth(
         lr_scheduler_type="linear",
         seed=SEED,
         output_dir=output_dir,
-        report_to="mlflow",
+        report_to="none",
         run_name=run_name,
         save_strategy="steps",
         save_steps=max(5, MAX_STEPS // 2),
@@ -403,24 +419,33 @@ def train_qwen35_unsloth(
     except Exception as exc:
         print(f"Response-only masking was skipped: {exc}")
 
-    with start_mlflow_run(mlflow, run_name) as run:
-        mlflow.log_params(
-            {
-                "base_model": MODEL_NAME,
-                "training_mode": training_mode,
-                "num_gpus": num_gpus,
-                "max_seq_length": MAX_SEQ_LENGTH,
-                "max_steps": MAX_STEPS,
-                "training_record_count": len(examples_pdf),
-                "source_table": SOURCE_TABLE,
-                "sft_table": SFT_TABLE,
-                "lora_r": 16,
-                "lora_alpha": 16,
-            }
-        )
+    run_context = start_mlflow_run(mlflow, run_name) if is_main_process else nullcontext()
+
+    with run_context as run:
+        if is_main_process:
+            mlflow.log_params(
+                {
+                    "base_model": MODEL_NAME,
+                    "training_mode": training_mode,
+                    "num_gpus": num_gpus,
+                    "rank": rank,
+                    "world_size": world_size,
+                    "max_seq_length": MAX_SEQ_LENGTH,
+                    "max_steps": MAX_STEPS,
+                    "rank_0_training_record_count": len(examples_pdf),
+                    "source_table": SOURCE_TABLE,
+                    "sft_table": SFT_TABLE,
+                    "lora_r": 16,
+                    "lora_alpha": 16,
+                }
+            )
 
         train_output = trainer.train()
         metrics = getattr(train_output, "metrics", {}) or {}
+
+        if not is_main_process:
+            return None
+
         for metric_name, metric_value in metrics.items():
             if isinstance(metric_value, (int, float)):
                 mlflow.log_metric(f"trainer_{metric_name}", float(metric_value))
@@ -462,7 +487,12 @@ def train_qwen35_unsloth(
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # Switching from Single Node to Multi-node Training with a Single Parmameter
+# MAGIC ## Scale training by changing one decorator parameter
+# MAGIC
+# MAGIC This is the only training cell in the demo.
+# MAGIC Run it first with `gpus=1` to validate the workflow, then change the decorator to `gpus=8` and rerun the same cell to distribute training across multiple GPUs.
+# MAGIC
+# MAGIC Each worker reads a rank-assigned slice of the prepared SFT Delta table. Keeping the Delta read inside the decorated function avoids shipping a large in-memory dataset from the notebook driver to the GPU workers.
 
 # COMMAND ----------
 
@@ -472,9 +502,11 @@ mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen_2b_training")
 # COMMAND ----------
 
 from serverless_gpu import distributed
-from serverless_gpu import runtime as rt
 
-@distributed(gpus=8, gpu_type="h100")
+TRAINING_SAMPLE_FRACTION = 0.001
+
+
+@distributed(gpus=1, gpu_type="h100")
 def run_training_job():
     import os
     import torch
@@ -497,103 +529,40 @@ def run_training_job():
     WHERE pmod(shard_id, {world_size}) = {rank}
     """
 
-    dataset = get_spark_session().sql(distributed_sql).sample(0.001).toPandas()
+    dataset = get_spark_session().sql(distributed_sql).sample(TRAINING_SAMPLE_FRACTION).toPandas()
+    run_output_dir = f"{TRAINING_OUTPUT_DIR}/{world_size}gpu"
+    run_name = f"{TRAINING_RUN_NAME}-{world_size}gpu"
+    training_mode = f"{world_size}_gpu_rank_sharded_sample"
 
-    return train_qwen35_unsloth(
-        examples_pdf=dataset,
-        output_dir=SINGLE_NODE_OUTPUT_DIR,
-        run_name="unsloth_distributed",
-        training_mode="single_node_sample",
-        num_gpus=8,
-        register_model=True,
-)
+    try:
+        return train_qwen35_unsloth(
+            examples_pdf=dataset,
+            output_dir=run_output_dir,
+            run_name=run_name,
+            training_mode=training_mode,
+            num_gpus=world_size,
+            register_model=REGISTER_MODEL,
+            device_map={"": local_rank},
+            save_artifacts=rank == 0,
+            rank=rank,
+            world_size=world_size,
+        )
+    finally:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 distributed_run_ids = run_training_job.distributed()
-DISTRIBUTED_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
+TRAINING_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
 
-print(f"Distributed MLflow run ID: {DISTRIBUTED_RUN_ID}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Part 2: distributed training on the full dataset
-# MAGIC
-# MAGIC After the single-node pass succeeds, load rank-assigned shards from the prepared SFT Delta table and run the same training function with the distributed AI Runtime strategy.
-# MAGIC This section demonstrates the scale-up path: the data contract, LoRA configuration, MLflow logging, and Unity Catalog artifact locations stay the same, while the compute strategy changes.
-# MAGIC
-# MAGIC This is the production-oriented training pass:
-# MAGIC
-# MAGIC - Dataset: precomputed SFT Delta rows assigned by `shard_id`
-# MAGIC - Compute: distributed `serverless_gpu` execution using the configured GPU count and type
-# MAGIC - Model registration: controlled by `register_model` in `training.yaml`
-# MAGIC - Output: full-run adapters, checkpoints, and optional Unity Catalog registered model
-# MAGIC
-# MAGIC The SFT-table load happens inside the decorated function. This follows the `serverless_gpu` best practice: keep large datasets out of the function closure so the launcher does not need to pickle and ship them to workers.
-# MAGIC In production, `rt.get_global_rank()` and `rt.get_world_size()` let each worker read a different set of table shards instead of having every worker load the full dataset.
-
-# COMMAND ----------
-
-from serverless_gpu import distributed
-
-
-@distributed(gpus=DISTRIBUTED_GPUS, gpu_type=DISTRIBUTED_GPU_TYPE)
-def run_distributed_train():
-    import os
-    import torch
-    from serverless_gpu import runtime as rt
-
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    rank = rt.get_global_rank()
-    world_size = rt.get_world_size()
-    torch.cuda.set_device(local_rank)
-
-    distributed_sql = f"""
-    SELECT
-      training_id,
-      shard_id,
-      prompt,
-      assistant_response,
-      fraud_label,
-      is_fraud
-    FROM {sft_table_q}
-    WHERE pmod(shard_id, {world_size}) = {rank}
-    """
-
-    distributed_pdf = get_spark_session().sql(distributed_sql).toPandas()
-    if rank == 0:
-        print(f"Prepared {len(distributed_pdf)} distributed examples for rank {rank} of {world_size}")
-        print(
-            distributed_pdf.groupby("is_fraud")
-            .size()
-            .reset_index(name="row_count")
-            .assign(dataset="distributed_rank_shard")
-            .to_string(index=False)
-        )
-
-    return train_qwen35_unsloth(
-        examples_pdf=distributed_pdf,
-        output_dir=DISTRIBUTED_OUTPUT_DIR,
-        run_name=DISTRIBUTED_RUN_NAME,
-        training_mode=f"distributed_{DISTRIBUTED_GPUS}x{DISTRIBUTED_GPU_TYPE}_full",
-        num_gpus=DISTRIBUTED_GPUS,
-        register_model=REGISTER_MODEL,
-        device_map={"": local_rank},
-        save_artifacts=rt.get_global_rank() == 0,
-    )
-
-
-distributed_run_ids = run_distributed_train.distributed()
-DISTRIBUTED_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
-
-print(f"Distributed MLflow run ID: {DISTRIBUTED_RUN_ID}")
+print(f"Training MLflow run ID: {TRAINING_RUN_ID}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Performance optimization loop
 # MAGIC
-# MAGIC After a successful baseline run, compare runtime, loss, and GPU utilization in MLflow and the notebook resource panels.
-# MAGIC For distributed training, a common first bottleneck is an effective batch size that is too small to keep the GPUs busy.
+# MAGIC After a successful baseline run, change `gpus` in the decorator, rerun the training cell, and compare runtime, loss, and GPU utilization in MLflow and the notebook resource panels.
+# MAGIC For multi-GPU training, a common first bottleneck is an effective batch size that is too small to keep the GPUs busy.
 # MAGIC
 # MAGIC Use the suggested configuration below as a starting point for the next experiment:
 # MAGIC
@@ -676,7 +645,7 @@ print(json.dumps(serving_payload, indent=2))
 # MAGIC - Ingested transactions are governed in Unity Catalog.
 # MAGIC - Supervised chat records are generated from real table rows during ingestion and stored in the prepared SFT Delta table.
 # MAGIC - AI Runtime provides managed serverless GPU compute for model training.
-# MAGIC - The same training logic supports single-node validation and a scaled multi-GPU path.
+# MAGIC - The same training cell supports `gpus=1` validation and a scaled multi-GPU path.
 # MAGIC - MLflow captures the experiment record, and Unity Catalog provides the handoff point for serving.
 # MAGIC
 # MAGIC The main platform outcome is speed with control: teams can move from governed data to GPU fine-tuning to registered model artifacts without leaving Databricks or stitching together separate infrastructure.
