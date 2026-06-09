@@ -1,4 +1,17 @@
 # Databricks notebook source
+# MAGIC %md
+# MAGIC ## Install notebook requirements
+# MAGIC
+# MAGIC Install the Python packages required by the notebook.
+# MAGIC AI Runtime already includes many common AI and ML libraries; this cell makes the notebook reproducible when package versions need to be pinned for the project.
+
+# COMMAND ----------
+
+# MAGIC %pip install -qqq -r requirements.txt
+# MAGIC %restart_python
+
+# COMMAND ----------
+
 # DBTITLE 1,AI Runtime fraud fine-tuning with Qwen3.5 2B and Unsloth
 # MAGIC %md
 # MAGIC # Fine-tune Qwen3.5 2B for fraud decisions with AI Runtime
@@ -58,24 +71,6 @@
 # MAGIC
 # MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 2B bf16 LoRA workflow.
 # MAGIC The model is intentionally small so the notebook highlights the platform workflow: governed data, GPU-backed training, experiment tracking, and production handoff.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Install notebook requirements
-# MAGIC
-# MAGIC Install the Python packages required by the notebook.
-# MAGIC AI Runtime already includes many common AI and ML libraries; this cell makes the notebook reproducible when package versions need to be pinned for the project.
-
-# COMMAND ----------
-
-# MAGIC %pip install -qqq -r requirements.txt
-# MAGIC %restart_python
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Load shared utilities
 
 # COMMAND ----------
 
@@ -174,6 +169,8 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC This step also verifies that the ingestion notebook has successfully loaded the data before GPU time is used for training.
 
 # COMMAND ----------
+
+display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd', 'user_id_text', 'card_id_text', 'transaction_ts_text', 'merchant_city_text', 'merchant_state_text', 'mcc_text', 'errors_text', 'has_error_signal'))
 
 summary_sql = f"""
 SELECT
@@ -482,8 +479,7 @@ from serverless_gpu import distributed
 
 TRAINING_SAMPLE_FRACTION = 0.001
 
-
-@distributed(gpus=1, gpu_type="h100")
+@distributed(gpus=8, gpu_type="h100")
 def run_training_job():
     import os
     import torch
