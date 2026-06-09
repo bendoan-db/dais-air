@@ -242,7 +242,7 @@ display(pd.DataFrame([scale_config]))
 # MAGIC
 # MAGIC - MLflow records parameters, metrics, and run metadata.
 # MAGIC - Checkpoints and adapters are saved to a Unity Catalog volume.
-# MAGIC - If enabled, the merged model is registered to Unity Catalog for downstream serving.
+# MAGIC - Model registration is handled in a separate section after training completes.
 # MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the `gpus=1` and `gpus>1` runs.
 # MAGIC
 # MAGIC The training implementation is kept inline below so readers can inspect the Unsloth, TRL, MLflow, and distributed execution code directly.
@@ -291,7 +291,6 @@ def train_qwen35_unsloth(
     run_name: str,
     training_mode: str,
     num_gpus: int,
-    register_model: bool,
     device_map=None,
     save_artifacts: bool = True,
     rank: int = 0,
@@ -455,28 +454,6 @@ def train_qwen35_unsloth(
             tokenizer.save_pretrained(output_dir)
             mlflow.log_param("adapter_output_dir", output_dir)
 
-            if register_model:
-                try:
-                    merged_model = model.merge_and_unload()
-                    model_info = mlflow.transformers.log_model(
-                        transformers_model={"model": merged_model, "tokenizer": tokenizer},
-                        name="model",
-                        task="llm/v1/chat",
-                        registered_model_name=FULL_MODEL_NAME,
-                        await_registration_for=3600,
-                        metadata={
-                            "task": "llm/v1/chat",
-                            "pretrained_model_name": MODEL_NAME,
-                            "databricks_model_family": "Qwen3.5",
-                            "demo": "AIR DAIS fraud detection",
-                        },
-                    )
-                    print(f"Registered model: {FULL_MODEL_NAME}")
-                    print(f"MLflow model URI: {model_info.model_uri}")
-                except Exception as exc:
-                    print(f"Model registration skipped or failed: {exc}")
-                    print(f"LoRA adapters remain saved at: {output_dir}")
-
         if torch.cuda.is_available():
             peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
             mlflow.log_metric("peak_cuda_memory_allocated_gb", peak_memory_gb)
@@ -541,7 +518,6 @@ def run_training_job():
             run_name=run_name,
             training_mode=training_mode,
             num_gpus=world_size,
-            register_model=REGISTER_MODEL,
             device_map={"": local_rank},
             save_artifacts=rank == 0,
             rank=rank,
@@ -553,8 +529,11 @@ def run_training_job():
 
 distributed_run_ids = run_training_job.distributed()
 TRAINING_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
+TRAINING_WORLD_SIZE = len(distributed_run_ids)
+TRAINED_ADAPTER_OUTPUT_DIR = f"{TRAINING_OUTPUT_DIR}/{TRAINING_WORLD_SIZE}gpu"
 
 print(f"Training MLflow run ID: {TRAINING_RUN_ID}")
+print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
 
 # COMMAND ----------
 
@@ -588,9 +567,83 @@ display(pd.DataFrame([genie_suggested_config]))
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Register the trained model
+# MAGIC
+# MAGIC Registration is separate from training so the distributed training cell stays focused on GPU optimization and adapter checkpointing.
+# MAGIC This cell loads the rank-0 adapter artifacts saved by training, merges them with the base model, and registers the merged model to Unity Catalog for serving.
+# MAGIC
+# MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration fails, rerun only this section.
+
+# COMMAND ----------
+
+def register_trained_qwen35_model(adapter_output_dir: str, run_name: str):
+    import mlflow
+
+    mlflow.set_registry_uri("databricks-uc")
+
+    load_kwargs = {
+        "model_name": adapter_output_dir,
+        "max_seq_length": MAX_SEQ_LENGTH,
+        "dtype": None,
+        "load_in_4bit": False,
+        "load_in_16bit": True,
+    }
+    try:
+        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+    except TypeError:
+        load_kwargs.pop("load_in_16bit", None)
+        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+
+    merged_model = model.merge_and_unload()
+
+    with start_mlflow_run(mlflow, run_name) as run:
+        mlflow.log_params(
+            {
+                "base_model": MODEL_NAME,
+                "adapter_output_dir": adapter_output_dir,
+                "registered_model_name": FULL_MODEL_NAME,
+                "source_training_run_id": TRAINING_RUN_ID,
+            }
+        )
+        model_info = mlflow.transformers.log_model(
+            transformers_model={"model": merged_model, "tokenizer": tokenizer},
+            name="model",
+            task="llm/v1/chat",
+            registered_model_name=FULL_MODEL_NAME,
+            await_registration_for=3600,
+            metadata={
+                "task": "llm/v1/chat",
+                "pretrained_model_name": MODEL_NAME,
+                "databricks_model_family": "Qwen3.5",
+                "demo": "AIR DAIS fraud detection",
+            },
+        )
+
+    return {
+        "registration_run_id": run.info.run_id,
+        "registered_model_name": FULL_MODEL_NAME,
+        "model_uri": model_info.model_uri,
+    }
+
+
+if REGISTER_MODEL:
+    if "TRAINED_ADAPTER_OUTPUT_DIR" not in globals() or not TRAINED_ADAPTER_OUTPUT_DIR:
+        raise ValueError("Run the training cell before registering the model.")
+
+    registration_result = register_trained_qwen35_model(
+        adapter_output_dir=TRAINED_ADAPTER_OUTPUT_DIR,
+        run_name=f"{TRAINING_RUN_NAME}-registration",
+    )
+    display(pd.DataFrame([registration_result]))
+else:
+    print("Model registration skipped because register_model is false in training.yaml.")
+
+# COMMAND ----------
+
+# MAGIC %md
 # MAGIC ## Production handoff: model serving and autoscaling
 # MAGIC
-# MAGIC The fine-tuned model is registered to the Unity Catalog name printed in the next cell when `register_model = true`.
+# MAGIC The previous section registers the fine-tuned model to Unity Catalog when `register_model = true`.
 # MAGIC
 # MAGIC From there, the production path is:
 # MAGIC
