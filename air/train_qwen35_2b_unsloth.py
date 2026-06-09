@@ -580,6 +580,7 @@ display(pd.DataFrame([genie_suggested_config]))
 # MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
 # MAGIC - The entrypoint launches from the MLflow model's `artifacts/` folder, so the `--model` path is the bare artifact name relative to that folder.
 # MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
+# MAGIC - The serving container installs vLLM from `pip_requirements`, not from `requirements.txt`. Qwen3.5's `Qwen3_5ForConditionalGeneration` architecture needs `vllm==0.19.1` and `transformers>=5.4`, and the entrypoint passes `--language-model-only` so vLLM skips the vision encoder for this text-only fine-tune.
 # MAGIC
 # MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration or deployment fails, rerun only this section.
 
@@ -640,6 +641,7 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
             f"--model {CUSTOM_LLM_MODEL_ARTIFACT_PATH} "
             f"--served-model-name {SERVED_MODEL_NAME} "
             "--host 0.0.0.0 --port 8080 "
+            "--language-model-only "
             f"--dtype {VLLM_DTYPE} "
             f"--max-model-len {VLLM_MAX_MODEL_LEN} "
             f"--gpu-memory-utilization {VLLM_GPU_MEMORY_UTILIZATION}"
@@ -699,8 +701,10 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 input_example=input_example,
                 pip_requirements=[
                     "mlflow>=3.12.0",
-                    "vllm>=0.10.0",
-                    "transformers>=5.0.0",
+                    # Qwen3.5 (Qwen3_5ForConditionalGeneration) requires vllm>=0.17;
+                    # 0.19.1 is the version validated internally for Qwen3.5 serving.
+                    "vllm==0.19.1",
+                    "transformers>=5.4.0",
                     "accelerate>=1.11.0",
                     "safetensors>=0.5.0",
                     "torch",
