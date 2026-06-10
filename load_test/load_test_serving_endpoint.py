@@ -36,7 +36,24 @@
 
 # COMMAND ----------
 
-# MAGIC %run ../train/training_utils
+# training_utils is a plain Python module in train/ (not a notebook), so it is
+# imported rather than %run. The notebook's working directory is the notebook's
+# folder on serverless, so ../train resolves to the module's directory.
+import sys
+from pathlib import Path
+
+TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
+if TRAIN_MODULE_DIR not in sys.path:
+    sys.path.insert(0, TRAIN_MODULE_DIR)
+
+from training_utils import (
+    config_float,
+    config_int,
+    config_str,
+    full_name,
+    get_spark_session,
+    load_yaml_config,
+)
 
 # COMMAND ----------
 
@@ -55,7 +72,7 @@ from pyspark.sql import functions as F
 
 # COMMAND ----------
 
-config_path, load_test_config = load_yaml_config("serving_load_test.yaml")
+config_path, load_test_config = load_yaml_config("serving_load_test.yaml", base_dir=Path.cwd())
 
 UC_CATALOG = config_str(load_test_config, "catalog")
 UC_SCHEMA = config_str(load_test_config, "schema")

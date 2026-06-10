@@ -1,32 +1,26 @@
-# Databricks notebook source
-# DBTITLE 1,AIR fraud fine-tuning utilities
-# MAGIC %md
-# MAGIC # AIR fraud fine-tuning utilities
-# MAGIC
-# MAGIC Shared setup helpers for the demo. The training notebook loads this file with `%run ./training_utils` and the load-test notebook with `%run ../train/training_utils`, so configuration loading and Spark naming are defined in the notebook session. `train.py` (and the setup notebook in local-script mode) imports it as a regular Python module instead.
-# MAGIC
-# MAGIC The module is deliberately not named `utils`: GPU base environments (via `nvidia_cutlass_dsl`) register their own top-level `utils` module once the torch/CUDA stack loads, which shadows any local `utils.py` on import.
+"""Shared helpers for the AIR fraud fine-tuning demo.
 
-# COMMAND ----------
+This is a plain Python module (NOT a Databricks notebook): the workspace
+refuses ordinary imports of notebook-formatted files (NotebookImportException),
+and ``train.py`` must import these helpers under the runner notebook, the AI
+Runtime CLI, and local execution alike. Notebooks consume it the same way —
+insert this file's directory into ``sys.path`` and import; do not ``%run`` it.
+
+The module is deliberately not named ``utils``: GPU base environments (via
+``nvidia_cutlass_dsl``) register their own top-level ``utils`` module once the
+torch/CUDA stack loads, which shadows any local ``utils.py`` on import.
+"""
 
 from pathlib import Path
 
 import yaml
 
-# COMMAND ----------
+MODULE_DIR = Path(__file__).resolve().parent
 
 
-def get_notebook_dir() -> Path:
-    try:
-        return Path(__file__).resolve().parent
-    except NameError:
-        notebook_context = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
-        notebook_path = notebook_context.notebookPath().get()
-        return Path("/Workspace") / notebook_path.lstrip("/").rsplit("/", 1)[0]
-
-
-def load_yaml_config(config_filename: str) -> tuple[Path, dict]:
-    config_path = get_notebook_dir() / config_filename
+def load_yaml_config(config_filename: str, base_dir: Path | None = None) -> tuple[Path, dict]:
+    """Load a YAML mapping from ``base_dir`` (default: this module's folder)."""
+    config_path = (base_dir or MODULE_DIR) / config_filename
 
     with config_path.open("r", encoding="utf-8") as config_file:
         config = yaml.safe_load(config_file)
@@ -70,8 +64,6 @@ def config_bool(config: dict, key: str) -> bool:
         return False
     raise ValueError(f"Config key must be boolean-like: {key}")
 
-# COMMAND ----------
-
 
 def quote_identifier(identifier: str) -> str:
     return f"`{identifier.replace('`', '``')}`"
@@ -82,14 +74,11 @@ def full_name(*parts: str) -> str:
 
 
 def get_spark_session():
-    if "spark" in globals():
-        return globals()["spark"]
-
+    """Return the active Spark session, attaching a serverless Databricks
+    Connect session when none exists yet (local scripts, GPU workers)."""
     from databricks.connect import DatabricksSession
 
     return DatabricksSession.builder.serverless().getOrCreate()
-
-# COMMAND ----------
 
 
 def load_training_config() -> dict:
@@ -103,7 +92,7 @@ def load_training_config() -> dict:
     quoted SQL identifiers, intended to be bound into the caller's namespace
     with ``globals().update(load_training_config())``. Used by the training
     runner notebook and by train.py; deliberately a function (not top-level
-    code) so that other consumers of this file are unaffected.
+    code) so that importing this module has no side effects.
     """
     import os
 

@@ -12,7 +12,18 @@
 
 # COMMAND ----------
 
-# MAGIC %run ./training_utils
+# training_utils is a plain Python module (not a notebook) so the same file
+# can be imported here, by train.py, and under the AI Runtime CLI. Put this
+# notebook's directory on sys.path first; NOTEBOOK_DIR is reused inside the
+# @distributed cell so GPU workers can import train.py the same way.
+import sys
+from pathlib import Path
+
+NOTEBOOK_DIR = str(Path.cwd())
+if NOTEBOOK_DIR not in sys.path:
+    sys.path.insert(0, NOTEBOOK_DIR)
+
+from training_utils import init_training_workspace, load_training_config
 
 # COMMAND ----------
 
@@ -55,12 +66,6 @@ print(f"Register model: {REGISTER_MODEL}")
 print(f"Deploy endpoint: {DEPLOY_ENDPOINT}")
 print(f"Serving endpoint: {ENDPOINT_NAME}")
 print(f"Serving workload: {SERVING_WORKLOAD_TYPE} / {SERVING_WORKLOAD_SIZE}")
-
-# Make train.py importable from this notebook's folder, both on the driver and
-# inside @distributed GPU workers.
-NOTEBOOK_DIR = str(get_notebook_dir())
-if NOTEBOOK_DIR not in sys.path:
-    sys.path.insert(0, NOTEBOOK_DIR)
 
 # COMMAND ----------
 
