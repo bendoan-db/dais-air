@@ -585,7 +585,7 @@ display(pd.DataFrame([genie_suggested_config]))
 # MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
 # MAGIC - The entrypoint launches from the MLflow model's `artifacts/` folder, so the `--model` path is the bare artifact name relative to that folder.
 # MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
-# MAGIC - The serving container installs vLLM from `pip_requirements`, not from `requirements.txt`. The pin `vllm==0.15.0` is the newest vLLM that runs on Model Serving's FIPS-enabled pods, it requires `transformers<5`, and the base model architecture (`Qwen3ForCausalLM`) is in its supported model list.
+# MAGIC - The serving container installs vLLM from `pip_requirements`, not from `requirements.txt`. The pins `vllm==0.11.0`, `transformers<5`, and `opencv-python-headless==4.12.0.88` are the combination that runs on Model Serving's FIPS-enabled pods, and the base model architecture (`Qwen3ForCausalLM`) is in this vLLM's supported model list.
 # MAGIC
 # MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration or deployment fails, rerun only this section.
 
@@ -705,13 +705,16 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 input_example=input_example,
                 pip_requirements=[
                     "mlflow>=3.12.0",
-                    # vllm 0.15.0 is the newest FIPS-safe version: anything newer
-                    # pulls opencv-python-headless>=4.13, whose bundled OpenSSL
-                    # fails the FIPS self-test on serving pods. vLLM <= 0.15 also
-                    # requires transformers 4.x; transformers 5 removed tokenizer
-                    # attributes (all_special_tokens_extended) that it reads.
-                    "vllm==0.15.0",
+                    # FIPS-safe combination for Model Serving pods: vllm 0.11.0 is
+                    # the newest vLLM whose opencv floor (>=4.11) still admits
+                    # opencv 4.12.0.88 — the 4.13+ builds bundle an OpenSSL that
+                    # dies with FATAL FIPS SELFTEST FAILURE (vllm>=0.15 floors
+                    # opencv at 4.13, so it cannot be made FIPS-safe). vLLM of
+                    # this era also needs transformers 4.x: transformers 5 removed
+                    # tokenizer attributes (all_special_tokens_extended) it reads.
+                    "vllm==0.11.0",
                     "transformers>=4.56.0,<5",
+                    "opencv-python-headless==4.12.0.88",
                     "accelerate>=1.11.0",
                     "safetensors>=0.5.0",
                     "torch",
