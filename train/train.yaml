@@ -10,7 +10,7 @@
 # serving settings). AIR also exposes it on the cluster via
 # $HYPERPARAMETERS_PATH, which load_training_config() prefers so that
 # `air run --override` values reach the training script.
-experiment_name: unsloth_qwen3_4b_training
+experiment_name: unsloth_qwen3_4b_instruct_training
 environment:
   version: '5'
   # Keep in sync with train/requirements.txt.
@@ -63,8 +63,8 @@ parameters:
     # must match setup.yaml's sft_volume.
     sft_volume: training_data
     checkpoint_volume: checkpoints
-    uc_model_name: qwen3_4b_finetuned
-    endpoint_name: qwen3_4b_finetuned
+    uc_model_name: qwen3_4b_instruct_finetuned
+    endpoint_name: qwen3_4b_instruct_finetuned
 
     model_name: unsloth/Qwen3-4B-Instruct-2507
     max_seq_length: 2048
@@ -83,7 +83,7 @@ parameters:
     # us-west-2 + beta enrollment required).
     serving_workload_size: Large
     serving_scale_to_zero: false
-    served_model_name: qwen3_4b_finetuned
+    served_model_name: qwen3_4b_instruct_finetuned
     vllm_dtype: float16
     vllm_max_model_len: 2048
     vllm_gpu_memory_utilization: 0.9

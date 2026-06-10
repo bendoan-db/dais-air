@@ -236,7 +236,7 @@ mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen3_4b_training"
 
 from serverless_gpu import distributed
 
-@distributed(gpus=1, gpu_type="h100")
+@distributed(gpus=8, gpu_type="h100")
 def run_training_job():
     import sys
 
@@ -507,7 +507,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_version=str(model_version),
         workload_type=workload_type,
         workload_size=SERVING_WORKLOAD_SIZE,
-        scale_to_zero_enabled=SERVING_SCALE_TO_ZERO,
+        max_provisioned_concurrency=128,
         environment_vars={
             # The serving container has no ninja/nvcc, so FlashInfer (shipped in
             # the Databricks AI base env) cannot JIT-compile its sampling kernels
@@ -563,7 +563,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         "served_entity_name": served_entity_name,
         "workload_type": SERVING_WORKLOAD_TYPE,
         "workload_size": SERVING_WORKLOAD_SIZE,
-        "scale_to_zero_enabled": SERVING_SCALE_TO_ZERO,
+        "max_provisioned_concurrency": 128,
         "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
         "config_update": str(getattr(endpoint_state, "config_update", None)),
     }
