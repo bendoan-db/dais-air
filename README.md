@@ -74,7 +74,7 @@ Update these files before running the demo:
 
    - Installs `air/requirements.txt`.
    - Reads the prepared SFT Delta table.
-   - Fine-tunes `unsloth/Qwen3-4B` with Unsloth LoRA.
+   - Fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with Unsloth LoRA.
    - Uses the `@distributed` decorator so the same training cell can run on one GPU or multiple GPUs by changing the `gpus` parameter.
    - Saves rank-0 adapter artifacts to a Unity Catalog volume.
    - Logs training metrics to MLflow.

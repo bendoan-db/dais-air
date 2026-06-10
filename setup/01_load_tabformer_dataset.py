@@ -30,6 +30,26 @@ from pyspark.sql.types import (
 
 # COMMAND ----------
 
+# MAGIC %run ../air/utils
+
+# COMMAND ----------
+
+# The %run above provides the shared helpers in workspace notebook runs; when
+# this file executes as a local script the MAGIC line is a plain comment, so
+# import the same helpers from air/utils instead.
+if "quote_identifier" not in globals():
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "air"))
+    from utils import (
+        config_bool,
+        config_float,
+        config_int,
+        config_str,
+        get_spark_session,
+        quote_identifier,
+    )
+
 try:
     script_dir = Path(__file__).resolve().parent
 except NameError:
@@ -42,28 +62,19 @@ config_path = script_dir / "setup.yaml"
 with config_path.open("r", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
-catalog = str(config["catalog"]).strip()
-schema = str(config["schema"]).strip()
-table = str(config["table"]).strip()
-sft_table = str(config["sft_table"]).strip()
-staging_volume = str(config["staging_volume"]).strip()
-dataset_name = str(config["dataset_name"]).strip()
-source_url = str(config["source_url"]).strip()
-archive_filename = str(config["archive_filename"]).strip()
-force_download = config["force_download"]
-suspicious_amount_threshold = float(config["suspicious_amount_threshold"])
-sft_shards = int(config["sft_shards"])
+catalog = config_str(config, "catalog")
+schema = config_str(config, "schema")
+table = config_str(config, "table")
+sft_table = config_str(config, "sft_table")
+staging_volume = config_str(config, "staging_volume")
+dataset_name = config_str(config, "dataset_name")
+source_url = config_str(config, "source_url")
+archive_filename = config_str(config, "archive_filename")
+force_download = config_bool(config, "force_download")
+suspicious_amount_threshold = config_float(config, "suspicious_amount_threshold")
+sft_shards = config_int(config, "sft_shards")
 
-
-if "spark" not in globals():
-    from databricks.connect import DatabricksSession
-
-    spark = DatabricksSession.builder.serverless().getOrCreate()
-
-
-def quote_identifier(identifier: str) -> str:
-    return f"`{identifier.replace('`', '``')}`"
-
+spark = get_spark_session()
 
 catalog_q = quote_identifier(catalog)
 schema_q = quote_identifier(schema)

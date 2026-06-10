@@ -41,7 +41,6 @@
 # COMMAND ----------
 
 import json
-import math
 import os
 import time
 import uuid
@@ -49,6 +48,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 from pyspark.sql import functions as F
@@ -304,18 +304,7 @@ load_test_id = str(uuid.uuid4())
 def percentile(values: list[float], percentile_value: float) -> float | None:
     if not values:
         return None
-
-    sorted_values = sorted(values)
-    rank = (len(sorted_values) - 1) * percentile_value / 100
-    lower_index = math.floor(rank)
-    upper_index = math.ceil(rank)
-
-    if lower_index == upper_index:
-        return sorted_values[int(rank)]
-
-    lower_weight = upper_index - rank
-    upper_weight = rank - lower_index
-    return sorted_values[lower_index] * lower_weight + sorted_values[upper_index] * upper_weight
+    return float(np.percentile(values, percentile_value))
 
 
 worker_result_schema = """
@@ -383,6 +372,16 @@ def run_worker_batches(batch_iterator):
                 latency_ms = (time.perf_counter() - started_request) * 1000
                 return "exception", latency_ms, repr(exc)[:500]
 
+        async def drain_completed(pending_tasks):
+            done, remaining = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                status, latency_ms, error_preview = await task
+                status_counts[str(status)] += 1
+                record_latency(latency_ms)
+                if error_preview and len(failure_examples) < 5:
+                    failure_examples.append({"status": str(status), "preview": error_preview})
+            return remaining
+
         async with aiohttp.ClientSession(headers=AUTH_HEADERS, timeout=timeout, connector=connector) as session:
             pending = set()
             started_at = time.perf_counter()
@@ -396,22 +395,10 @@ def run_worker_batches(batch_iterator):
                 pending.add(asyncio.create_task(send_request(session, request_index)))
 
                 if len(pending) >= WORKER_CONCURRENCY:
-                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        status, latency_ms, error_preview = await task
-                        status_counts[str(status)] += 1
-                        record_latency(latency_ms)
-                        if error_preview and len(failure_examples) < 5:
-                            failure_examples.append({"status": str(status), "preview": error_preview})
+                    pending = await drain_completed(pending)
 
             while pending:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    status, latency_ms, error_preview = await task
-                    status_counts[str(status)] += 1
-                    record_latency(latency_ms)
-                    if error_preview and len(failure_examples) < 5:
-                        failure_examples.append({"status": str(status), "preview": error_preview})
+                pending = await drain_completed(pending)
 
         elapsed_seconds = time.perf_counter() - started_at
         success_count = sum(count for status, count in status_counts.items() if status.isdigit() and 200 <= int(status) < 300)

@@ -25,7 +25,7 @@
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
-# MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
+# MAGIC - `max_steps`, batch size, learning rate, and `training_sample_fraction` control the training cost and runtime.
 # MAGIC
 # MAGIC The demo uses one training cell. Run it first with `@distributed(gpus=1, gpu_type="h100")`, then change only `gpus` to a larger value such as `8` to distribute the same training workflow.
 # MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare runs in MLflow.
@@ -62,6 +62,7 @@ MAX_STEPS = config_int(training_config, "max_steps")
 PER_DEVICE_TRAIN_BATCH_SIZE = config_int(training_config, "per_device_train_batch_size")
 GRADIENT_ACCUMULATION_STEPS = config_int(training_config, "gradient_accumulation_steps")
 LEARNING_RATE = config_float(training_config, "learning_rate")
+TRAINING_SAMPLE_FRACTION = config_float(training_config, "training_sample_fraction")
 REGISTER_MODEL = config_bool(training_config, "register_model")
 DEPLOY_ENDPOINT = config_bool(training_config, "deploy_endpoint")
 SERVING_WORKLOAD_TYPE = config_str(training_config, "serving_workload_type")
@@ -99,8 +100,8 @@ volume_q = full_name(UC_CATALOG, UC_SCHEMA, UC_VOLUME)
 source_table_q = full_name(UC_CATALOG, UC_SCHEMA, SOURCE_TABLE_NAME)
 sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 
-#spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
-#spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_q}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_q}")
 
 Path(TRAINING_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
@@ -136,7 +137,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it.
 # MAGIC
 # MAGIC The setup notebook loads IBM TabFormer credit-card transactions into Unity Catalog Delta tables and builds prompt/response records for supervised fine-tuning.
-# MAGIC This training notebook reads those prepared SFT records and fine-tunes `unsloth/Qwen3-4B` to emit a structured fraud decision.
+# MAGIC This training notebook reads those prepared SFT records and fine-tunes `unsloth/Qwen3-4B-Instruct-2507` to emit a structured fraud decision.
 # MAGIC
 # MAGIC The output contract is a compact JSON object with:
 # MAGIC
@@ -202,8 +203,6 @@ display(sft_summary_pdf)
 # MAGIC
 # MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 4B bf16 LoRA workflow.
 # MAGIC The model is intentionally small so the notebook highlights the platform workflow: governed data, GPU-backed training, experiment tracking, and production handoff.
-# MAGIC
-# MAGIC ** Call out that we can run Spark on GPUs **
 
 # COMMAND ----------
 
@@ -238,7 +237,8 @@ display(pd.DataFrame([scale_config]))
 # MAGIC %md
 # MAGIC ## Fine-tune Qwen3 4B with Unsloth
 # MAGIC
-# MAGIC This section fine-tunes `unsloth/Qwen3-4B` with LoRA adapters.
+# MAGIC This section fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with LoRA adapters.
+# MAGIC The Instruct-2507 variant is non-thinking: it answers directly instead of emitting reasoning tokens first, which keeps served responses inside the compact JSON contract and the per-request generation budget. (Base Qwen3 is a hybrid reasoning model whose serving-time chat template defaults to thinking mode.)
 # MAGIC It uses bf16/16-bit LoRA for accuracy; the 4B model fits comfortably in GPU memory without quantization.
 # MAGIC
 # MAGIC The implementation highlights the production workflow around training:
@@ -252,8 +252,8 @@ display(pd.DataFrame([scale_config]))
 
 # COMMAND ----------
 
-# DBTITLE 1,Cell 18
-from contextlib import contextmanager, nullcontext
+# DBTITLE 1,Training implementation
+from contextlib import nullcontext
 
 from unsloth import FastLanguageModel, is_bfloat16_supported
 from unsloth.chat_templates import train_on_responses_only
@@ -261,30 +261,27 @@ from transformers import DataCollatorForSeq2Seq
 from trl import SFTTrainer, SFTConfig
 
 
-@contextmanager
-def start_mlflow_run(mlflow_module, run_name: str):
-    try:
-        with mlflow_module.start_run(run_name=run_name, log_system_metrics=True) as run:
-            yield run
-    except TypeError:
-        with mlflow_module.start_run(run_name=run_name) as run:
-            yield run
+def load_unsloth_model(model_name: str, device_map=None):
+    load_kwargs = {
+        "model_name": model_name,
+        "max_seq_length": MAX_SEQ_LENGTH,
+        "dtype": None,
+        "load_in_4bit": False,
+        "load_in_16bit": True,
+        "full_finetuning": False,
+    }
+    if device_map is not None:
+        load_kwargs["device_map"] = device_map
+    return FastLanguageModel.from_pretrained(**load_kwargs)
 
 
 def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-            enable_thinking=False,
-        )
-    except TypeError:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=False,
+    )
 
 
 def train_qwen3_unsloth(
@@ -312,23 +309,7 @@ def train_qwen3_unsloth(
         preserve_index=False,
     )
 
-    load_kwargs = {
-        "model_name": MODEL_NAME,
-        "max_seq_length": MAX_SEQ_LENGTH,
-        "dtype": None,
-        "load_in_4bit": False,
-        "load_in_16bit": True,
-        "full_finetuning": False,
-    }
-    if device_map is not None:
-        load_kwargs["device_map"] = device_map
-
-    try:
-        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
-    except TypeError:
-        load_kwargs.pop("load_in_16bit", None)
-        load_kwargs.pop("full_finetuning", None)
-        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+    model, tokenizer = load_unsloth_model(MODEL_NAME, device_map=device_map)
 
     def formatting_prompts_func(examples):
         texts = [
@@ -376,11 +357,7 @@ def train_qwen3_unsloth(
         "max_seq_length": MAX_SEQ_LENGTH,
     }
 
-    try:
-        model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
-    except TypeError:
-        peft_kwargs.pop("max_seq_length", None)
-        model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
+    model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
 
     training_args = SFTConfig(
         per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
@@ -426,7 +403,11 @@ def train_qwen3_unsloth(
     except Exception as exc:
         print(f"Response-only masking was skipped: {exc}")
 
-    run_context = start_mlflow_run(mlflow, run_name) if is_main_process else nullcontext()
+    run_context = (
+        mlflow.start_run(run_name=run_name, log_system_metrics=True)
+        if is_main_process
+        else nullcontext()
+    )
 
     with run_context as run:
         if is_main_process:
@@ -488,9 +469,7 @@ mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen3_4b_training"
 
 from serverless_gpu import distributed
 
-TRAINING_SAMPLE_FRACTION = 0.001
-
-@distributed(gpus=8, gpu_type="h100")
+@distributed(gpus=1, gpu_type="h100")
 def run_training_job():
     import os
     import torch
@@ -561,15 +540,15 @@ print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
 
 # COMMAND ----------
 
-genie_suggested_config = {
+suggested_next_config = {
     "current_per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
     "current_gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
-    "suggested_per_device_train_batch_size": max(PER_DEVICE_TRAIN_BATCH_SIZE, 4),
-    "suggested_gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
+    "suggested_per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE * 2,
+    "suggested_gradient_accumulation_steps": max(1, GRADIENT_ACCUMULATION_STEPS // 2),
     "rerun_instruction": "Update training.yaml, rerun from Training configuration, and compare MLflow loss/runtime/GPU metrics.",
 }
 
-display(pd.DataFrame([genie_suggested_config]))
+display(pd.DataFrame([suggested_next_config]))
 
 # COMMAND ----------
 
@@ -593,15 +572,6 @@ display(pd.DataFrame([genie_suggested_config]))
 
 CUSTOM_LLM_TASK = "llm/v1/chat"
 CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen3_fraud_model"
-CUSTOM_LLM_MODEL_ARTIFACT_PATH = CUSTOM_LLM_MODEL_ARTIFACT_NAME
-
-
-def save_merged_hf_model(merged_model, tokenizer, model_dir: Path) -> None:
-    try:
-        merged_model.save_pretrained(model_dir, safe_serialization=True)
-    except TypeError:
-        merged_model.save_pretrained(model_dir)
-    tokenizer.save_pretrained(model_dir)
 
 
 def local_model_work_dir() -> Path:
@@ -614,13 +584,9 @@ def local_model_work_dir() -> Path:
 
 
 def register_custom_llm_model(adapter_output_dir: str, run_name: str):
-    import os
     import shutil
 
     import mlflow
-
-    os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] = "1200"
-    os.environ["MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT"] = "1200"
 
     mlflow.set_registry_uri("databricks-uc")
 
@@ -643,7 +609,7 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
         "task": CUSTOM_LLM_TASK,
         "entrypoint": (
             "python -u -m vllm.entrypoints.openai.api_server "
-            f"--model {CUSTOM_LLM_MODEL_ARTIFACT_PATH} "
+            f"--model {CUSTOM_LLM_MODEL_ARTIFACT_NAME} "
             f"--served-model-name {SERVED_MODEL_NAME} "
             "--host 0.0.0.0 --port 8080 "
             f"--dtype {VLLM_DTYPE} "
@@ -667,23 +633,13 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
     try:
         merged_model_dir = temp_dir / CUSTOM_LLM_MODEL_ARTIFACT_NAME
 
-        load_kwargs = {
-            "model_name": adapter_output_dir,
-            "max_seq_length": MAX_SEQ_LENGTH,
-            "dtype": None,
-            "load_in_4bit": False,
-            "load_in_16bit": True,
-        }
-        try:
-            model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
-        except TypeError:
-            load_kwargs.pop("load_in_16bit", None)
-            model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+        model, tokenizer = load_unsloth_model(adapter_output_dir)
 
         merged_model = model.merge_and_unload()
-        save_merged_hf_model(merged_model, tokenizer, merged_model_dir)
+        merged_model.save_pretrained(merged_model_dir, safe_serialization=True)
+        tokenizer.save_pretrained(merged_model_dir)
 
-        with start_mlflow_run(mlflow, run_name) as run:
+        with mlflow.start_run(run_name=run_name, log_system_metrics=True) as run:
             mlflow.log_params(
                 {
                     "base_model": MODEL_NAME,
@@ -691,7 +647,7 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                     "registered_model_name": FULL_MODEL_NAME,
                     "source_training_run_id": TRAINING_RUN_ID,
                     "custom_llm_task": CUSTOM_LLM_TASK,
-                    "custom_llm_model_artifact": CUSTOM_LLM_MODEL_ARTIFACT_PATH,
+                    "custom_llm_model_artifact": CUSTOM_LLM_MODEL_ARTIFACT_NAME,
                     "served_model_name": SERVED_MODEL_NAME,
                     "vllm_dtype": VLLM_DTYPE,
                     "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
@@ -772,6 +728,8 @@ else:
 # MAGIC - `serving_workload_size` controls provisioned capacity behind the endpoint.
 # MAGIC - `serving_scale_to_zero` is useful for demos and development, but should be disabled for latency-sensitive production traffic.
 # MAGIC
+# MAGIC The served entity also sets `VLLM_USE_FLASHINFER_SAMPLER=0`: the serving container cannot JIT-compile FlashInfer kernels (no `ninja`/`nvcc`), so vLLM must use its native PyTorch sampler.
+# MAGIC
 # MAGIC Custom LLM serving is currently a fixed-capacity serving path during beta. Size the workload for the traffic target before running a high-QPS load test.
 
 # COMMAND ----------
@@ -809,7 +767,13 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_version=str(model_version),
         workload_type=workload_type,
         workload_size=SERVING_WORKLOAD_SIZE,
-        scale_to_zero_enabled=False,
+        scale_to_zero_enabled=SERVING_SCALE_TO_ZERO,
+        environment_vars={
+            # The serving container has no ninja/nvcc, so FlashInfer (shipped in
+            # the Databricks AI base env) cannot JIT-compile its sampling kernels
+            # at startup; fall back to vLLM's native PyTorch sampler.
+            "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        },
     )
     traffic_config = TrafficConfig(
         routes=[
