@@ -30,18 +30,20 @@ from pyspark.sql.types import (
 
 # COMMAND ----------
 
-# MAGIC %run ../train/utils
+# MAGIC %run ../train/training_utils
 
 # COMMAND ----------
 
 # The %run above provides the shared helpers in workspace notebook runs; when
 # this file executes as a local script the MAGIC line is a plain comment, so
-# import the same helpers from train/utils instead.
+# import the same helpers from train/training_utils instead. (The module is not
+# named `utils` because GPU base environments ship packages that register a
+# top-level `utils` module, shadowing any local one.)
 if "quote_identifier" not in globals():
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "train"))
-    from utils import (
+    from training_utils import (
         config_bool,
         config_float,
         config_int,
@@ -67,6 +69,7 @@ schema = config_str(config, "schema")
 table = config_str(config, "table")
 sft_table = config_str(config, "sft_table")
 staging_volume = config_str(config, "staging_volume")
+sft_volume = config_str(config, "sft_volume")
 dataset_name = config_str(config, "dataset_name")
 source_url = config_str(config, "source_url")
 archive_filename = config_str(config, "archive_filename")
@@ -81,16 +84,20 @@ schema_q = quote_identifier(schema)
 table_q = quote_identifier(table)
 sft_table_q = quote_identifier(sft_table)
 volume_q = quote_identifier(staging_volume)
+sft_volume_q = quote_identifier(sft_volume)
 
 full_schema_name = f"{catalog_q}.{schema_q}"
 full_table_name = f"{full_schema_name}.{table_q}"
 full_sft_table_name = f"{full_schema_name}.{sft_table_q}"
 full_volume_name = f"{full_schema_name}.{volume_q}"
+full_sft_volume_name = f"{full_schema_name}.{sft_volume_q}"
+sft_files_path = f"/Volumes/{catalog}/{schema}/{sft_volume}/{sft_table}"
 
 # COMMAND ----------
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {full_schema_name}")
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {full_volume_name}")
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {full_sft_volume_name}")
 
 volume_root = Path(f"/Volumes/{catalog}/{schema}/{staging_volume}")
 dataset_root = volume_root / dataset_name
@@ -102,6 +109,7 @@ dataset_root.mkdir(parents=True, exist_ok=True)
 print(f"Config path: {config_path}")
 print(f"Target table: {full_table_name}")
 print(f"Target SFT table: {full_sft_table_name}")
+print(f"Target SFT parquet export: {sft_files_path}")
 print(f"Staging path: {dataset_root}")
 
 # COMMAND ----------
@@ -608,6 +616,29 @@ print(f"Overwrote SFT Delta table {full_sft_table_name}")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Export SFT records to a Unity Catalog volume as Parquet
+# MAGIC
+# MAGIC AI Runtime's data-loading guidance recommends exporting large Delta tables to a UC volume and reading the files directly during training, which avoids Spark overhead on the GPU workers:
+# MAGIC https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
+# MAGIC
+# MAGIC Parquet is used because the training code (Unsloth) consumes Hugging Face `datasets`, which loads Parquet natively as memory-mapped Arrow tables.
+# MAGIC The export is partitioned by `shard_id`, so the existing rank-sharding contract carries over: each GPU worker claims the `shard_id=N` directories where `N % world_size == rank` and reads only its own files.
+
+# COMMAND ----------
+
+(
+    spark.table(full_sft_table_name)
+    .repartition(sft_shards, "shard_id")
+    .write.mode("overwrite")
+    .partitionBy("shard_id")
+    .parquet(sft_files_path)
+)
+
+print(f"Exported SFT parquet shards to {sft_files_path}")
+
+# COMMAND ----------
+
 loaded_df = spark.sql(f"SELECT * FROM {full_table_name}")
 sft_loaded_df = spark.sql(f"SELECT * FROM {full_sft_table_name}")
 
@@ -646,3 +677,10 @@ if "is_fraud" in sft_loaded_df.columns:
 
 display(sft_loaded_df.agg(*sft_summary_expressions))
 display(sft_loaded_df.select("training_id", "shard_id", "prompt", "assistant_response").limit(10))
+
+sft_shard_dirs = sorted(Path(sft_files_path).glob("shard_id=*"))
+print(f"SFT parquet export: {len(sft_shard_dirs)} shard directories under {sft_files_path}")
+if len(sft_shard_dirs) != sft_shards:
+    raise ValueError(
+        f"Expected {sft_shards} shard directories in the parquet export, found {len(sft_shard_dirs)}."
+    )
