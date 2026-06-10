@@ -2,8 +2,8 @@
 
 This module owns the Unsloth LoRA training implementation and runs two ways:
 
-- Imported by the ``train_qwen3_4b_unsloth`` notebook, whose ``@distributed``
-  cell calls :func:`run_rank_training` on each GPU worker.
+- Imported by the ``runner`` notebook, whose ``@distributed`` cell calls
+  :func:`run_rank_training` on each GPU worker.
 - Executed directly as ``python train.py`` by the AI Runtime CLI
   (``air run --file train.yaml``), where each GPU worker runs this file.
 
@@ -26,42 +26,14 @@ from unsloth.chat_templates import train_on_responses_only
 from transformers import DataCollatorForSeq2Seq
 from trl import SFTTrainer, SFTConfig
 
-from utils import (
-    config_float,
-    config_int,
-    config_str,
-    config_value,
-    full_name,
-    get_spark_session,
-    load_yaml_config,
-)
+from utils import get_spark_session, load_training_config
 
-CONFIG_PATH, WORKLOAD_CONFIG = load_yaml_config("train.yaml")
-TRAINING_CONFIG = config_value(WORKLOAD_CONFIG, "training_config")
-
-UC_CATALOG = config_str(TRAINING_CONFIG, "catalog")
-UC_SCHEMA = config_str(TRAINING_CONFIG, "schema")
-SOURCE_TABLE_NAME = config_str(TRAINING_CONFIG, "source_table")
-SFT_TABLE_NAME = config_str(TRAINING_CONFIG, "sft_table")
-UC_VOLUME = config_str(TRAINING_CONFIG, "checkpoint_volume")
-UC_MODEL_NAME = config_str(TRAINING_CONFIG, "uc_model_name")
-
-MODEL_NAME = config_str(TRAINING_CONFIG, "model_name")
-MAX_SEQ_LENGTH = config_int(TRAINING_CONFIG, "max_seq_length")
-MAX_STEPS = config_int(TRAINING_CONFIG, "max_steps")
-PER_DEVICE_TRAIN_BATCH_SIZE = config_int(TRAINING_CONFIG, "per_device_train_batch_size")
-GRADIENT_ACCUMULATION_STEPS = config_int(TRAINING_CONFIG, "gradient_accumulation_steps")
-LEARNING_RATE = config_float(TRAINING_CONFIG, "learning_rate")
-TRAINING_SAMPLE_FRACTION = config_float(TRAINING_CONFIG, "training_sample_fraction")
-SEED = config_int(TRAINING_CONFIG, "seed")
-
-SOURCE_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SOURCE_TABLE_NAME}"
-SFT_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}"
-SFT_TABLE_QUALIFIED = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
-TRAINING_OUTPUT_DIR = (
-    f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}/{UC_MODEL_NAME}/training_demo"
-)
-TRAINING_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-training-steps{MAX_STEPS}"
+# Bind the shared configuration into module globals: typed training_config
+# values (MODEL_NAME, MAX_SEQ_LENGTH, hyperparameters, SEED, ...), derived
+# names (SOURCE_TABLE, SFT_TABLE, TRAINING_OUTPUT_DIR, TRAINING_RUN_NAME), and
+# quoted SQL identifiers (sft_table_q) — the same names the runner notebook
+# binds into its session.
+globals().update(load_training_config())
 
 
 def load_unsloth_model(model_name: str, device_map=None):
@@ -292,7 +264,7 @@ def run_rank_training() -> str | None:
       assistant_response,
       fraud_label,
       is_fraud
-    FROM {SFT_TABLE_QUALIFIED}
+    FROM {sft_table_q}
     WHERE pmod(shard_id, {world_size}) = {rank}
     """
 

@@ -10,7 +10,7 @@ The demo uses the IBM TabFormer credit-card dataset and prepares a supervised fi
 | --- | --- |
 | `setup/01_load_tabformer_dataset.py` | Databricks notebook that downloads TabFormer, cleans transaction data, and overwrites Delta tables. |
 | `setup/setup.yaml` | Ingestion configuration: catalog, schema, table names, staging volume, source URL, and SFT shard count. |
-| `train/train_qwen3_4b_unsloth.py` | Databricks notebook for AIR fine-tuning with Unsloth, MLflow registration, and Model Serving deployment. |
+| `train/runner.py` | Databricks notebook for AIR fine-tuning with Unsloth, MLflow registration, and Model Serving deployment. |
 | `train/train.py` | Standalone training module: imported by the notebook's `@distributed` cell and runnable directly via the AI Runtime CLI. |
 | `train/train.yaml` | AI Runtime CLI workload definition (`air run --file train.yaml`) plus the training, registration, and serving configuration (`training_config` section). |
 | `load_test/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
@@ -71,7 +71,7 @@ Update these files before running the demo:
 
 2. Fine-tune with AI Runtime.
 
-   Run `train/train_qwen3_4b_unsloth.py` on Databricks Serverless GPU with AI Runtime. The notebook:
+   Run `train/runner.py` on Databricks Serverless GPU with AI Runtime. The notebook:
 
    - Installs `train/requirements.txt`.
    - Reads the prepared SFT Delta table.

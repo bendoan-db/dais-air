@@ -6,8 +6,8 @@
 # The top-level fields follow the AI Runtime workload schema
 # (https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/).
 # The training_config section is the demo's own configuration, read by
-# train.py and by the train_qwen3_4b_unsloth notebook (training, registration,
-# and serving settings).
+# train.py and by the runner notebook (training, registration, and serving
+# settings).
 experiment_name: /Users/ben.doan@databricks.com/unsloth_qwen3_4b_training
 environment:
   version: '5'

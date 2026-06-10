@@ -40,42 +40,13 @@ import pandas as pd
 
 # COMMAND ----------
 
-config_path, workload_config = load_yaml_config("train.yaml")
-training_config = config_value(workload_config, "training_config")
+# load_training_config (defined in utils) parses train.yaml's training_config
+# section, derives the UC names/paths, and returns one flat dict; binding it
+# into globals gives every later cell the same constants train.py uses.
+training_context = load_training_config()
+globals().update(training_context)
 
-UC_CATALOG = config_str(training_config, "catalog")
-UC_SCHEMA = config_str(training_config, "schema")
-SOURCE_TABLE_NAME = config_str(training_config, "source_table")
-SFT_TABLE_NAME = config_str(training_config, "sft_table")
-UC_VOLUME = config_str(training_config, "checkpoint_volume")
-UC_MODEL_NAME = config_str(training_config, "uc_model_name")
-ENDPOINT_NAME = config_str(training_config, "endpoint_name")
-
-MODEL_NAME = config_str(training_config, "model_name")
-MAX_SEQ_LENGTH = config_int(training_config, "max_seq_length")
-MAX_STEPS = config_int(training_config, "max_steps")
-PER_DEVICE_TRAIN_BATCH_SIZE = config_int(training_config, "per_device_train_batch_size")
-GRADIENT_ACCUMULATION_STEPS = config_int(training_config, "gradient_accumulation_steps")
-LEARNING_RATE = config_float(training_config, "learning_rate")
-REGISTER_MODEL = config_bool(training_config, "register_model")
-DEPLOY_ENDPOINT = config_bool(training_config, "deploy_endpoint")
-SERVING_WORKLOAD_TYPE = config_str(training_config, "serving_workload_type")
-SERVING_WORKLOAD_SIZE = config_str(training_config, "serving_workload_size")
-SERVING_SCALE_TO_ZERO = config_bool(training_config, "serving_scale_to_zero")
-SERVED_MODEL_NAME = config_str(training_config, "served_model_name")
-VLLM_DTYPE = config_str(training_config, "vllm_dtype")
-VLLM_MAX_MODEL_LEN = config_int(training_config, "vllm_max_model_len")
-VLLM_GPU_MEMORY_UTILIZATION = config_float(training_config, "vllm_gpu_memory_utilization")
-SEED = config_int(training_config, "seed")
-
-SOURCE_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SOURCE_TABLE_NAME}"
-SFT_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}"
-FULL_MODEL_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_MODEL_NAME}"
-OUTPUT_ROOT = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}/{UC_MODEL_NAME}"
-TRAINING_OUTPUT_DIR = f"{OUTPUT_ROOT}/training_demo"
-TRAINING_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-training-steps{MAX_STEPS}"
-
-print(f"Training config: {config_path}")
+print(f"Training config: {CONFIG_PATH}")
 print(f"Source table: {SOURCE_TABLE}")
 print(f"SFT table: {SFT_TABLE}")
 print(f"Base model: {MODEL_NAME}")
@@ -93,17 +64,7 @@ if NOTEBOOK_DIR not in sys.path:
 
 # COMMAND ----------
 
-spark = get_spark_session()
-
-schema_q = full_name(UC_CATALOG, UC_SCHEMA)
-volume_q = full_name(UC_CATALOG, UC_SCHEMA, UC_VOLUME)
-source_table_q = full_name(UC_CATALOG, UC_SCHEMA, SOURCE_TABLE_NAME)
-sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
-
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
-spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_q}")
-
-Path(TRAINING_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+spark = init_training_workspace(training_context)
 
 print(f"Ready: {schema_q}")
 print(f"Ready: {volume_q}")
