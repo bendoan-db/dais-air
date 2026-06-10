@@ -1,0 +1,71 @@
+# Combined AI Runtime CLI workload definition and demo training configuration.
+#
+# Submit training from this directory with:
+#   air run --file train.yaml --watch
+#
+# The top-level fields follow the AI Runtime workload schema
+# (https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/).
+# The training_config section is the demo's own configuration, read by
+# train.py and by the train_qwen3_4b_unsloth notebook (training, registration,
+# and serving settings).
+experiment_name: /Users/ben.doan@databricks.com/unsloth_qwen3_4b_training
+environment:
+  version: '5'
+  # Keep in sync with train/requirements.txt.
+  dependencies:
+    - pyyaml>=6.0.2
+    - pandas>=2.2.0
+    - databricks-connect>=17.0.0
+    - databricks-sdk>=0.102.0
+    - mlflow>=3.12.0
+    - accelerate>=1.11.0
+    - bitsandbytes>=0.46.0
+    - datasets>=3.6.0
+    - einops>=0.8.1
+    - hf_transfer>=0.1.9
+    - peft>=0.19.1
+    - safetensors>=0.5.0
+    - transformers>=5.0.0
+    - trl>=0.24.0
+    - unsloth
+    - unsloth_zoo>=2026.4.8
+    - torchao>=0.16.0
+    - xformers>=0.0.31.post1
+compute:
+  num_accelerators: 1
+  # GPU_1xA10 is enough for the 4B LoRA validation run; switch to GPU_8xH100
+  # for the scaled multi-GPU demo run.
+  accelerator_type: GPU_1xA10
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: .
+command: python $CODE_SOURCE_PATH/train.py
+
+# Demo configuration (not part of the AI Runtime workload schema).
+training_config:
+  catalog: doan
+  schema: air_dais
+  source_table: fraud_dataset
+  sft_table: fraud_sft_dataset
+  checkpoint_volume: checkpoints
+  uc_model_name: qwen3_4b_finetuned
+  endpoint_name: qwen3_4b_finetuned
+
+  model_name: unsloth/Qwen3-4B-Instruct-2507
+  max_seq_length: 2048
+  max_steps: 10
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-4
+  training_sample_fraction: 0.001
+  register_model: true
+  deploy_endpoint: true
+  serving_workload_type: GPU_MEDIUM
+  serving_workload_size: Small
+  serving_scale_to_zero: false
+  served_model_name: qwen3_4b_finetuned
+  vllm_dtype: float16
+  vllm_max_model_len: 2048
+  vllm_gpu_memory_utilization: 0.85
+  seed: 3407

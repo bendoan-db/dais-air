@@ -3,7 +3,7 @@
 # MAGIC %md
 # MAGIC # AIR fraud fine-tuning utilities
 # MAGIC
-# MAGIC Shared setup helpers for the fraud fine-tuning notebook. The training notebook loads this file with `%run ./utils` so configuration loading and Spark naming are defined in the notebook session.
+# MAGIC Shared setup helpers for the demo. The training notebook loads this file with `%run ./utils` and the load-test notebook with `%run ../train/utils`, so configuration loading and Spark naming are defined in the notebook session. `train.py` (and the setup notebook in local-script mode) imports it as a regular Python module instead.
 
 # COMMAND ----------
 

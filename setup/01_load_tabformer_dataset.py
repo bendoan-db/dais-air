@@ -30,17 +30,17 @@ from pyspark.sql.types import (
 
 # COMMAND ----------
 
-# MAGIC %run ../air/utils
+# MAGIC %run ../train/utils
 
 # COMMAND ----------
 
 # The %run above provides the shared helpers in workspace notebook runs; when
 # this file executes as a local script the MAGIC line is a plain comment, so
-# import the same helpers from air/utils instead.
+# import the same helpers from train/utils instead.
 if "quote_identifier" not in globals():
     import sys
 
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "air"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "train"))
     from utils import (
         config_bool,
         config_float,

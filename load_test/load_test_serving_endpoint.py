@@ -36,7 +36,7 @@
 
 # COMMAND ----------
 
-# MAGIC %run ./utils
+# MAGIC %run ../train/utils
 
 # COMMAND ----------
 

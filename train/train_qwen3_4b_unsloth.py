@@ -19,7 +19,7 @@
 # MAGIC %md
 # MAGIC ## Training configuration
 # MAGIC
-# MAGIC Training settings are loaded from `air/training.yaml`.
+# MAGIC Training, registration, and serving settings are loaded from the `training_config` section of `train/train.yaml` — the same file that defines the AI Runtime CLI workload, so the notebook and CLI launch paths share one configuration.
 # MAGIC This keeps the notebook body stable while making the experiment easy to tune:
 # MAGIC
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
@@ -33,20 +33,15 @@
 # COMMAND ----------
 
 import json
-import os
+import sys
 from pathlib import Path
 
 import pandas as pd
 
-os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-
-print("Environment flags configured before importing Unsloth.")
-
 # COMMAND ----------
 
-config_path, training_config = load_yaml_config("training.yaml")
+config_path, workload_config = load_yaml_config("train.yaml")
+training_config = config_value(workload_config, "training_config")
 
 UC_CATALOG = config_str(training_config, "catalog")
 UC_SCHEMA = config_str(training_config, "schema")
@@ -62,7 +57,6 @@ MAX_STEPS = config_int(training_config, "max_steps")
 PER_DEVICE_TRAIN_BATCH_SIZE = config_int(training_config, "per_device_train_batch_size")
 GRADIENT_ACCUMULATION_STEPS = config_int(training_config, "gradient_accumulation_steps")
 LEARNING_RATE = config_float(training_config, "learning_rate")
-TRAINING_SAMPLE_FRACTION = config_float(training_config, "training_sample_fraction")
 REGISTER_MODEL = config_bool(training_config, "register_model")
 DEPLOY_ENDPOINT = config_bool(training_config, "deploy_endpoint")
 SERVING_WORKLOAD_TYPE = config_str(training_config, "serving_workload_type")
@@ -90,6 +84,12 @@ print(f"Register model: {REGISTER_MODEL}")
 print(f"Deploy endpoint: {DEPLOY_ENDPOINT}")
 print(f"Serving endpoint: {ENDPOINT_NAME}")
 print(f"Serving workload: {SERVING_WORKLOAD_TYPE} / {SERVING_WORKLOAD_SIZE}")
+
+# Make train.py importable from this notebook's folder, both on the driver and
+# inside @distributed GPU workers.
+NOTEBOOK_DIR = str(get_notebook_dir())
+if NOTEBOOK_DIR not in sys.path:
+    sys.path.insert(0, NOTEBOOK_DIR)
 
 # COMMAND ----------
 
@@ -248,217 +248,18 @@ display(pd.DataFrame([scale_config]))
 # MAGIC - Model registration is handled in a separate section after training completes.
 # MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the `gpus=1` and `gpus>1` runs.
 # MAGIC
-# MAGIC The training implementation is kept inline below so readers can inspect the Unsloth, TRL, MLflow, and distributed execution code directly.
-
-# COMMAND ----------
-
-# DBTITLE 1,Training implementation
-from contextlib import nullcontext
-
-from unsloth import FastLanguageModel, is_bfloat16_supported
-from unsloth.chat_templates import train_on_responses_only
-from transformers import DataCollatorForSeq2Seq
-from trl import SFTTrainer, SFTConfig
-
-
-def load_unsloth_model(model_name: str, device_map=None):
-    load_kwargs = {
-        "model_name": model_name,
-        "max_seq_length": MAX_SEQ_LENGTH,
-        "dtype": None,
-        "load_in_4bit": False,
-        "load_in_16bit": True,
-        "full_finetuning": False,
-    }
-    if device_map is not None:
-        load_kwargs["device_map"] = device_map
-    return FastLanguageModel.from_pretrained(**load_kwargs)
-
-
-def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=False,
-        enable_thinking=False,
-    )
-
-
-def train_qwen3_unsloth(
-    *,
-    examples_pdf: pd.DataFrame,
-    output_dir: str,
-    run_name: str,
-    training_mode: str,
-    num_gpus: int,
-    device_map=None,
-    save_artifacts: bool = True,
-    rank: int = 0,
-    world_size: int = 1,
-) -> str | None:
-    import mlflow
-    import torch
-    from datasets import Dataset
-
-    mlflow.set_registry_uri("databricks-uc")
-    is_main_process = rank == 0
-    save_artifacts = save_artifacts and is_main_process
-
-    dataset = Dataset.from_pandas(
-        examples_pdf[["prompt", "assistant_response"]],
-        preserve_index=False,
-    )
-
-    model, tokenizer = load_unsloth_model(MODEL_NAME, device_map=device_map)
-
-    def formatting_prompts_func(examples):
-        texts = [
-            render_chat_messages(
-                tokenizer,
-                [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": assistant_response},
-                ],
-            )
-            for prompt, assistant_response in zip(
-                examples["prompt"],
-                examples["assistant_response"],
-            )
-        ]
-        return {"text": texts}
-
-    dataset = dataset.map(
-        formatting_prompts_func,
-        batched=True,
-        remove_columns=dataset.column_names,
-    )
-
-    peft_kwargs = {
-        "r": 16,
-        "target_modules": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-        "lora_alpha": 16,
-        "lora_dropout": 0,
-        "bias": "none",
-        # Unsloth's custom checkpointing is reentrant and fires DDP gradient hooks
-        # twice per LoRA param under multi-GPU @distributed runs; non-reentrant HF
-        # checkpointing is enabled through SFTConfig below instead.
-        "use_gradient_checkpointing": False,
-        "random_state": SEED,
-        "use_rslora": False,
-        "loftq_config": None,
-        "max_seq_length": MAX_SEQ_LENGTH,
-    }
-
-    model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
-
-    training_args = SFTConfig(
-        per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        warmup_steps=5,
-        max_steps=MAX_STEPS,
-        learning_rate=LEARNING_RATE,
-        fp16=not is_bfloat16_supported(),
-        bf16=is_bfloat16_supported(),
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=1,
-        optim="adamw_8bit",
-        weight_decay=0.01,
-        lr_scheduler_type="linear",
-        seed=SEED,
-        output_dir=output_dir,
-        report_to="none",
-        run_name=run_name,
-        save_strategy="steps",
-        save_steps=max(5, MAX_STEPS // 2),
-        dataset_text_field="text",
-        max_seq_length=MAX_SEQ_LENGTH,
-        dataset_num_proc=1,
-        packing=False,
-    )
-
-    trainer = SFTTrainer(
-        model=model,
-        processing_class=tokenizer,
-        train_dataset=dataset,
-        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
-        args=training_args,
-    )
-
-    try:
-        trainer = train_on_responses_only(
-            trainer,
-            instruction_part="<|im_start|>user\n",
-            response_part="<|im_start|>assistant\n",
-            num_proc=1,
-        )
-    except Exception as exc:
-        print(f"Response-only masking was skipped: {exc}")
-
-    run_context = (
-        mlflow.start_run(run_name=run_name, log_system_metrics=True)
-        if is_main_process
-        else nullcontext()
-    )
-
-    with run_context as run:
-        if is_main_process:
-            mlflow.log_params(
-                {
-                    "base_model": MODEL_NAME,
-                    "training_mode": training_mode,
-                    "num_gpus": num_gpus,
-                    "rank": rank,
-                    "world_size": world_size,
-                    "max_seq_length": MAX_SEQ_LENGTH,
-                    "max_steps": MAX_STEPS,
-                    "rank_0_training_record_count": len(examples_pdf),
-                    "source_table": SOURCE_TABLE,
-                    "sft_table": SFT_TABLE,
-                    "lora_r": 16,
-                    "lora_alpha": 16,
-                }
-            )
-
-        train_output = trainer.train()
-        metrics = getattr(train_output, "metrics", {}) or {}
-
-        if not is_main_process:
-            return None
-
-        for metric_name, metric_value in metrics.items():
-            if isinstance(metric_value, (int, float)):
-                mlflow.log_metric(f"trainer_{metric_name}", float(metric_value))
-
-        if save_artifacts:
-            trainer.save_model(output_dir)
-            tokenizer.save_pretrained(output_dir)
-            mlflow.log_param("adapter_output_dir", output_dir)
-
-        if torch.cuda.is_available():
-            peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
-            mlflow.log_metric("peak_cuda_memory_allocated_gb", peak_memory_gb)
-            print(f"Peak CUDA memory allocated: {peak_memory_gb:.2f} GB")
-
-        return run.info.run_id
+# MAGIC The training implementation lives in `train/train.py`, a plain Python module shared by two launchers: this notebook's `@distributed` cell and the AI Runtime CLI (`air run --file train.yaml`), which runs the same file standalone on serverless GPUs.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Scale training by changing one decorator parameter
 # MAGIC
-# MAGIC This is the only training cell in the demo.
+# MAGIC This is the only training cell in the demo: a thin wrapper that imports `train.py` on each GPU worker and runs one rank of training.
 # MAGIC Run it first with `gpus=1` to validate the workflow, then change the decorator to `gpus=8` and rerun the same cell to distribute training across multiple GPUs.
 # MAGIC
-# MAGIC Each worker reads a rank-assigned slice of the prepared SFT Delta table. Keeping the Delta read inside the decorated function avoids shipping a large in-memory dataset from the notebook driver to the GPU workers.
+# MAGIC Each worker reads its rank-assigned slice of the prepared SFT Delta table inside `run_rank_training`, so nothing large ships from the notebook driver to the GPU workers.
+# MAGIC The same function runs without a notebook through the AI Runtime CLI: `air run --file train.yaml` executes `python train.py` on serverless GPUs.
 
 # COMMAND ----------
 
@@ -471,47 +272,14 @@ from serverless_gpu import distributed
 
 @distributed(gpus=1, gpu_type="h100")
 def run_training_job():
-    import os
-    import torch
-    from serverless_gpu import runtime as rt
+    import sys
 
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    rank = rt.get_global_rank()
-    world_size = rt.get_world_size()
-    torch.cuda.set_device(local_rank)
+    if NOTEBOOK_DIR not in sys.path:
+        sys.path.insert(0, NOTEBOOK_DIR)
 
-    distributed_sql = f"""
-    SELECT
-      training_id,
-      shard_id,
-      prompt,
-      assistant_response,
-      fraud_label,
-      is_fraud
-    FROM {sft_table_q}
-    WHERE pmod(shard_id, {world_size}) = {rank}
-    """
+    from train import run_rank_training
 
-    dataset = get_spark_session().sql(distributed_sql).sample(TRAINING_SAMPLE_FRACTION).toPandas()
-    run_output_dir = f"{TRAINING_OUTPUT_DIR}/{world_size}gpu"
-    run_name = f"{TRAINING_RUN_NAME}-{world_size}gpu"
-    training_mode = f"{world_size}_gpu_rank_sharded_sample"
-
-    try:
-        return train_qwen3_unsloth(
-            examples_pdf=dataset,
-            output_dir=run_output_dir,
-            run_name=run_name,
-            training_mode=training_mode,
-            num_gpus=world_size,
-            device_map={"": local_rank},
-            save_artifacts=rank == 0,
-            rank=rank,
-            world_size=world_size,
-        )
-    finally:
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+    return run_rank_training()
 
 distributed_run_ids = run_training_job.distributed()
 TRAINING_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
@@ -545,7 +313,7 @@ suggested_next_config = {
     "current_gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
     "suggested_per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE * 2,
     "suggested_gradient_accumulation_steps": max(1, GRADIENT_ACCUMULATION_STEPS // 2),
-    "rerun_instruction": "Update training.yaml, rerun from Training configuration, and compare MLflow loss/runtime/GPU metrics.",
+    "rerun_instruction": "Update train.yaml's training_config, rerun from Training configuration, and compare MLflow loss/runtime/GPU metrics.",
 }
 
 display(pd.DataFrame([suggested_next_config]))
@@ -569,6 +337,8 @@ display(pd.DataFrame([suggested_next_config]))
 # MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration or deployment fails, rerun only this section.
 
 # COMMAND ----------
+
+from train import load_unsloth_model
 
 CUSTOM_LLM_TASK = "llm/v1/chat"
 CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen3_fraud_model"
@@ -711,7 +481,7 @@ if REGISTER_MODEL:
     REGISTERED_MODEL_VERSION = str(registration_result["model_version"])
     display(pd.DataFrame([registration_result]))
 else:
-    print("Model registration skipped because register_model is false in training.yaml.")
+    print("Model registration skipped because register_model is false in train.yaml.")
 
 # COMMAND ----------
 
@@ -721,7 +491,7 @@ else:
 # MAGIC This cell creates or updates a Mosaic AI Model Serving endpoint for the registered custom LLM.
 # MAGIC The deployment uses the Databricks SDK so the demo can be run end to end from the notebook instead of switching to the UI.
 # MAGIC
-# MAGIC The endpoint configuration is controlled by `training.yaml`:
+# MAGIC The endpoint configuration is controlled by the `training_config` section of `train.yaml`:
 # MAGIC
 # MAGIC - `endpoint_name` is the serving endpoint name used by the load-test notebook.
 # MAGIC - `serving_workload_type` selects the GPU class, such as `GPU_MEDIUM` for A10 or `GPU_XLARGE` for H100.
@@ -743,7 +513,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
     if SERVING_WORKLOAD_TYPE == "GPU_XLARGE" and SERVING_SCALE_TO_ZERO:
         raise ValueError(
             "Custom LLM serving beta does not support scale-to-zero for GPU_XLARGE. "
-            "Set serving_scale_to_zero: false in training.yaml."
+            "Set serving_scale_to_zero: false in train.yaml."
         )
 
     from datetime import timedelta
@@ -838,7 +608,7 @@ if DEPLOY_ENDPOINT:
     deployment_result = create_or_update_custom_llm_endpoint(REGISTERED_MODEL_VERSION)
     display(pd.DataFrame([deployment_result]))
 else:
-    print("Endpoint deployment skipped because deploy_endpoint is false in training.yaml.")
+    print("Endpoint deployment skipped because deploy_endpoint is false in train.yaml.")
 
 # COMMAND ----------
 

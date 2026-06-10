@@ -10,12 +10,13 @@ The demo uses the IBM TabFormer credit-card dataset and prepares a supervised fi
 | --- | --- |
 | `setup/01_load_tabformer_dataset.py` | Databricks notebook that downloads TabFormer, cleans transaction data, and overwrites Delta tables. |
 | `setup/setup.yaml` | Ingestion configuration: catalog, schema, table names, staging volume, source URL, and SFT shard count. |
-| `air/train_qwen3_4b_unsloth.py` | Databricks notebook for AIR fine-tuning with Unsloth, MLflow registration, and Model Serving deployment. |
-| `air/training.yaml` | Training, registration, and serving configuration. |
-| `air/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
-| `air/serving_load_test.yaml` | Load-test configuration. |
-| `air/utils.py` | Shared notebook utilities for YAML config loading and Unity Catalog name handling. |
-| `air/requirements.txt` | Python dependencies used by the AIR training notebook. |
+| `train/train_qwen3_4b_unsloth.py` | Databricks notebook for AIR fine-tuning with Unsloth, MLflow registration, and Model Serving deployment. |
+| `train/train.py` | Standalone training module: imported by the notebook's `@distributed` cell and runnable directly via the AI Runtime CLI. |
+| `train/train.yaml` | AI Runtime CLI workload definition (`air run --file train.yaml`) plus the training, registration, and serving configuration (`training_config` section). |
+| `load_test/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
+| `load_test/serving_load_test.yaml` | Load-test configuration. |
+| `train/utils.py` | Shared notebook utilities for YAML config loading and Unity Catalog name handling. |
+| `train/requirements.txt` | Python dependencies used by the AIR training notebook. |
 | `databricks.yml` | Databricks bundle metadata used by the Databricks extension/CLI. |
 | `demo_script/` | Demo script materials. |
 
@@ -39,7 +40,7 @@ Update these files before running the demo:
   - `staging_volume`
   - `source_url`
 
-- `air/training.yaml`
+- `train/train.yaml` (`training_config` section; the top-level fields configure the AI Runtime CLI workload)
   - `catalog`, `schema`, `source_table`, and `sft_table`
   - `checkpoint_volume`
   - `uc_model_name`
@@ -47,7 +48,7 @@ Update these files before running the demo:
   - training parameters such as `max_steps`, batch size, and learning rate
   - serving parameters such as `serving_workload_type`, `serving_workload_size`, and `serving_scale_to_zero`
 
-- `air/serving_load_test.yaml`
+- `load_test/serving_load_test.yaml`
   - `endpoint_name`
   - `target_qps`
   - `duration_seconds`
@@ -70,14 +71,16 @@ Update these files before running the demo:
 
 2. Fine-tune with AI Runtime.
 
-   Run `air/train_qwen3_4b_unsloth.py` on Databricks Serverless GPU with AI Runtime. The notebook:
+   Run `train/train_qwen3_4b_unsloth.py` on Databricks Serverless GPU with AI Runtime. The notebook:
 
-   - Installs `air/requirements.txt`.
+   - Installs `train/requirements.txt`.
    - Reads the prepared SFT Delta table.
    - Fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with Unsloth LoRA.
    - Uses the `@distributed` decorator so the same training cell can run on one GPU or multiple GPUs by changing the `gpus` parameter.
    - Saves rank-0 adapter artifacts to a Unity Catalog volume.
    - Logs training metrics to MLflow.
+
+   The training implementation lives in `train/train.py` and can also run without the notebook through the [AI Runtime CLI](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/): `cd train && air run --file train.yaml --watch`.
 
 3. Register the custom LLM.
 
@@ -91,11 +94,11 @@ Update these files before running the demo:
 
 4. Deploy the serving endpoint.
 
-   If `deploy_endpoint: true` in `air/training.yaml`, the training notebook creates or updates the configured Model Serving endpoint and routes 100% of traffic to the registered model version.
+   If `deploy_endpoint: true` in `train/train.yaml`'s `training_config`, the training notebook creates or updates the configured Model Serving endpoint and routes 100% of traffic to the registered model version.
 
 5. Load test the endpoint.
 
-   Run `air/load_test_serving_endpoint.py` after the endpoint is ready. The notebook:
+   Run `load_test/load_test_serving_endpoint.py` after the endpoint is ready. The notebook:
 
    - Samples prompts from the SFT Delta table.
    - Runs a smoke test against the endpoint.
@@ -114,7 +117,7 @@ source .venv/bin/activate
 Install local dependencies:
 
 ```bash
-.venv/bin/python -m pip install -r air/requirements.txt
+.venv/bin/python -m pip install -r train/requirements.txt
 ```
 
 The ingestion notebook can run with Databricks Connect when authentication is configured:
