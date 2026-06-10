@@ -31,3 +31,4 @@ __pycache__/
 .cache/
 .locks/
 train/unsloth_compiled_cache/
+air/unsloth_compiled_cache/
