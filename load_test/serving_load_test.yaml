@@ -4,7 +4,7 @@ sft_table: fraud_sft_dataset
 endpoint_name: qwen3_4b_finetuned
 results_table: serving_load_test_results
 
-target_qps: 10000
+target_qps: 1000
 duration_seconds: 60
 # Each worker is one Spark task running its own asyncio loop; workers only run
 # concurrently up to the cluster's task slots (observed ~33-43 on serverless),

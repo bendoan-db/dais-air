@@ -529,6 +529,10 @@ print(f"Saved load test summary to {results_table_q}")
 
 # COMMAND ----------
 
+display(spark.table(results_table_q))
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Interpret the result
 # MAGIC
