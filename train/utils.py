@@ -91,7 +91,11 @@ def get_spark_session():
 
 
 def load_training_config() -> dict:
-    """Load train.yaml's ``training_config`` section and derive shared names.
+    """Load the ``parameters.training_config`` section and derive shared names.
+
+    Under an AI Runtime CLI workload the parameters arrive via the YAML file
+    at ``$HYPERPARAMETERS_PATH`` (which reflects ``air run --override``
+    values); otherwise they are read from ``train.yaml`` next to this file.
 
     Returns a flat dict of typed config values, derived UC names/paths, and
     quoted SQL identifiers, intended to be bound into the caller's namespace
@@ -99,8 +103,21 @@ def load_training_config() -> dict:
     runner notebook and by train.py; deliberately a function (not top-level
     code) so that other consumers of this file are unaffected.
     """
-    config_path, workload_config = load_yaml_config("train.yaml")
-    config = config_value(workload_config, "training_config")
+    import os
+
+    hyperparameters_path = os.environ.get("HYPERPARAMETERS_PATH")
+    if hyperparameters_path:
+        config_path = Path(hyperparameters_path)
+        with config_path.open("r", encoding="utf-8") as config_file:
+            loaded = yaml.safe_load(config_file)
+        # The AIR CLI docs say HYPERPARAMETERS_PATH holds just the
+        # `parameters` dict, but v0.1.0b1 points it at the full workload
+        # YAML — accept either shape.
+        parameters = loaded.get("parameters", loaded)
+    else:
+        config_path, workload_config = load_yaml_config("train.yaml")
+        parameters = config_value(workload_config, "parameters")
+    config = config_value(parameters, "training_config")
 
     uc_catalog = config_str(config, "catalog")
     uc_schema = config_str(config, "schema")

@@ -343,6 +343,10 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
             f"--model {CUSTOM_LLM_MODEL_ARTIFACT_NAME} "
             f"--served-model-name {SERVED_MODEL_NAME} "
             "--host 0.0.0.0 --port 8080 "
+            # All fraud prompts share the same instruction header, so prefix
+            # caching skips most prefill work (explicit for visibility; the
+            # vLLM v1 engine defaults it on).
+            "--enable-prefix-caching "
             f"--dtype {VLLM_DTYPE} "
             f"--max-model-len {VLLM_MAX_MODEL_LEN} "
             f"--gpu-memory-utilization {VLLM_GPU_MEMORY_UTILIZATION}"
@@ -356,7 +360,7 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 "content": "Classify this card transaction and return compact JSON.",
             }
         ],
-        "max_tokens": 128,
+        "max_tokens": 64,
         "temperature": 0.0,
     }
 
@@ -604,7 +608,7 @@ serving_payload = {
             "content": sample_transaction_prompt,
         }
     ],
-    "max_tokens": 128,
+    "max_tokens": 64,
     "temperature": 0.0,
 }
 

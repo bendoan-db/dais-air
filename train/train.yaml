@@ -5,10 +5,12 @@
 #
 # The top-level fields follow the AI Runtime workload schema
 # (https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/).
-# The training_config section is the demo's own configuration, read by
-# train.py and by the runner notebook (training, registration, and serving
-# settings).
-experiment_name: /Users/ben.doan@databricks.com/unsloth_qwen3_4b_training
+# The parameters.training_config section is the demo's own configuration,
+# read by train.py and by the runner notebook (training, registration, and
+# serving settings). AIR also exposes it on the cluster via
+# $HYPERPARAMETERS_PATH, which load_training_config() prefers so that
+# `air run --override` values reach the training script.
+experiment_name: unsloth_qwen3_4b_training
 environment:
   version: '5'
   # Keep in sync with train/requirements.txt.
@@ -36,36 +38,50 @@ compute:
   # GPU_1xA10 is enough for the 4B LoRA validation run; switch to GPU_8xH100
   # for the scaled multi-GPU demo run.
   accelerator_type: GPU_1xA10
+env_variables:
+  # AIR CLI nodes don't set this, but the runtime image's bundled
+  # databricks-connect needs it to substitute its 'DBCONNECT_VERSION'
+  # placeholder — without it, DatabricksSession.builder.serverless() dies in
+  # validate_session_serverless with packaging InvalidVersion. The compat
+  # check only requires client <= server, and 15.4 is the AIR CLI's own
+  # legacy-launcher default.
+  DATABRICKS_RUNTIME_VERSION: '15.4'
 code_source:
   type: snapshot
   snapshot:
     root_path: .
 command: python $CODE_SOURCE_PATH/train.py
 
-# Demo configuration (not part of the AI Runtime workload schema).
-training_config:
-  catalog: doan
-  schema: air_dais
-  source_table: fraud_dataset
-  sft_table: fraud_sft_dataset
-  checkpoint_volume: checkpoints
-  uc_model_name: qwen3_4b_finetuned
-  endpoint_name: qwen3_4b_finetuned
+# Demo configuration, carried in the workload's `parameters` field.
+parameters:
+  training_config:
+    catalog: doan
+    schema: air_dais
+    source_table: fraud_dataset
+    sft_table: fraud_sft_dataset
+    checkpoint_volume: checkpoints
+    uc_model_name: qwen3_4b_finetuned
+    endpoint_name: qwen3_4b_finetuned
 
-  model_name: unsloth/Qwen3-4B-Instruct-2507
-  max_seq_length: 2048
-  max_steps: 10
-  per_device_train_batch_size: 2
-  gradient_accumulation_steps: 4
-  learning_rate: 2e-4
-  training_sample_fraction: 0.001
-  register_model: true
-  deploy_endpoint: true
-  serving_workload_type: GPU_MEDIUM
-  serving_workload_size: Small
-  serving_scale_to_zero: false
-  served_model_name: qwen3_4b_finetuned
-  vllm_dtype: float16
-  vllm_max_model_len: 2048
-  vllm_gpu_memory_utilization: 0.85
-  seed: 3407
+    model_name: unsloth/Qwen3-4B-Instruct-2507
+    max_seq_length: 2048
+    max_steps: 10
+    per_device_train_batch_size: 2
+    gradient_accumulation_steps: 4
+    learning_rate: 2e-4
+    training_sample_fraction: 0.001
+    register_model: true
+    deploy_endpoint: true
+    serving_workload_type: GPU_MEDIUM
+    # workload_size sets a FIXED replica count (no autoscaling during beta) —
+    # size for peak traffic. Measured on this workload: one A10 replica
+    # sustains ~150 QPS; requests beyond provisioned capacity get 429s.
+    # For the full 10K QPS demo, pair Large with GPU_XLARGE (H100,
+    # us-west-2 + beta enrollment required).
+    serving_workload_size: Large
+    serving_scale_to_zero: false
+    served_model_name: qwen3_4b_finetuned
+    vllm_dtype: float16
+    vllm_max_model_len: 2048
+    vllm_gpu_memory_utilization: 0.9
+    seed: 3407

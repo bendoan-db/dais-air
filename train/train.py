@@ -7,9 +7,10 @@ This module owns the Unsloth LoRA training implementation and runs two ways:
 - Executed directly as ``python train.py`` by the AI Runtime CLI
   (``air run --file train.yaml``), where each GPU worker runs this file.
 
-Configuration comes from the ``training_config`` section of ``train.yaml``
-(the same file that defines the AI Runtime CLI workload) and shared helpers
-from ``utils.py``, both in the same directory as this file.
+Configuration comes from the ``parameters.training_config`` section of
+``train.yaml`` (the same file that defines the AI Runtime CLI workload;
+under an AIR run it arrives via ``$HYPERPARAMETERS_PATH``) and shared
+helpers from ``utils.py``, both in the same directory as this file.
 """
 
 import os
@@ -34,6 +35,15 @@ from utils import get_spark_session, load_training_config
 # quoted SQL identifiers (sft_table_q) — the same names the runner notebook
 # binds into its session.
 globals().update(load_training_config())
+
+# The AI Runtime CLI launch wrapper exports these before running the script;
+# neither is present under the notebook's @distributed path. Used to label
+# MLflow runs with their launcher so CLI and notebook runs are
+# distinguishable in the experiment.
+LAUNCHED_VIA_AIR_CLI = bool(
+    os.environ.get("HYPERPARAMETERS_PATH") or os.environ.get("CODE_SOURCE_PATH")
+)
+LAUNCHER = "air-cli" if LAUNCHED_VIA_AIR_CLI else "notebook"
 
 
 def load_unsloth_model(model_name: str, device_map=None):
@@ -186,6 +196,15 @@ def train_qwen3_unsloth(
 
     with run_context as run:
         if is_main_process:
+            mlflow.set_tags(
+                {
+                    "submitted_via": LAUNCHER,
+                    # AIR pre-creates the workload's MLflow run and start_run
+                    # resumes it, ignoring run_name — set the name explicitly
+                    # so the launcher-suffixed name sticks on both paths.
+                    "mlflow.runName": run_name,
+                }
+            )
             mlflow.log_params(
                 {
                     "base_model": MODEL_NAME,
@@ -272,11 +291,13 @@ def run_rank_training() -> str | None:
         get_spark_session().sql(distributed_sql).sample(TRAINING_SAMPLE_FRACTION).toPandas()
     )
 
+    run_suffix = "-air-cli" if LAUNCHED_VIA_AIR_CLI else ""
+
     try:
         return train_qwen3_unsloth(
             examples_pdf=examples_pdf,
             output_dir=f"{TRAINING_OUTPUT_DIR}/{world_size}gpu",
-            run_name=f"{TRAINING_RUN_NAME}-{world_size}gpu",
+            run_name=f"{TRAINING_RUN_NAME}-{world_size}gpu{run_suffix}",
             training_mode=f"{world_size}_gpu_rank_sharded_sample",
             num_gpus=world_size,
             device_map={"": local_rank},
