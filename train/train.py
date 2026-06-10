@@ -10,7 +10,7 @@ This module owns the Unsloth LoRA training implementation and runs two ways:
 Configuration comes from the ``parameters.training_config`` section of
 ``train.yaml`` (the same file that defines the AI Runtime CLI workload;
 under an AIR run it arrives via ``$HYPERPARAMETERS_PATH``) and shared
-helpers from ``utils.py``, both in the same directory as this file.
+helpers from ``training_utils.py``, both in the same directory as this file.
 """
 
 import os
@@ -27,7 +27,12 @@ from unsloth.chat_templates import train_on_responses_only
 from transformers import DataCollatorForSeq2Seq
 from trl import SFTTrainer, SFTConfig
 
-from utils import get_spark_session, load_training_config
+from pathlib import Path
+
+# The helpers module is deliberately NOT named `utils`: the Databricks AI base
+# environment's nvidia_cutlass_dsl package registers its own top-level `utils`
+# module once the torch/CUDA stack loads, which shadows any local utils.py.
+from training_utils import load_training_config
 
 # Bind the shared configuration into module globals: typed training_config
 # values (MODEL_NAME, MAX_SEQ_LENGTH, hyperparameters, SEED, ...), derived
@@ -266,30 +271,43 @@ def get_distributed_context() -> tuple[int, int, int]:
 
 
 def run_rank_training() -> str | None:
-    """Train this rank's shard slice of the SFT table.
+    """Train this rank's shard slice of the exported SFT parquet files.
 
     Returns the MLflow run id on rank 0 and ``None`` on other ranks.
     """
     import torch
+    from datasets import load_dataset
 
     rank, world_size, local_rank = get_distributed_context()
     torch.cuda.set_device(local_rank)
 
-    distributed_sql = f"""
-    SELECT
-      training_id,
-      shard_id,
-      prompt,
-      assistant_response,
-      fraud_label,
-      is_fraud
-    FROM {sft_table_q}
-    WHERE pmod(shard_id, {world_size}) = {rank}
-    """
+    # Read the SFT records as parquet shard files from the UC volume instead
+    # of querying Delta through Spark on the GPU workers, per the AIR
+    # data-loading guidance for large Delta tables:
+    # https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
+    # Ingestion writes one shard_id=N directory per stable hash shard; each
+    # rank claims the shards where N % world_size == rank, preserving the
+    # original Delta rank-sharding contract.
+    shard_dirs = sorted(Path(SFT_FILES_DIR).glob("shard_id=*"))
+    if not shard_dirs:
+        raise FileNotFoundError(
+            f"No SFT parquet shards found under {SFT_FILES_DIR}. "
+            "Run setup/01_load_tabformer_dataset.py first."
+        )
 
-    examples_pdf = (
-        get_spark_session().sql(distributed_sql).sample(TRAINING_SAMPLE_FRACTION).toPandas()
-    )
+    rank_files = [
+        str(parquet_file)
+        for shard_dir in shard_dirs
+        if int(shard_dir.name.split("=", 1)[1]) % world_size == rank
+        for parquet_file in sorted(shard_dir.glob("*.parquet"))
+    ]
+
+    dataset = load_dataset("parquet", data_files=rank_files, split="train")
+    examples_pdf = dataset.to_pandas()
+    if TRAINING_SAMPLE_FRACTION < 1.0:
+        examples_pdf = examples_pdf.sample(
+            frac=TRAINING_SAMPLE_FRACTION, random_state=SEED
+        )
 
     run_suffix = "-air-cli" if LAUNCHED_VIA_AIR_CLI else ""
 

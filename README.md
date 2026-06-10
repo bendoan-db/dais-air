@@ -15,7 +15,7 @@ The demo uses the IBM TabFormer credit-card dataset and prepares a supervised fi
 | `train/train.yaml` | AI Runtime CLI workload definition (`air run --file train.yaml`) plus the training, registration, and serving configuration (`training_config` section). |
 | `load_test/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
 | `load_test/serving_load_test.yaml` | Load-test configuration. |
-| `train/utils.py` | Shared notebook utilities for YAML config loading and Unity Catalog name handling. |
+| `train/training_utils.py` | Shared notebook utilities for YAML config loading and Unity Catalog name handling. |
 | `train/requirements.txt` | Python dependencies used by the AIR training notebook. |
 | `databricks.yml` | Databricks bundle metadata used by the Databricks extension/CLI. |
 | `demo_script/` | Demo script materials. |
@@ -37,6 +37,7 @@ Update these files before running the demo:
 - `setup/setup.yaml`
   - `catalog` and `schema`
   - `table` and `sft_table`
+  - `sft_volume` (volume for the Parquet export of the SFT table)
   - `staging_volume`
   - `source_url`
 
@@ -67,6 +68,7 @@ Update these files before running the demo:
    - Adds prompt-ready transaction fields and fraud labels.
    - Writes the cleaned transaction Delta table.
    - Writes the prepared SFT Delta table with prompt, response, and shard columns.
+   - Exports the SFT records to a Unity Catalog volume as Parquet files partitioned by `shard_id`, per the [AI Runtime data-loading guidance](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes).
    - Overwrites target tables on each run.
 
 2. Fine-tune with AI Runtime.
@@ -74,7 +76,7 @@ Update these files before running the demo:
    Run `train/runner.py` on Databricks Serverless GPU with AI Runtime. The notebook:
 
    - Installs `train/requirements.txt`.
-   - Reads the prepared SFT Delta table.
+   - Reads the rank-sharded SFT Parquet files from the Unity Catalog volume with Hugging Face `datasets` (no Spark on the GPU workers).
    - Fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with Unsloth LoRA.
    - Uses the `@distributed` decorator so the same training cell can run on one GPU or multiple GPUs by changing the `gpus` parameter.
    - Saves rank-0 adapter artifacts to a Unity Catalog volume.

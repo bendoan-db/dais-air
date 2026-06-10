@@ -3,7 +3,9 @@
 # MAGIC %md
 # MAGIC # AIR fraud fine-tuning utilities
 # MAGIC
-# MAGIC Shared setup helpers for the demo. The training notebook loads this file with `%run ./utils` and the load-test notebook with `%run ../train/utils`, so configuration loading and Spark naming are defined in the notebook session. `train.py` (and the setup notebook in local-script mode) imports it as a regular Python module instead.
+# MAGIC Shared setup helpers for the demo. The training notebook loads this file with `%run ./training_utils` and the load-test notebook with `%run ../train/training_utils`, so configuration loading and Spark naming are defined in the notebook session. `train.py` (and the setup notebook in local-script mode) imports it as a regular Python module instead.
+# MAGIC
+# MAGIC The module is deliberately not named `utils`: GPU base environments (via `nvidia_cutlass_dsl`) register their own top-level `utils` module once the torch/CUDA stack loads, which shadows any local `utils.py` on import.
 
 # COMMAND ----------
 
@@ -123,6 +125,7 @@ def load_training_config() -> dict:
     uc_schema = config_str(config, "schema")
     source_table_name = config_str(config, "source_table")
     sft_table_name = config_str(config, "sft_table")
+    sft_volume = config_str(config, "sft_volume")
     uc_volume = config_str(config, "checkpoint_volume")
     uc_model_name = config_str(config, "uc_model_name")
     max_steps = config_int(config, "max_steps")
@@ -154,6 +157,11 @@ def load_training_config() -> dict:
         "VLLM_MAX_MODEL_LEN": config_int(config, "vllm_max_model_len"),
         "VLLM_GPU_MEMORY_UTILIZATION": config_float(config, "vllm_gpu_memory_utilization"),
         "SEED": config_int(config, "seed"),
+        "SFT_VOLUME": sft_volume,
+        # Parquet export of the SFT table, written by setup per the AIR
+        # data-loading guidance; training reads these files instead of
+        # querying Delta through Spark on the GPU workers.
+        "SFT_FILES_DIR": f"/Volumes/{uc_catalog}/{uc_schema}/{sft_volume}/{sft_table_name}",
         "SOURCE_TABLE": f"{uc_catalog}.{uc_schema}.{source_table_name}",
         "SFT_TABLE": f"{uc_catalog}.{uc_schema}.{sft_table_name}",
         "FULL_MODEL_NAME": f"{uc_catalog}.{uc_schema}.{uc_model_name}",

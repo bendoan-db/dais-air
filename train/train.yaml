@@ -59,6 +59,9 @@ parameters:
     schema: air_dais
     source_table: fraud_dataset
     sft_table: fraud_sft_dataset
+    # Volume holding the parquet export of the SFT table (written by setup);
+    # must match setup.yaml's sft_volume.
+    sft_volume: training_data
     checkpoint_volume: checkpoints
     uc_model_name: qwen3_4b_finetuned
     endpoint_name: qwen3_4b_finetuned

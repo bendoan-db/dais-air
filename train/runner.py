@@ -12,7 +12,7 @@
 
 # COMMAND ----------
 
-# MAGIC %run ./utils
+# MAGIC %run ./training_utils
 
 # COMMAND ----------
 
@@ -40,7 +40,7 @@ import pandas as pd
 
 # COMMAND ----------
 
-# load_training_config (defined in utils) parses train.yaml's training_config
+# load_training_config (defined in training_utils) parses train.yaml's training_config
 # section, derives the UC names/paths, and returns one flat dict; binding it
 # into globals gives every later cell the same constants train.py uses.
 training_context = load_training_config()
@@ -170,7 +170,7 @@ display(sft_summary_pdf)
 # MAGIC %md
 # MAGIC ## Scale plan
 # MAGIC
-# MAGIC The notebook loads training records directly from the prepared SFT Delta table inside the `@distributed` training function.
+# MAGIC The training function loads records from the SFT parquet shards that ingestion exported to a Unity Catalog volume, following the AI Runtime data-loading guidance for large Delta tables (https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes). GPU workers read the files directly with Hugging Face `datasets` — no Spark session is needed on the workers.
 # MAGIC Prompt and response generation already happened in ingestion, so the training path avoids row-by-row prompt construction on the driver:
 # MAGIC
 # MAGIC - With `gpus=1`, one worker reads the sample and validates the end-to-end flow.
@@ -184,7 +184,7 @@ display(sft_summary_pdf)
 scale_config = {
     "initial_strategy": "@distributed(gpus=1, gpu_type=\"h100\")",
     "scale_up_strategy": "change only the decorator to @distributed(gpus=8, gpu_type=\"h100\")",
-    "delta_load": "rank-sharded SFT table inside the distributed function",
+    "data_load": "rank-sharded parquet files from the UC volume, read with HF datasets",
     "intermediate_dataset_files": "none",
     "per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
     "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
@@ -219,7 +219,7 @@ display(pd.DataFrame([scale_config]))
 # MAGIC This is the only training cell in the demo: a thin wrapper that imports `train.py` on each GPU worker and runs one rank of training.
 # MAGIC Run it first with `gpus=1` to validate the workflow, then change the decorator to `gpus=8` and rerun the same cell to distribute training across multiple GPUs.
 # MAGIC
-# MAGIC Each worker reads its rank-assigned slice of the prepared SFT Delta table inside `run_rank_training`, so nothing large ships from the notebook driver to the GPU workers.
+# MAGIC Each worker reads its rank-assigned `shard_id=N` parquet directories from the UC volume inside `run_rank_training`, so nothing large ships from the notebook driver to the GPU workers.
 # MAGIC The same function runs without a notebook through the AI Runtime CLI: `air run --file train.yaml` executes `python train.py` on serverless GPUs.
 
 # COMMAND ----------
