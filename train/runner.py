@@ -326,6 +326,11 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
 
     mlflow.set_registry_uri("databricks-uc")
 
+    # Defined inline (not in train.py/training_utils.py) on purpose: cloudpickle
+    # serializes notebook-local classes BY VALUE, so the serving container can
+    # unpickle the model without any repo code and no code_paths are needed in
+    # log_model. If this class ever moves into a module or imports repo helpers,
+    # registration must add code_paths=["train.py", "training_utils.py"].
     class CustomLlmEntrypointPlaceholder(mlflow.pyfunc.PythonModel):
         def predict(self, context, model_input, params=None):
             return {
