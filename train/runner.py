@@ -36,7 +36,8 @@ from training_utils import init_training_workspace, load_training_config
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
-# MAGIC - `max_steps`, batch size, learning rate, and `training_sample_fraction` control the training cost and runtime.
+# MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
+# MAGIC - The sampling fraction is set directly in the training cell below (`TRAINING_SAMPLE_FRACTION`), so it can be adjusted live during the demo; `train.yaml`'s `training_sample_fraction` only serves as the AI Runtime CLI default.
 # MAGIC
 # MAGIC The demo uses one training cell. Run it first with `@distributed(gpus=1, gpu_type="h100")`, then change only `gpus` to a larger value such as `8` to distribute the same training workflow.
 # MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare runs in MLflow.
@@ -223,6 +224,7 @@ display(pd.DataFrame([scale_config]))
 # MAGIC
 # MAGIC This is the only training cell in the demo: a thin wrapper that imports `train.py` on each GPU worker and runs one rank of training.
 # MAGIC Run it first with `gpus=1` to validate the workflow, then change the decorator to `gpus=8` and rerun the same cell to distribute training across multiple GPUs.
+# MAGIC `TRAINING_SAMPLE_FRACTION` at the top of the cell controls how much of each rank's shard slice is used — raise it here to broaden the dataset between runs without touching `train.yaml`.
 # MAGIC
 # MAGIC Each worker reads its rank-assigned `shard_id=N` parquet directories from the UC volume inside `run_rank_training`, so nothing large ships from the notebook driver to the GPU workers.
 # MAGIC The same function runs without a notebook through the AI Runtime CLI: `air run --file train.yaml` executes `python train.py` on serverless GPUs.
@@ -236,6 +238,12 @@ mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen3_4b_training"
 
 from serverless_gpu import distributed
 
+# Demo knob: fraction of each rank's SFT shard slice to train on. Set it here
+# so it can be changed live during the demo; this overrides the
+# training_sample_fraction value in train.yaml (which only the AIR CLI path
+# uses as its default).
+TRAINING_SAMPLE_FRACTION = 0.001
+
 @distributed(gpus=8, gpu_type="h100")
 def run_training_job():
     import sys
@@ -245,7 +253,7 @@ def run_training_job():
 
     from train import run_rank_training
 
-    return run_rank_training()
+    return run_rank_training(sample_fraction=TRAINING_SAMPLE_FRACTION)
 
 distributed_run_ids = run_training_job.distributed()
 TRAINING_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)

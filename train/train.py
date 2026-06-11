@@ -270,16 +270,27 @@ def get_distributed_context() -> tuple[int, int, int]:
         )
 
 
-def run_rank_training() -> str | None:
+def run_rank_training(sample_fraction: float | None = None) -> str | None:
     """Train this rank's shard slice of the exported SFT parquet files.
+
+    ``sample_fraction`` overrides the ``training_sample_fraction`` value from
+    the config — the runner notebook passes it from its training cell so the
+    fraction can be changed live during the demo; the AIR CLI path leaves it
+    ``None`` and uses the config value.
 
     Returns the MLflow run id on rank 0 and ``None`` on other ranks.
     """
     import torch
     from datasets import load_dataset
 
+    if sample_fraction is None:
+        sample_fraction = TRAINING_SAMPLE_FRACTION
+
     rank, world_size, local_rank = get_distributed_context()
     torch.cuda.set_device(local_rank)
+
+    import math
+    import random
 
     # Read the SFT records as parquet shard files from the UC volume instead
     # of querying Delta through Spark on the GPU workers, per the AIR
@@ -295,19 +306,35 @@ def run_rank_training() -> str | None:
             "Run setup/01_load_tabformer_dataset.py first."
         )
 
-    rank_files = [
-        str(parquet_file)
+    rank_shard_dirs = [
+        shard_dir
         for shard_dir in shard_dirs
         if int(shard_dir.name.split("=", 1)[1]) % world_size == rank
+    ]
+
+    # Two-level sampling. shard_id is a uniform hash, so loading a subset of
+    # shard directories is statistically equivalent to row sampling — and it
+    # keeps the HF datasets Arrow conversion ("Generating train split")
+    # proportional to sample_fraction instead of always materializing the
+    # rank's full slice. Row-level sampling within the loaded shards then
+    # lands on the exact requested fraction.
+    within_shard_fraction = 1.0
+    if sample_fraction < 1.0 and rank_shard_dirs:
+        total_rank_dirs = len(rank_shard_dirs)
+        dirs_to_load = max(1, math.ceil(total_rank_dirs * sample_fraction))
+        rank_shard_dirs = sorted(random.Random(SEED).sample(rank_shard_dirs, dirs_to_load))
+        within_shard_fraction = min(1.0, sample_fraction * total_rank_dirs / dirs_to_load)
+
+    rank_files = [
+        str(parquet_file)
+        for shard_dir in rank_shard_dirs
         for parquet_file in sorted(shard_dir.glob("*.parquet"))
     ]
 
     dataset = load_dataset("parquet", data_files=rank_files, split="train")
     examples_pdf = dataset.to_pandas()
-    if TRAINING_SAMPLE_FRACTION < 1.0:
-        examples_pdf = examples_pdf.sample(
-            frac=TRAINING_SAMPLE_FRACTION, random_state=SEED
-        )
+    if within_shard_fraction < 1.0:
+        examples_pdf = examples_pdf.sample(frac=within_shard_fraction, random_state=SEED)
 
     run_suffix = "-air-cli" if LAUNCHED_VIA_AIR_CLI else ""
 
