@@ -101,10 +101,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC %md
 # MAGIC ## Business scenario and model contract
 # MAGIC
-# MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it.
-# MAGIC
-# MAGIC The setup notebook loads IBM TabFormer credit-card transactions into Unity Catalog Delta tables and builds prompt/response records for supervised fine-tuning.
-# MAGIC This training notebook reads those prepared SFT records and fine-tunes `unsloth/Qwen3-4B-Instruct-2507` to emit a structured fraud decision.
+# MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it. We will finetune Qwen3-4B-Instruct-2507` to emit a structured fraud decision with additional triage steps.
 # MAGIC
 # MAGIC The output contract is a compact JSON object with:
 # MAGIC
@@ -113,20 +110,6 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC - `reason`: a short analyst-facing explanation
 # MAGIC
 # MAGIC Keeping the response schema explicit makes the model easier to evaluate, serve, and integrate into downstream applications.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Read and summarize the fraud data
-# MAGIC
-# MAGIC Start by summarizing the transaction table and the prepared SFT table.
-# MAGIC Fraud datasets are typically highly imbalanced, so the row count, fraud count, fraud rate, time range, and SFT shard coverage provide useful context before any modeling work starts.
-# MAGIC
-# MAGIC This step also verifies that the ingestion notebook has successfully loaded the data before GPU time is used for training.
-
-# COMMAND ----------
-
-display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd', 'user_id_text', 'card_id_text', 'transaction_ts_text', 'merchant_city_text', 'merchant_state_text', 'mcc_text', 'errors_text', 'has_error_signal'))
 
 # COMMAND ----------
 
@@ -143,6 +126,20 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # MAGIC
 # MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 4B bf16 LoRA workflow.
 # MAGIC The model is intentionally small so the notebook highlights the platform workflow: governed data, GPU-backed training, experiment tracking, and production handoff.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Read and summarize the fraud data
+# MAGIC
+# MAGIC Start by summarizing the transaction table and the prepared SFT table.
+# MAGIC Fraud datasets are typically highly imbalanced, so the row count, fraud count, fraud rate, time range, and SFT shard coverage provide useful context before any modeling work starts.
+# MAGIC
+# MAGIC This step also verifies that the ingestion notebook has successfully loaded the data before GPU time is used for training.
+
+# COMMAND ----------
+
+display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd', 'user_id_text', 'card_id_text', 'transaction_ts_text', 'merchant_city_text', 'merchant_state_text', 'mcc_text', 'errors_text', 'has_error_signal'))
 
 # COMMAND ----------
 
@@ -185,9 +182,9 @@ mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen3_4b_training"
 from serverless_gpu import distributed
 
 # Override sampling fraction (set to 1.0 to use all data)
-TRAINING_SAMPLE_FRACTION = .0001
+TRAINING_SAMPLE_FRACTION = .001
 
-@distributed(gpus=8, gpu_type="h100", remote=False)
+@distributed(gpus=8, gpu_type="h100")
 def run_training_job():
     import sys
 
@@ -433,9 +430,9 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_name=FULL_MODEL_NAME,
         entity_version=str(model_version),
         workload_type=workload_type,
-        #workload_size=SERVING_WORKLOAD_SIZE,
-        min_provisioned_concurrency=256,
-        max_provisioned_concurrency=256,
+        workload_size=SERVING_WORKLOAD_SIZE,
+        #min_provisioned_concurrency=256,
+        #max_provisioned_concurrency=256,
         environment_vars={
             # The serving container has no ninja/nvcc, so FlashInfer (shipped in
             # the Databricks AI base env) cannot JIT-compile its sampling kernels
@@ -490,9 +487,9 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         "model_version": str(model_version),
         "served_entity_name": served_entity_name,
         "workload_type": SERVING_WORKLOAD_TYPE,
-        #"workload_size": SERVING_WORKLOAD_SIZE,
-        "min_provisioned_concurrency": 256,
-        "max_provisioned_concurrency": 256,
+        "workload_size": SERVING_WORKLOAD_SIZE,
+        #"min_provisioned_concurrency": 256,
+        #"max_provisioned_concurrency": 256,
         "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
         "config_update": str(getattr(endpoint_state, "config_update", None)),
     }
