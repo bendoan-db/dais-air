@@ -81,13 +81,14 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC %md
 # MAGIC # Fine-tune Qwen3 4B for fraud decisions with AI Runtime
 # MAGIC
-# MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime.
-# MAGIC It is designed to stand alone for an external technical audience: each section explains what is happening, why it matters, and how the step contributes to a production AI workflow.
+# MAGIC ![](/Workspace/Users/ben.doan@databricks.com/dais-air/train/images/Screenshot 2026-06-11 at 12.04.39 PM.png)
+# MAGIC
+# MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime. 
 # MAGIC
 # MAGIC The workflow uses the IBM TabFormer credit-card dataset loaded and prepared by `setup/01_load_tabformer_dataset.py`.
 # MAGIC The setup notebook creates both a cleaned transaction table and a supervised fine-tuning table with prompt/response records. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
 # MAGIC
-# MAGIC **AI Runtime value drivers demonstrated in this notebook**
+# MAGIC **Features demonstrated in this notebook**
 # MAGIC
 # MAGIC - **On-demand GPU access:** run deep learning workloads on serverless GPU compute without provisioning or maintaining GPU clusters.
 # MAGIC - **Managed AI environment:** use the AI Runtime base environment with common model-training libraries already available.
@@ -127,33 +128,6 @@ print(f"SFT table: {sft_table_q}")
 
 display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd', 'user_id_text', 'card_id_text', 'transaction_ts_text', 'merchant_city_text', 'merchant_state_text', 'mcc_text', 'errors_text', 'has_error_signal'))
 
-summary_sql = f"""
-SELECT
-  COUNT(*) AS row_count,
-  SUM(CASE WHEN is_fraud = 1 THEN 1 ELSE 0 END) AS fraud_row_count,
-  AVG(CAST(is_fraud AS DOUBLE)) AS fraud_rate,
-  MIN(transaction_ts) AS min_transaction_ts,
-  MAX(transaction_ts) AS max_transaction_ts
-FROM {source_table_q}
-"""
-
-summary_pdf = spark.sql(summary_sql).toPandas()
-display(summary_pdf)
-
-sft_summary_sql = f"""
-SELECT
-  COUNT(*) AS row_count,
-  COUNT(DISTINCT shard_id) AS shard_count,
-  MIN(shard_id) AS min_shard_id,
-  MAX(shard_id) AS max_shard_id,
-  SUM(CASE WHEN is_fraud = 1 THEN 1 ELSE 0 END) AS fraud_row_count,
-  AVG(CAST(is_fraud AS DOUBLE)) AS fraud_rate
-FROM {sft_table_q}
-"""
-
-sft_summary_pdf = spark.sql(sft_summary_sql).toPandas()
-display(sft_summary_pdf)
-
 # COMMAND ----------
 
 # MAGIC %md
@@ -173,35 +147,9 @@ display(sft_summary_pdf)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Scale plan
+# MAGIC <img src="/Workspace/Users/ben.doan@databricks.com/dais-air/train/images/unsloth_green_sticker_cME6ryC59BlZg-VtqGN4p.avif" alt="drawing" width="200"/>
 # MAGIC
-# MAGIC The training function loads records from the SFT parquet shards that ingestion exported to a Unity Catalog volume, following the AI Runtime data-loading guidance for large Delta tables (https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes). GPU workers read the files directly with Hugging Face `datasets` — no Spark session is needed on the workers.
-# MAGIC Prompt and response generation already happened in ingestion, so the training path avoids row-by-row prompt construction on the driver:
-# MAGIC
-# MAGIC - With `gpus=1`, one worker reads the sample and validates the end-to-end flow.
-# MAGIC - With `gpus>1`, each worker reads a different set of SFT shards by rank.
-# MAGIC
-# MAGIC The model, prompt contract, LoRA setup, MLflow logging, and Unity Catalog artifact layout stay fixed.
-# MAGIC The main change during the demo is the `gpus` value in the decorator.
-
-# COMMAND ----------
-
-scale_config = {
-    "initial_strategy": "@distributed(gpus=1, gpu_type=\"h100\")",
-    "scale_up_strategy": "change only the decorator to @distributed(gpus=8, gpu_type=\"h100\")",
-    "data_load": "rank-sharded parquet files from the UC volume, read with HF datasets",
-    "intermediate_dataset_files": "none",
-    "per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
-    "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
-    "effective_micro_batch_per_step": PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
-}
-
-display(pd.DataFrame([scale_config]))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Fine-tune Qwen3 4B with Unsloth
+# MAGIC ## Fine-tune Qwen3 4B Instruct with Unsloth
 # MAGIC
 # MAGIC This section fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with LoRA adapters.
 # MAGIC The Instruct-2507 variant is non-thinking: it answers directly instead of emitting reasoning tokens first, which keeps served responses inside the compact JSON contract and the per-request generation budget. (Base Qwen3 is a hybrid reasoning model whose serving-time chat template defaults to thinking mode.)
@@ -236,7 +184,10 @@ mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen3_4b_training"
 
 from serverless_gpu import distributed
 
-@distributed(gpus=8, gpu_type="h100")
+# Override sampling fraction (set to 1.0 to use all data)
+TRAINING_SAMPLE_FRACTION = .0001
+
+@distributed(gpus=8, gpu_type="h100", remote=False)
 def run_training_job():
     import sys
 
@@ -254,35 +205,6 @@ TRAINED_ADAPTER_OUTPUT_DIR = f"{TRAINING_OUTPUT_DIR}/{TRAINING_WORLD_SIZE}gpu"
 
 print(f"Training MLflow run ID: {TRAINING_RUN_ID}")
 print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Performance optimization loop
-# MAGIC
-# MAGIC After a successful baseline run, change `gpus` in the decorator, rerun the training cell, and compare runtime, loss, and GPU utilization in MLflow and the notebook resource panels.
-# MAGIC For multi-GPU training, a common first bottleneck is an effective batch size that is too small to keep the GPUs busy.
-# MAGIC
-# MAGIC Use the suggested configuration below as a starting point for the next experiment:
-# MAGIC
-# MAGIC - Increase `per_device_train_batch_size` if memory allows.
-# MAGIC - Otherwise increase `gradient_accumulation_steps`.
-# MAGIC - Keep `learning_rate`, `max_steps`, and dataset size controlled while comparing runs.
-# MAGIC - Use MLflow metrics and system telemetry to confirm that throughput improves without destabilizing training.
-# MAGIC
-# MAGIC AI Runtime keeps this loop inside the same platform experience: data, GPU compute, metrics, artifacts, and registered models remain connected.
-
-# COMMAND ----------
-
-suggested_next_config = {
-    "current_per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
-    "current_gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
-    "suggested_per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE * 2,
-    "suggested_gradient_accumulation_steps": max(1, GRADIENT_ACCUMULATION_STEPS // 2),
-    "rerun_instruction": "Update train.yaml's training_config, rerun from Training configuration, and compare MLflow loss/runtime/GPU metrics.",
-}
-
-display(pd.DataFrame([suggested_next_config]))
 
 # COMMAND ----------
 
@@ -511,8 +433,9 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_name=FULL_MODEL_NAME,
         entity_version=str(model_version),
         workload_type=workload_type,
-        workload_size=SERVING_WORKLOAD_SIZE,
-        max_provisioned_concurrency=128,
+        #workload_size=SERVING_WORKLOAD_SIZE,
+        min_provisioned_concurrency=256,
+        max_provisioned_concurrency=256,
         environment_vars={
             # The serving container has no ninja/nvcc, so FlashInfer (shipped in
             # the Databricks AI base env) cannot JIT-compile its sampling kernels
@@ -567,8 +490,9 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         "model_version": str(model_version),
         "served_entity_name": served_entity_name,
         "workload_type": SERVING_WORKLOAD_TYPE,
-        "workload_size": SERVING_WORKLOAD_SIZE,
-        "max_provisioned_concurrency": 128,
+        #"workload_size": SERVING_WORKLOAD_SIZE,
+        "min_provisioned_concurrency": 256,
+        "max_provisioned_concurrency": 256,
         "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
         "config_update": str(getattr(endpoint_state, "config_update", None)),
     }
