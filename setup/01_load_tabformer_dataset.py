@@ -37,49 +37,64 @@ except NameError:
     notebook_path = notebook_context.notebookPath().get()
     script_dir = Path("/Workspace") / notebook_path.lstrip("/").rsplit("/", 1)[0]
 
+# training_utils is a plain Python module in train/ shared across the demo;
+# the same import works for workspace-notebook and local-script runs. (It is
+# not named `utils` because GPU base environments ship packages that register
+# a top-level `utils` module, shadowing any local one.)
+import sys
+
+train_module_dir = str((script_dir.parent / "train").resolve())
+if train_module_dir not in sys.path:
+    sys.path.insert(0, train_module_dir)
+
+from training_utils import (
+    config_bool,
+    config_float,
+    config_int,
+    config_str,
+    get_spark_session,
+    quote_identifier,
+)
+
 config_path = script_dir / "setup.yaml"
 
 with config_path.open("r", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
-catalog = str(config["catalog"]).strip()
-schema = str(config["schema"]).strip()
-table = str(config["table"]).strip()
-sft_table = str(config["sft_table"]).strip()
-staging_volume = str(config["staging_volume"]).strip()
-dataset_name = str(config["dataset_name"]).strip()
-source_url = str(config["source_url"]).strip()
-archive_filename = str(config["archive_filename"]).strip()
-force_download = config["force_download"]
-suspicious_amount_threshold = float(config["suspicious_amount_threshold"])
-sft_shards = int(config["sft_shards"])
+catalog = config_str(config, "catalog")
+schema = config_str(config, "schema")
+table = config_str(config, "table")
+sft_table = config_str(config, "sft_table")
+staging_volume = config_str(config, "staging_volume")
+sft_volume = config_str(config, "sft_volume")
+dataset_name = config_str(config, "dataset_name")
+source_url = config_str(config, "source_url")
+archive_filename = config_str(config, "archive_filename")
+force_download = config_bool(config, "force_download")
+suspicious_amount_threshold = config_float(config, "suspicious_amount_threshold")
+sft_shards = config_int(config, "sft_shards")
 
-
-if "spark" not in globals():
-    from databricks.connect import DatabricksSession
-
-    spark = DatabricksSession.builder.serverless().getOrCreate()
-
-
-def quote_identifier(identifier: str) -> str:
-    return f"`{identifier.replace('`', '``')}`"
-
+spark = get_spark_session()
 
 catalog_q = quote_identifier(catalog)
 schema_q = quote_identifier(schema)
 table_q = quote_identifier(table)
 sft_table_q = quote_identifier(sft_table)
 volume_q = quote_identifier(staging_volume)
+sft_volume_q = quote_identifier(sft_volume)
 
 full_schema_name = f"{catalog_q}.{schema_q}"
 full_table_name = f"{full_schema_name}.{table_q}"
 full_sft_table_name = f"{full_schema_name}.{sft_table_q}"
 full_volume_name = f"{full_schema_name}.{volume_q}"
+full_sft_volume_name = f"{full_schema_name}.{sft_volume_q}"
+sft_files_path = f"/Volumes/{catalog}/{schema}/{sft_volume}/{sft_table}"
 
 # COMMAND ----------
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {full_schema_name}")
 spark.sql(f"CREATE VOLUME IF NOT EXISTS {full_volume_name}")
+spark.sql(f"CREATE VOLUME IF NOT EXISTS {full_sft_volume_name}")
 
 volume_root = Path(f"/Volumes/{catalog}/{schema}/{staging_volume}")
 dataset_root = volume_root / dataset_name
@@ -91,6 +106,7 @@ dataset_root.mkdir(parents=True, exist_ok=True)
 print(f"Config path: {config_path}")
 print(f"Target table: {full_table_name}")
 print(f"Target SFT table: {full_sft_table_name}")
+print(f"Target SFT parquet export: {sft_files_path}")
 print(f"Staging path: {dataset_root}")
 
 # COMMAND ----------
@@ -597,6 +613,29 @@ print(f"Overwrote SFT Delta table {full_sft_table_name}")
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC ## Export SFT records to a Unity Catalog volume as Parquet
+# MAGIC
+# MAGIC AI Runtime's data-loading guidance recommends exporting large Delta tables to a UC volume and reading the files directly during training, which avoids Spark overhead on the GPU workers:
+# MAGIC https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
+# MAGIC
+# MAGIC Parquet is used because the training code (Unsloth) consumes Hugging Face `datasets`, which loads Parquet natively as memory-mapped Arrow tables.
+# MAGIC The export is partitioned by `shard_id`, so the existing rank-sharding contract carries over: each GPU worker claims the `shard_id=N` directories where `N % world_size == rank` and reads only its own files.
+
+# COMMAND ----------
+
+(
+    spark.table(full_sft_table_name)
+    .repartition(sft_shards, "shard_id")
+    .write.mode("overwrite")
+    .partitionBy("shard_id")
+    .parquet(sft_files_path)
+)
+
+print(f"Exported SFT parquet shards to {sft_files_path}")
+
+# COMMAND ----------
+
 loaded_df = spark.sql(f"SELECT * FROM {full_table_name}")
 sft_loaded_df = spark.sql(f"SELECT * FROM {full_sft_table_name}")
 
@@ -635,3 +674,10 @@ if "is_fraud" in sft_loaded_df.columns:
 
 display(sft_loaded_df.agg(*sft_summary_expressions))
 display(sft_loaded_df.select("training_id", "shard_id", "prompt", "assistant_response").limit(10))
+
+sft_shard_dirs = sorted(Path(sft_files_path).glob("shard_id=*"))
+print(f"SFT parquet export: {len(sft_shard_dirs)} shard directories under {sft_files_path}")
+if len(sft_shard_dirs) != sft_shards:
+    raise ValueError(
+        f"Expected {sft_shards} shard directories in the parquet export, found {len(sft_shard_dirs)}."
+    )

@@ -12,20 +12,32 @@
 
 # COMMAND ----------
 
-# MAGIC %run ./utils
+# training_utils is a plain Python module (not a notebook) so the same file
+# can be imported here, by train.py, and under the AI Runtime CLI. Put this
+# notebook's directory on sys.path first; NOTEBOOK_DIR is reused inside the
+# @distributed cell so GPU workers can import train.py the same way.
+import sys
+from pathlib import Path
+
+NOTEBOOK_DIR = str(Path.cwd())
+if NOTEBOOK_DIR not in sys.path:
+    sys.path.insert(0, NOTEBOOK_DIR)
+
+from training_utils import init_training_workspace, load_training_config
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Training configuration
 # MAGIC
-# MAGIC Training settings are loaded from `air/training.yaml`.
+# MAGIC Training, registration, and serving settings are loaded from the `training_config` section of `train/train.yaml` — the same file that defines the AI Runtime CLI workload, so the notebook and CLI launch paths share one configuration.
 # MAGIC This keeps the notebook body stable while making the experiment easy to tune:
 # MAGIC
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
 # MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
+# MAGIC - The sampling fraction is set directly in the training cell below (`TRAINING_SAMPLE_FRACTION`), so it can be adjusted live during the demo; `train.yaml`'s `training_sample_fraction` only serves as the AI Runtime CLI default.
 # MAGIC
 # MAGIC The demo uses one training cell. Run it first with `@distributed(gpus=1, gpu_type="h100")`, then change only `gpus` to a larger value such as `8` to distribute the same training workflow.
 # MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare runs in MLflow.
@@ -33,54 +45,20 @@
 # COMMAND ----------
 
 import json
-import os
+import sys
 from pathlib import Path
 
 import pandas as pd
 
-os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-
-print("Environment flags configured before importing Unsloth.")
-
 # COMMAND ----------
 
-config_path, training_config = load_yaml_config("training.yaml")
+# load_training_config (defined in training_utils) parses train.yaml's training_config
+# section, derives the UC names/paths, and returns one flat dict; binding it
+# into globals gives every later cell the same constants train.py uses.
+training_context = load_training_config()
+globals().update(training_context)
 
-UC_CATALOG = config_str(training_config, "catalog")
-UC_SCHEMA = config_str(training_config, "schema")
-SOURCE_TABLE_NAME = config_str(training_config, "source_table")
-SFT_TABLE_NAME = config_str(training_config, "sft_table")
-UC_VOLUME = config_str(training_config, "checkpoint_volume")
-UC_MODEL_NAME = config_str(training_config, "uc_model_name")
-ENDPOINT_NAME = config_str(training_config, "endpoint_name")
-
-MODEL_NAME = config_str(training_config, "model_name")
-MAX_SEQ_LENGTH = config_int(training_config, "max_seq_length")
-MAX_STEPS = config_int(training_config, "max_steps")
-PER_DEVICE_TRAIN_BATCH_SIZE = config_int(training_config, "per_device_train_batch_size")
-GRADIENT_ACCUMULATION_STEPS = config_int(training_config, "gradient_accumulation_steps")
-LEARNING_RATE = config_float(training_config, "learning_rate")
-REGISTER_MODEL = config_bool(training_config, "register_model")
-DEPLOY_ENDPOINT = config_bool(training_config, "deploy_endpoint")
-SERVING_WORKLOAD_TYPE = config_str(training_config, "serving_workload_type")
-SERVING_WORKLOAD_SIZE = config_str(training_config, "serving_workload_size")
-SERVING_SCALE_TO_ZERO = config_bool(training_config, "serving_scale_to_zero")
-SERVED_MODEL_NAME = config_str(training_config, "served_model_name")
-VLLM_DTYPE = config_str(training_config, "vllm_dtype")
-VLLM_MAX_MODEL_LEN = config_int(training_config, "vllm_max_model_len")
-VLLM_GPU_MEMORY_UTILIZATION = config_float(training_config, "vllm_gpu_memory_utilization")
-SEED = config_int(training_config, "seed")
-
-SOURCE_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SOURCE_TABLE_NAME}"
-SFT_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}"
-FULL_MODEL_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_MODEL_NAME}"
-OUTPUT_ROOT = f"/Volumes/{UC_CATALOG}/{UC_SCHEMA}/{UC_VOLUME}/{UC_MODEL_NAME}"
-TRAINING_OUTPUT_DIR = f"{OUTPUT_ROOT}/training_demo"
-TRAINING_RUN_NAME = f"air-demo-{UC_MODEL_NAME}-training-steps{MAX_STEPS}"
-
-print(f"Training config: {config_path}")
+print(f"Training config: {CONFIG_PATH}")
 print(f"Source table: {SOURCE_TABLE}")
 print(f"SFT table: {SFT_TABLE}")
 print(f"Base model: {MODEL_NAME}")
@@ -92,17 +70,7 @@ print(f"Serving workload: {SERVING_WORKLOAD_TYPE} / {SERVING_WORKLOAD_SIZE}")
 
 # COMMAND ----------
 
-spark = get_spark_session()
-
-schema_q = full_name(UC_CATALOG, UC_SCHEMA)
-volume_q = full_name(UC_CATALOG, UC_SCHEMA, UC_VOLUME)
-source_table_q = full_name(UC_CATALOG, UC_SCHEMA, SOURCE_TABLE_NAME)
-sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
-
-#spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
-#spark.sql(f"CREATE VOLUME IF NOT EXISTS {volume_q}")
-
-Path(TRAINING_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+spark = init_training_workspace(training_context)
 
 print(f"Ready: {schema_q}")
 print(f"Ready: {volume_q}")
@@ -114,13 +82,14 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC %md
 # MAGIC # Fine-tune Qwen3 4B for fraud decisions with AI Runtime
 # MAGIC
-# MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime.
-# MAGIC It is designed to stand alone for an external technical audience: each section explains what is happening, why it matters, and how the step contributes to a production AI workflow.
+# MAGIC ![](/Workspace/Users/ben.doan@databricks.com/dais-air/train/images/Screenshot 2026-06-11 at 12.04.39 PM.png)
+# MAGIC
+# MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime. 
 # MAGIC
 # MAGIC The workflow uses the IBM TabFormer credit-card dataset loaded and prepared by `setup/01_load_tabformer_dataset.py`.
 # MAGIC The setup notebook creates both a cleaned transaction table and a supervised fine-tuning table with prompt/response records. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
 # MAGIC
-# MAGIC **AI Runtime value drivers demonstrated in this notebook**
+# MAGIC **Features demonstrated in this notebook**
 # MAGIC
 # MAGIC - **On-demand GPU access:** run deep learning workloads on serverless GPU compute without provisioning or maintaining GPU clusters.
 # MAGIC - **Managed AI environment:** use the AI Runtime base environment with common model-training libraries already available.
@@ -133,10 +102,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC %md
 # MAGIC ## Business scenario and model contract
 # MAGIC
-# MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it.
-# MAGIC
-# MAGIC The setup notebook loads IBM TabFormer credit-card transactions into Unity Catalog Delta tables and builds prompt/response records for supervised fine-tuning.
-# MAGIC This training notebook reads those prepared SFT records and fine-tunes `unsloth/Qwen3-4B` to emit a structured fraud decision.
+# MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it. We will finetune Qwen3-4B-Instruct-2507` to emit a structured fraud decision with additional triage steps.
 # MAGIC
 # MAGIC The output contract is a compact JSON object with:
 # MAGIC
@@ -145,47 +111,6 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC - `reason`: a short analyst-facing explanation
 # MAGIC
 # MAGIC Keeping the response schema explicit makes the model easier to evaluate, serve, and integrate into downstream applications.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Read and summarize the fraud data
-# MAGIC
-# MAGIC Start by summarizing the transaction table and the prepared SFT table.
-# MAGIC Fraud datasets are typically highly imbalanced, so the row count, fraud count, fraud rate, time range, and SFT shard coverage provide useful context before any modeling work starts.
-# MAGIC
-# MAGIC This step also verifies that the ingestion notebook has successfully loaded the data before GPU time is used for training.
-
-# COMMAND ----------
-
-display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd', 'user_id_text', 'card_id_text', 'transaction_ts_text', 'merchant_city_text', 'merchant_state_text', 'mcc_text', 'errors_text', 'has_error_signal').limit(5))
-
-summary_sql = f"""
-SELECT
-  COUNT(*) AS row_count,
-  SUM(CASE WHEN is_fraud = 1 THEN 1 ELSE 0 END) AS fraud_row_count,
-  AVG(CAST(is_fraud AS DOUBLE)) AS fraud_rate,
-  MIN(transaction_ts) AS min_transaction_ts,
-  MAX(transaction_ts) AS max_transaction_ts
-FROM {source_table_q}
-"""
-
-summary_pdf = spark.sql(summary_sql).toPandas()
-display(summary_pdf)
-
-sft_summary_sql = f"""
-SELECT
-  COUNT(*) AS row_count,
-  COUNT(DISTINCT shard_id) AS shard_count,
-  MIN(shard_id) AS min_shard_id,
-  MAX(shard_id) AS max_shard_id,
-  SUM(CASE WHEN is_fraud = 1 THEN 1 ELSE 0 END) AS fraud_row_count,
-  AVG(CAST(is_fraud AS DOUBLE)) AS fraud_rate
-FROM {sft_table_q}
-"""
-
-sft_summary_pdf = spark.sql(sft_summary_sql).toPandas()
-display(sft_summary_pdf)
 
 # COMMAND ----------
 
@@ -202,43 +127,30 @@ display(sft_summary_pdf)
 # MAGIC
 # MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 4B bf16 LoRA workflow.
 # MAGIC The model is intentionally small so the notebook highlights the platform workflow: governed data, GPU-backed training, experiment tracking, and production handoff.
-# MAGIC
-# MAGIC ** Call out that we can run Spark on GPUs **
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Scale plan
+# MAGIC ## Read and summarize the fraud data
 # MAGIC
-# MAGIC The notebook loads training records directly from the prepared SFT Delta table inside the `@distributed` training function.
-# MAGIC Prompt and response generation already happened in ingestion, so the training path avoids row-by-row prompt construction on the driver:
+# MAGIC Start by summarizing the transaction table and the prepared SFT table.
+# MAGIC Fraud datasets are typically highly imbalanced, so the row count, fraud count, fraud rate, time range, and SFT shard coverage provide useful context before any modeling work starts.
 # MAGIC
-# MAGIC - With `gpus=1`, one worker reads the sample and validates the end-to-end flow.
-# MAGIC - With `gpus>1`, each worker reads a different set of SFT shards by rank.
-# MAGIC
-# MAGIC The model, prompt contract, LoRA setup, MLflow logging, and Unity Catalog artifact layout stay fixed.
-# MAGIC The main change during the demo is the `gpus` value in the decorator.
+# MAGIC This step also verifies that the ingestion notebook has successfully loaded the data before GPU time is used for training.
 
 # COMMAND ----------
 
-scale_config = {
-    "initial_strategy": "@distributed(gpus=1, gpu_type=\"h100\")",
-    "scale_up_strategy": "change only the decorator to @distributed(gpus=8, gpu_type=\"h100\")",
-    "delta_load": "rank-sharded SFT table inside the distributed function",
-    "intermediate_dataset_files": "none",
-    "per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
-    "gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
-    "effective_micro_batch_per_step": PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS,
-}
-
-display(pd.DataFrame([scale_config]))
+display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd', 'user_id_text', 'card_id_text', 'transaction_ts_text', 'merchant_city_text', 'merchant_state_text', 'mcc_text', 'errors_text', 'has_error_signal').limit(5))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Fine-tune Qwen3 4B with Unsloth
+# MAGIC <img src="/Workspace/Users/ben.doan@databricks.com/dais-air/train/images/unsloth_green_sticker_cME6ryC59BlZg-VtqGN4p.avif" alt="drawing" width="200"/>
 # MAGIC
-# MAGIC This section fine-tunes `unsloth/Qwen3-4B` with LoRA adapters.
+# MAGIC ## Fine-tune Qwen3 4B Instruct with Unsloth
+# MAGIC
+# MAGIC This section fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with LoRA adapters.
+# MAGIC The Instruct-2507 variant is non-thinking: it answers directly instead of emitting reasoning tokens first, which keeps served responses inside the compact JSON contract and the per-request generation budget. (Base Qwen3 is a hybrid reasoning model whose serving-time chat template defaults to thinking mode.)
 # MAGIC It uses bf16/16-bit LoRA for accuracy; the 4B model fits comfortably in GPU memory without quantization.
 # MAGIC
 # MAGIC The implementation highlights the production workflow around training:
@@ -248,236 +160,19 @@ display(pd.DataFrame([scale_config]))
 # MAGIC - Model registration is handled in a separate section after training completes.
 # MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the `gpus=1` and `gpus>1` runs.
 # MAGIC
-# MAGIC The training implementation is kept inline below so readers can inspect the Unsloth, TRL, MLflow, and distributed execution code directly.
-
-# COMMAND ----------
-
-# DBTITLE 1,Cell 18
-from contextlib import contextmanager, nullcontext
-
-from unsloth import FastLanguageModel, is_bfloat16_supported
-from unsloth.chat_templates import train_on_responses_only
-from transformers import DataCollatorForSeq2Seq
-from trl import SFTTrainer, SFTConfig
-
-
-@contextmanager
-def start_mlflow_run(mlflow_module, run_name: str):
-    try:
-        with mlflow_module.start_run(run_name=run_name, log_system_metrics=True) as run:
-            yield run
-    except TypeError:
-        with mlflow_module.start_run(run_name=run_name) as run:
-            yield run
-
-
-def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
-    try:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-            enable_thinking=False,
-        )
-    except TypeError:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-
-
-def train_qwen3_unsloth(
-    *,
-    examples_pdf: pd.DataFrame,
-    output_dir: str,
-    run_name: str,
-    training_mode: str,
-    num_gpus: int,
-    device_map=None,
-    save_artifacts: bool = True,
-    rank: int = 0,
-    world_size: int = 1,
-) -> str | None:
-    import mlflow
-    import torch
-    from datasets import Dataset
-
-    mlflow.set_registry_uri("databricks-uc")
-    is_main_process = rank == 0
-    save_artifacts = save_artifacts and is_main_process
-
-    dataset = Dataset.from_pandas(
-        examples_pdf[["prompt", "assistant_response"]],
-        preserve_index=False,
-    )
-
-    load_kwargs = {
-        "model_name": MODEL_NAME,
-        "max_seq_length": MAX_SEQ_LENGTH,
-        "dtype": None,
-        "load_in_4bit": False,
-        "load_in_16bit": True,
-        "full_finetuning": False,
-    }
-    if device_map is not None:
-        load_kwargs["device_map"] = device_map
-
-    try:
-        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
-    except TypeError:
-        load_kwargs.pop("load_in_16bit", None)
-        load_kwargs.pop("full_finetuning", None)
-        model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
-
-    def formatting_prompts_func(examples):
-        texts = [
-            render_chat_messages(
-                tokenizer,
-                [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": assistant_response},
-                ],
-            )
-            for prompt, assistant_response in zip(
-                examples["prompt"],
-                examples["assistant_response"],
-            )
-        ]
-        return {"text": texts}
-
-    dataset = dataset.map(
-        formatting_prompts_func,
-        batched=True,
-        remove_columns=dataset.column_names,
-    )
-
-    peft_kwargs = {
-        "r": 16,
-        "target_modules": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-        "lora_alpha": 16,
-        "lora_dropout": 0,
-        "bias": "none",
-        # Unsloth's custom checkpointing is reentrant and fires DDP gradient hooks
-        # twice per LoRA param under multi-GPU @distributed runs; non-reentrant HF
-        # checkpointing is enabled through SFTConfig below instead.
-        "use_gradient_checkpointing": False,
-        "random_state": SEED,
-        "use_rslora": False,
-        "loftq_config": None,
-        "max_seq_length": MAX_SEQ_LENGTH,
-    }
-
-    try:
-        model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
-    except TypeError:
-        peft_kwargs.pop("max_seq_length", None)
-        model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
-
-    training_args = SFTConfig(
-        per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        warmup_steps=5,
-        max_steps=MAX_STEPS,
-        learning_rate=LEARNING_RATE,
-        fp16=not is_bfloat16_supported(),
-        bf16=is_bfloat16_supported(),
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=1,
-        optim="adamw_8bit",
-        weight_decay=0.01,
-        lr_scheduler_type="linear",
-        seed=SEED,
-        output_dir=output_dir,
-        report_to="none",
-        run_name=run_name,
-        save_strategy="steps",
-        save_steps=max(5, MAX_STEPS // 2),
-        dataset_text_field="text",
-        max_seq_length=MAX_SEQ_LENGTH,
-        dataset_num_proc=1,
-        packing=False,
-    )
-
-    trainer = SFTTrainer(
-        model=model,
-        processing_class=tokenizer,
-        train_dataset=dataset,
-        data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
-        args=training_args,
-    )
-
-    try:
-        trainer = train_on_responses_only(
-            trainer,
-            instruction_part="<|im_start|>user\n",
-            response_part="<|im_start|>assistant\n",
-            num_proc=1,
-        )
-    except Exception as exc:
-        print(f"Response-only masking was skipped: {exc}")
-
-    run_context = start_mlflow_run(mlflow, run_name) if is_main_process else nullcontext()
-
-    with run_context as run:
-        if is_main_process:
-            mlflow.log_params(
-                {
-                    "base_model": MODEL_NAME,
-                    "training_mode": training_mode,
-                    "num_gpus": num_gpus,
-                    "rank": rank,
-                    "world_size": world_size,
-                    "max_seq_length": MAX_SEQ_LENGTH,
-                    "max_steps": MAX_STEPS,
-                    "rank_0_training_record_count": len(examples_pdf),
-                    "source_table": SOURCE_TABLE,
-                    "sft_table": SFT_TABLE,
-                    "lora_r": 16,
-                    "lora_alpha": 16,
-                }
-            )
-
-        train_output = trainer.train()
-        metrics = getattr(train_output, "metrics", {}) or {}
-
-        if not is_main_process:
-            return None
-
-        for metric_name, metric_value in metrics.items():
-            if isinstance(metric_value, (int, float)):
-                mlflow.log_metric(f"trainer_{metric_name}", float(metric_value))
-
-        if save_artifacts:
-            trainer.save_model(output_dir)
-            tokenizer.save_pretrained(output_dir)
-            mlflow.log_param("adapter_output_dir", output_dir)
-
-        if torch.cuda.is_available():
-            peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
-            mlflow.log_metric("peak_cuda_memory_allocated_gb", peak_memory_gb)
-            print(f"Peak CUDA memory allocated: {peak_memory_gb:.2f} GB")
-
-        return run.info.run_id
+# MAGIC The training implementation lives in `train/train.py`, a plain Python module shared by two launchers: this notebook's `@distributed` cell and the AI Runtime CLI (`air run --file train.yaml`), which runs the same file standalone on serverless GPUs.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Scale training by changing one decorator parameter
 # MAGIC
-# MAGIC This is the only training cell in the demo.
+# MAGIC This is the only training cell in the demo: a thin wrapper that imports `train.py` on each GPU worker and runs one rank of training.
 # MAGIC Run it first with `gpus=1` to validate the workflow, then change the decorator to `gpus=8` and rerun the same cell to distribute training across multiple GPUs.
+# MAGIC `TRAINING_SAMPLE_FRACTION` at the top of the cell controls how much of each rank's shard slice is used — raise it here to broaden the dataset between runs without touching `train.yaml`.
 # MAGIC
-# MAGIC Each worker reads a rank-assigned slice of the prepared SFT Delta table. Keeping the Delta read inside the decorated function avoids shipping a large in-memory dataset from the notebook driver to the GPU workers.
+# MAGIC Each worker reads its rank-assigned `shard_id=N` parquet directories from the UC volume inside `run_rank_training`, so nothing large ships from the notebook driver to the GPU workers.
+# MAGIC The same function runs without a notebook through the AI Runtime CLI: `air run --file train.yaml` executes `python train.py` on serverless GPUs.
 
 # COMMAND ----------
 
@@ -488,51 +183,20 @@ mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen3_4b_training"
 
 from serverless_gpu import distributed
 
+# Override sampling fraction (set to 1.0 to use all data). Notebook runs use
+# this value; train.yaml's training_sample_fraction is only the AIR CLI default.
 TRAINING_SAMPLE_FRACTION = 0.001
 
 @distributed(gpus=8, gpu_type="h100")
 def run_training_job():
-    import os
-    import torch
-    from serverless_gpu import runtime as rt
+    import sys
 
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    rank = rt.get_global_rank()
-    world_size = rt.get_world_size()
-    torch.cuda.set_device(local_rank)
+    if NOTEBOOK_DIR not in sys.path:
+        sys.path.insert(0, NOTEBOOK_DIR)
 
-    distributed_sql = f"""
-    SELECT
-      training_id,
-      shard_id,
-      prompt,
-      assistant_response,
-      fraud_label,
-      is_fraud
-    FROM {sft_table_q}
-    WHERE pmod(shard_id, {world_size}) = {rank}
-    """
+    from train import run_rank_training
 
-    dataset = get_spark_session().sql(distributed_sql).sample(TRAINING_SAMPLE_FRACTION).toPandas()
-    run_output_dir = f"{TRAINING_OUTPUT_DIR}/{world_size}gpu"
-    run_name = f"{TRAINING_RUN_NAME}-{world_size}gpu"
-    training_mode = f"{world_size}_gpu_rank_sharded_sample"
-
-    try:
-        return train_qwen3_unsloth(
-            examples_pdf=dataset,
-            output_dir=run_output_dir,
-            run_name=run_name,
-            training_mode=training_mode,
-            num_gpus=world_size,
-            device_map={"": local_rank},
-            save_artifacts=rank == 0,
-            rank=rank,
-            world_size=world_size,
-        )
-    finally:
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+    return run_rank_training(sample_fraction=TRAINING_SAMPLE_FRACTION)
 
 distributed_run_ids = run_training_job.distributed()
 TRAINING_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
@@ -541,35 +205,6 @@ TRAINED_ADAPTER_OUTPUT_DIR = f"{TRAINING_OUTPUT_DIR}/{TRAINING_WORLD_SIZE}gpu"
 
 print(f"Training MLflow run ID: {TRAINING_RUN_ID}")
 print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Performance optimization loop
-# MAGIC
-# MAGIC After a successful baseline run, change `gpus` in the decorator, rerun the training cell, and compare runtime, loss, and GPU utilization in MLflow and the notebook resource panels.
-# MAGIC For multi-GPU training, a common first bottleneck is an effective batch size that is too small to keep the GPUs busy.
-# MAGIC
-# MAGIC Use the suggested configuration below as a starting point for the next experiment:
-# MAGIC
-# MAGIC - Increase `per_device_train_batch_size` if memory allows.
-# MAGIC - Otherwise increase `gradient_accumulation_steps`.
-# MAGIC - Keep `learning_rate`, `max_steps`, and dataset size controlled while comparing runs.
-# MAGIC - Use MLflow metrics and system telemetry to confirm that throughput improves without destabilizing training.
-# MAGIC
-# MAGIC AI Runtime keeps this loop inside the same platform experience: data, GPU compute, metrics, artifacts, and registered models remain connected.
-
-# COMMAND ----------
-
-genie_suggested_config = {
-    "current_per_device_train_batch_size": PER_DEVICE_TRAIN_BATCH_SIZE,
-    "current_gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
-    "suggested_per_device_train_batch_size": max(PER_DEVICE_TRAIN_BATCH_SIZE, 4),
-    "suggested_gradient_accumulation_steps": GRADIENT_ACCUMULATION_STEPS,
-    "rerun_instruction": "Update training.yaml, rerun from Training configuration, and compare MLflow loss/runtime/GPU metrics.",
-}
-
-display(pd.DataFrame([genie_suggested_config]))
 
 # COMMAND ----------
 
@@ -591,17 +226,10 @@ display(pd.DataFrame([genie_suggested_config]))
 
 # COMMAND ----------
 
+from train import load_unsloth_model
+
 CUSTOM_LLM_TASK = "llm/v1/chat"
 CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen3_fraud_model"
-CUSTOM_LLM_MODEL_ARTIFACT_PATH = CUSTOM_LLM_MODEL_ARTIFACT_NAME
-
-
-def save_merged_hf_model(merged_model, tokenizer, model_dir: Path) -> None:
-    try:
-        merged_model.save_pretrained(model_dir, safe_serialization=True)
-    except TypeError:
-        merged_model.save_pretrained(model_dir)
-    tokenizer.save_pretrained(model_dir)
 
 
 def local_model_work_dir() -> Path:
@@ -614,16 +242,17 @@ def local_model_work_dir() -> Path:
 
 
 def register_custom_llm_model(adapter_output_dir: str, run_name: str):
-    import os
     import shutil
 
     import mlflow
 
-    os.environ["MLFLOW_HTTP_REQUEST_TIMEOUT"] = "1200"
-    os.environ["MLFLOW_ARTIFACT_UPLOAD_DOWNLOAD_TIMEOUT"] = "1200"
-
     mlflow.set_registry_uri("databricks-uc")
 
+    # Defined inline (not in train.py/training_utils.py) on purpose: cloudpickle
+    # serializes notebook-local classes BY VALUE, so the serving container can
+    # unpickle the model without any repo code and no code_paths are needed in
+    # log_model. If this class ever moves into a module or imports repo helpers,
+    # registration must add code_paths=["train.py", "training_utils.py"].
     class CustomLlmEntrypointPlaceholder(mlflow.pyfunc.PythonModel):
         def predict(self, context, model_input, params=None):
             return {
@@ -643,9 +272,13 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
         "task": CUSTOM_LLM_TASK,
         "entrypoint": (
             "python -u -m vllm.entrypoints.openai.api_server "
-            f"--model {CUSTOM_LLM_MODEL_ARTIFACT_PATH} "
+            f"--model {CUSTOM_LLM_MODEL_ARTIFACT_NAME} "
             f"--served-model-name {SERVED_MODEL_NAME} "
             "--host 0.0.0.0 --port 8080 "
+            # All fraud prompts share the same instruction header, so prefix
+            # caching skips most prefill work (explicit for visibility; the
+            # vLLM v1 engine defaults it on).
+            "--enable-prefix-caching "
             f"--dtype {VLLM_DTYPE} "
             f"--max-model-len {VLLM_MAX_MODEL_LEN} "
             f"--gpu-memory-utilization {VLLM_GPU_MEMORY_UTILIZATION}"
@@ -659,7 +292,7 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 "content": "Classify this card transaction and return compact JSON.",
             }
         ],
-        "max_tokens": 128,
+        "max_tokens": 64,
         "temperature": 0.0,
     }
 
@@ -667,23 +300,13 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
     try:
         merged_model_dir = temp_dir / CUSTOM_LLM_MODEL_ARTIFACT_NAME
 
-        load_kwargs = {
-            "model_name": adapter_output_dir,
-            "max_seq_length": MAX_SEQ_LENGTH,
-            "dtype": None,
-            "load_in_4bit": False,
-            "load_in_16bit": True,
-        }
-        try:
-            model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
-        except TypeError:
-            load_kwargs.pop("load_in_16bit", None)
-            model, tokenizer = FastLanguageModel.from_pretrained(**load_kwargs)
+        model, tokenizer = load_unsloth_model(adapter_output_dir)
 
         merged_model = model.merge_and_unload()
-        save_merged_hf_model(merged_model, tokenizer, merged_model_dir)
+        merged_model.save_pretrained(merged_model_dir, safe_serialization=True)
+        tokenizer.save_pretrained(merged_model_dir)
 
-        with start_mlflow_run(mlflow, run_name) as run:
+        with mlflow.start_run(run_name=run_name, log_system_metrics=True) as run:
             mlflow.log_params(
                 {
                     "base_model": MODEL_NAME,
@@ -691,7 +314,7 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                     "registered_model_name": FULL_MODEL_NAME,
                     "source_training_run_id": TRAINING_RUN_ID,
                     "custom_llm_task": CUSTOM_LLM_TASK,
-                    "custom_llm_model_artifact": CUSTOM_LLM_MODEL_ARTIFACT_PATH,
+                    "custom_llm_model_artifact": CUSTOM_LLM_MODEL_ARTIFACT_NAME,
                     "served_model_name": SERVED_MODEL_NAME,
                     "vllm_dtype": VLLM_DTYPE,
                     "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
@@ -755,7 +378,7 @@ if REGISTER_MODEL:
     REGISTERED_MODEL_VERSION = str(registration_result["model_version"])
     display(pd.DataFrame([registration_result]))
 else:
-    print("Model registration skipped because register_model is false in training.yaml.")
+    print("Model registration skipped because register_model is false in train.yaml.")
 
 # COMMAND ----------
 
@@ -765,12 +388,14 @@ else:
 # MAGIC This cell creates or updates a Mosaic AI Model Serving endpoint for the registered custom LLM.
 # MAGIC The deployment uses the Databricks SDK so the demo can be run end to end from the notebook instead of switching to the UI.
 # MAGIC
-# MAGIC The endpoint configuration is controlled by `training.yaml`:
+# MAGIC The endpoint configuration is controlled by the `training_config` section of `train.yaml`:
 # MAGIC
 # MAGIC - `endpoint_name` is the serving endpoint name used by the load-test notebook.
 # MAGIC - `serving_workload_type` selects the GPU class, such as `GPU_MEDIUM` for A10 or `GPU_XLARGE` for H100.
 # MAGIC - `serving_workload_size` controls provisioned capacity behind the endpoint.
 # MAGIC - `serving_scale_to_zero` is useful for demos and development, but should be disabled for latency-sensitive production traffic.
+# MAGIC
+# MAGIC The served entity also sets `VLLM_USE_FLASHINFER_SAMPLER=0`: the serving container cannot JIT-compile FlashInfer kernels (no `ninja`/`nvcc`), so vLLM must use its native PyTorch sampler.
 # MAGIC
 # MAGIC Custom LLM serving is currently a fixed-capacity serving path during beta. Size the workload for the traffic target before running a high-QPS load test.
 
@@ -785,7 +410,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
     if SERVING_WORKLOAD_TYPE == "GPU_XLARGE" and SERVING_SCALE_TO_ZERO:
         raise ValueError(
             "Custom LLM serving beta does not support scale-to-zero for GPU_XLARGE. "
-            "Set serving_scale_to_zero: false in training.yaml."
+            "Set serving_scale_to_zero: false in train.yaml."
         )
 
     from datetime import timedelta
@@ -809,7 +434,14 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_version=str(model_version),
         workload_type=workload_type,
         workload_size=SERVING_WORKLOAD_SIZE,
-        scale_to_zero_enabled=False,
+        #min_provisioned_concurrency=256,
+        #max_provisioned_concurrency=256,
+        environment_vars={
+            # The serving container has no ninja/nvcc, so FlashInfer (shipped in
+            # the Databricks AI base env) cannot JIT-compile its sampling kernels
+            # at startup; fall back to vLLM's native PyTorch sampler.
+            "VLLM_USE_FLASHINFER_SAMPLER": "0",
+        },
     )
     traffic_config = TrafficConfig(
         routes=[
@@ -859,7 +491,8 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         "served_entity_name": served_entity_name,
         "workload_type": SERVING_WORKLOAD_TYPE,
         "workload_size": SERVING_WORKLOAD_SIZE,
-        "scale_to_zero_enabled": SERVING_SCALE_TO_ZERO,
+        #"min_provisioned_concurrency": 256,
+        #"max_provisioned_concurrency": 256,
         "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
         "config_update": str(getattr(endpoint_state, "config_update", None)),
     }
@@ -874,7 +507,7 @@ if DEPLOY_ENDPOINT:
     deployment_result = create_or_update_custom_llm_endpoint(REGISTERED_MODEL_VERSION)
     display(pd.DataFrame([deployment_result]))
 else:
-    print("Endpoint deployment skipped because deploy_endpoint is false in training.yaml.")
+    print("Endpoint deployment skipped because deploy_endpoint is false in train.yaml.")
 
 # COMMAND ----------
 
@@ -909,7 +542,7 @@ serving_payload = {
             "content": sample_transaction_prompt,
         }
     ],
-    "max_tokens": 128,
+    "max_tokens": 64,
     "temperature": 0.0,
 }
 

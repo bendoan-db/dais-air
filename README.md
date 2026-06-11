@@ -10,12 +10,13 @@ The demo uses the IBM TabFormer credit-card dataset and prepares a supervised fi
 | --- | --- |
 | `setup/01_load_tabformer_dataset.py` | Databricks notebook that downloads TabFormer, cleans transaction data, and overwrites Delta tables. |
 | `setup/setup.yaml` | Ingestion configuration: catalog, schema, table names, staging volume, source URL, and SFT shard count. |
-| `air/train_qwen3_4b_unsloth.py` | Databricks notebook for AIR fine-tuning with Unsloth, MLflow registration, and Model Serving deployment. |
-| `air/training.yaml` | Training, registration, and serving configuration. |
-| `air/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
-| `air/serving_load_test.yaml` | Load-test configuration. |
-| `air/utils.py` | Shared notebook utilities for YAML config loading and Unity Catalog name handling. |
-| `air/requirements.txt` | Python dependencies used by the AIR training notebook. |
+| `train/runner.py` | Databricks notebook for AIR fine-tuning with Unsloth, MLflow registration, and Model Serving deployment. |
+| `train/train.py` | Standalone training module: imported by the notebook's `@distributed` cell and runnable directly via the AI Runtime CLI. |
+| `train/train.yaml` | AI Runtime CLI workload definition (`air run --file train.yaml`) plus the training, registration, and serving configuration (`parameters.training_config` section). |
+| `load_test/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
+| `load_test/serving_load_test.yaml` | Load-test configuration. |
+| `train/training_utils.py` | Shared notebook utilities for YAML config loading and Unity Catalog name handling. |
+| `train/requirements.txt` | Python dependencies used by the AIR training notebook. |
 | `databricks.yml` | Databricks bundle metadata used by the Databricks extension/CLI. |
 | `demo_script/` | Demo script materials. |
 
@@ -36,10 +37,11 @@ Update these files before running the demo:
 - `setup/setup.yaml`
   - `catalog` and `schema`
   - `table` and `sft_table`
+  - `sft_volume` (volume for the Parquet export of the SFT table)
   - `staging_volume`
   - `source_url`
 
-- `air/training.yaml`
+- `train/train.yaml` (`parameters.training_config` section; the top-level fields configure the AI Runtime CLI workload)
   - `catalog`, `schema`, `source_table`, and `sft_table`
   - `checkpoint_volume`
   - `uc_model_name`
@@ -47,7 +49,7 @@ Update these files before running the demo:
   - training parameters such as `max_steps`, batch size, and learning rate
   - serving parameters such as `serving_workload_type`, `serving_workload_size`, and `serving_scale_to_zero`
 
-- `air/serving_load_test.yaml`
+- `load_test/serving_load_test.yaml`
   - `endpoint_name`
   - `target_qps`
   - `duration_seconds`
@@ -66,18 +68,21 @@ Update these files before running the demo:
    - Adds prompt-ready transaction fields and fraud labels.
    - Writes the cleaned transaction Delta table.
    - Writes the prepared SFT Delta table with prompt, response, and shard columns.
+   - Exports the SFT records to a Unity Catalog volume as Parquet files partitioned by `shard_id`, per the [AI Runtime data-loading guidance](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes).
    - Overwrites target tables on each run.
 
 2. Fine-tune with AI Runtime.
 
-   Run `air/train_qwen3_4b_unsloth.py` on Databricks Serverless GPU with AI Runtime. The notebook:
+   Run `train/runner.py` on Databricks Serverless GPU with AI Runtime. The notebook:
 
-   - Installs `air/requirements.txt`.
-   - Reads the prepared SFT Delta table.
-   - Fine-tunes `unsloth/Qwen3-4B` with Unsloth LoRA.
+   - Installs `train/requirements.txt`.
+   - Reads the rank-sharded SFT Parquet files from the Unity Catalog volume with Hugging Face `datasets` (no Spark on the GPU workers).
+   - Fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with Unsloth LoRA.
    - Uses the `@distributed` decorator so the same training cell can run on one GPU or multiple GPUs by changing the `gpus` parameter.
    - Saves rank-0 adapter artifacts to a Unity Catalog volume.
    - Logs training metrics to MLflow.
+
+   The training implementation lives in `train/train.py` and can also run without the notebook through the AI Runtime CLI — see [Training via the AI Runtime CLI](#training-via-the-ai-runtime-cli).
 
 3. Register the custom LLM.
 
@@ -91,16 +96,62 @@ Update these files before running the demo:
 
 4. Deploy the serving endpoint.
 
-   If `deploy_endpoint: true` in `air/training.yaml`, the training notebook creates or updates the configured Model Serving endpoint and routes 100% of traffic to the registered model version.
+   If `deploy_endpoint: true` in `train/train.yaml`'s `training_config`, the training notebook creates or updates the configured Model Serving endpoint and routes 100% of traffic to the registered model version.
 
 5. Load test the endpoint.
 
-   Run `air/load_test_serving_endpoint.py` after the endpoint is ready. The notebook:
+   Run `load_test/load_test_serving_endpoint.py` after the endpoint is ready. The notebook:
 
    - Samples prompts from the SFT Delta table.
    - Runs a smoke test against the endpoint.
    - Generates asynchronous HTTP traffic from Spark tasks.
    - Records achieved throughput, status counts, latency samples, and summary metrics to a Delta table.
+
+## Training via the AI Runtime CLI
+
+The same training code that the notebook's `@distributed` cell runs can be submitted from a laptop with the [AI Runtime CLI](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/), without opening a notebook. `train/train.yaml` is the single configuration file for both paths: its top-level fields define the CLI workload (experiment, environment, compute, code snapshot, command) and its `parameters.training_config` section holds the demo's own training/registration/serving settings.
+
+1. Install the CLI (requires Python 3.10+ and [uv](https://docs.astral.sh/uv/)):
+
+   ```bash
+   uv tool install --force databricks-air --python 3.12
+   air --version
+   ```
+
+2. Authenticate. The CLI reuses Databricks CLI profiles from `~/.databrickscfg`:
+
+   ```bash
+   databricks auth login --host https://<your-workspace>.cloud.databricks.com
+   ```
+
+3. Submit the training workload (run ingestion first — training reads the Parquet shard export it produces):
+
+   ```bash
+   cd train && COPYFILE_DISABLE=1 air run --file train.yaml --watch -p <profile>
+   ```
+
+   `--watch` streams the job state and node logs until the run finishes. Validate the file without submitting using `--dry-run`, and override config values per run without editing the file, for example:
+
+   ```bash
+   COPYFILE_DISABLE=1 air run --file train.yaml \
+     --override parameters.training_config.max_steps=50 --watch
+   ```
+
+   `COPYFILE_DISABLE=1` is required on macOS: without it, bsdtar embeds AppleDouble (`._*`) metadata entries in the code-snapshot tarball, the remote launcher resolves the code directory from the archive's first entry, and the job fails before user code with `can't open file '/databricks/code_source/._train/train.py'`. See `demo_script/air-cli-appledouble-tarball-error.md` for the full diagnosis and two related CLI workarounds already baked into this repo (`$HYPERPARAMETERS_PATH` shape handling in `training_utils.py`, and the `DATABRICKS_RUNTIME_VERSION` entry under `env_variables` in `train.yaml`).
+
+4. Monitor and manage runs:
+
+   ```bash
+   air list runs --limit 10        # recent runs (--active for running only)
+   air get run <run-id>            # status and configuration for one run
+   air logs <run-id>               # stream logs (defaults to node 0)
+   air cancel <run-id>             # stop a run (do this on failures — max_retries
+                                   # otherwise reruns the same broken workload)
+   ```
+
+Runs land in the same MLflow experiment as notebook runs (AIR resolves `experiment_name` to `/Users/<you>/<experiment_name>`), with two markers distinguishing the launch path: the run name carries an `-air-cli` suffix and the run is tagged `submitted_via: air-cli` (notebook runs are tagged `submitted_via: notebook`). Filter with `tags.submitted_via = 'air-cli'` in the MLflow UI.
+
+To scale up, edit `compute` in `train.yaml` (for example `num_accelerators: 8` with `accelerator_type: GPU_8xH100`) — `train.py` resolves rank and world size from the runtime, and each rank loads only its own `shard_id` directories from the Parquet export. The CLI path runs training only; model registration and endpoint deployment remain in the notebook's later cells, which read the adapter directory that training writes to the checkpoint volume.
 
 ## Local Development
 
@@ -114,7 +165,7 @@ source .venv/bin/activate
 Install local dependencies:
 
 ```bash
-.venv/bin/python -m pip install -r air/requirements.txt
+.venv/bin/python -m pip install -r train/requirements.txt
 ```
 
 The ingestion notebook can run with Databricks Connect when authentication is configured:

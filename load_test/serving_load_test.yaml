@@ -1,0 +1,27 @@
+catalog: doan
+schema: air_dais
+sft_table: fraud_sft_dataset
+endpoint_name: qwen3_4b_instruct_finetuned_lora
+results_table: serving_load_test_results
+
+target_qps: 1000
+duration_seconds: 60
+# Each worker is one Spark task running its own asyncio loop; workers only run
+# concurrently up to the cluster's task slots (observed ~33-43 on serverless),
+# so keep load_generator_workers at or below the slots actually available and
+# scale per-worker rate/concurrency instead. At 10,000 QPS and ~1.2s per
+# request, the fleet must sustain ~12,000 requests in flight:
+# 32 workers x 512 concurrency = 16,384 capacity.
+load_generator_workers: 32
+worker_concurrency: 512
+request_timeout_seconds: 30
+
+prompt_sample_fraction: 0.001
+prompt_sample_size: 1000
+smoke_test_requests: 5
+max_latency_samples_per_worker: 10000
+
+# The fraud JSON answer needs ~50-60 tokens; a tight cap raises endpoint
+# throughput almost linearly (decode-bound) and trims latency.
+max_tokens: 64
+temperature: 0.0

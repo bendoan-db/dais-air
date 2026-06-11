@@ -36,12 +36,28 @@
 
 # COMMAND ----------
 
-# MAGIC %run ./utils
+# training_utils is a plain Python module in train/ (not a notebook), so it is
+# imported rather than %run. The notebook's working directory is the notebook's
+# folder on serverless, so ../train resolves to the module's directory.
+import sys
+from pathlib import Path
+
+TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
+if TRAIN_MODULE_DIR not in sys.path:
+    sys.path.insert(0, TRAIN_MODULE_DIR)
+
+from training_utils import (
+    config_float,
+    config_int,
+    config_str,
+    full_name,
+    get_spark_session,
+    load_yaml_config,
+)
 
 # COMMAND ----------
 
 import json
-import math
 import os
 import time
 import uuid
@@ -49,13 +65,14 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 from pyspark.sql import functions as F
 
 # COMMAND ----------
 
-config_path, load_test_config = load_yaml_config("serving_load_test.yaml")
+config_path, load_test_config = load_yaml_config("serving_load_test.yaml", base_dir=Path.cwd())
 
 UC_CATALOG = config_str(load_test_config, "catalog")
 UC_SCHEMA = config_str(load_test_config, "schema")
@@ -85,8 +102,6 @@ if LOAD_GENERATOR_WORKERS <= 0:
     raise ValueError("load_generator_workers must be greater than zero.")
 if WORKER_CONCURRENCY <= 0:
     raise ValueError("worker_concurrency must be greater than zero.")
-
-spark = get_spark_session()
 
 schema_q = full_name(UC_CATALOG, UC_SCHEMA)
 sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
@@ -304,18 +319,7 @@ load_test_id = str(uuid.uuid4())
 def percentile(values: list[float], percentile_value: float) -> float | None:
     if not values:
         return None
-
-    sorted_values = sorted(values)
-    rank = (len(sorted_values) - 1) * percentile_value / 100
-    lower_index = math.floor(rank)
-    upper_index = math.ceil(rank)
-
-    if lower_index == upper_index:
-        return sorted_values[int(rank)]
-
-    lower_weight = upper_index - rank
-    upper_weight = rank - lower_index
-    return sorted_values[lower_index] * lower_weight + sorted_values[upper_index] * upper_weight
+    return float(np.percentile(values, percentile_value))
 
 
 worker_result_schema = """
@@ -383,6 +387,16 @@ def run_worker_batches(batch_iterator):
                 latency_ms = (time.perf_counter() - started_request) * 1000
                 return "exception", latency_ms, repr(exc)[:500]
 
+        async def drain_completed(pending_tasks):
+            done, remaining = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                status, latency_ms, error_preview = await task
+                status_counts[str(status)] += 1
+                record_latency(latency_ms)
+                if error_preview and len(failure_examples) < 5:
+                    failure_examples.append({"status": str(status), "preview": error_preview})
+            return remaining
+
         async with aiohttp.ClientSession(headers=AUTH_HEADERS, timeout=timeout, connector=connector) as session:
             pending = set()
             started_at = time.perf_counter()
@@ -396,22 +410,10 @@ def run_worker_batches(batch_iterator):
                 pending.add(asyncio.create_task(send_request(session, request_index)))
 
                 if len(pending) >= WORKER_CONCURRENCY:
-                    done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        status, latency_ms, error_preview = await task
-                        status_counts[str(status)] += 1
-                        record_latency(latency_ms)
-                        if error_preview and len(failure_examples) < 5:
-                            failure_examples.append({"status": str(status), "preview": error_preview})
+                    pending = await drain_completed(pending)
 
             while pending:
-                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-                for task in done:
-                    status, latency_ms, error_preview = await task
-                    status_counts[str(status)] += 1
-                    record_latency(latency_ms)
-                    if error_preview and len(failure_examples) < 5:
-                        failure_examples.append({"status": str(status), "preview": error_preview})
+                pending = await drain_completed(pending)
 
         elapsed_seconds = time.perf_counter() - started_at
         success_count = sum(count for status, count in status_counts.items() if status.isdigit() and 200 <= int(status) < 300)
@@ -522,6 +524,10 @@ display(worker_results_pdf.drop(columns=["latency_samples_json"]).sort_values("w
 )
 
 print(f"Saved load test summary to {results_table_q}")
+
+# COMMAND ----------
+
+display(spark.table(results_table_q))
 
 # COMMAND ----------
 
