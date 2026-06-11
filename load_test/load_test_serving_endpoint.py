@@ -103,8 +103,6 @@ if LOAD_GENERATOR_WORKERS <= 0:
 if WORKER_CONCURRENCY <= 0:
     raise ValueError("worker_concurrency must be greater than zero.")
 
-spark = get_spark_session()
-
 schema_q = full_name(UC_CATALOG, UC_SCHEMA)
 sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 results_table_q = full_name(UC_CATALOG, UC_SCHEMA, RESULTS_TABLE_NAME)

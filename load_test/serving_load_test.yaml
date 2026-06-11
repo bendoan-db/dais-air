@@ -1,7 +1,7 @@
 catalog: doan
 schema: air_dais
 sft_table: fraud_sft_dataset
-endpoint_name: qwen3_4b_finetuned
+endpoint_name: qwen3_4b_instruct_finetuned_lora
 results_table: serving_load_test_results
 
 target_qps: 1000
