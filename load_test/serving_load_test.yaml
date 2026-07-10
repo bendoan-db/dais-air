@@ -1,7 +1,7 @@
 catalog: doan
 schema: air_dais
 sft_table: fraud_sft_dataset
-endpoint_name: qwen3_4b_instruct_finetuned_lora
+endpoint_name: qwen3_4b_instruct_finetuned
 results_table: serving_load_test_results
 
 target_qps: 1000
@@ -13,7 +13,7 @@ duration_seconds: 60
 # request, the fleet must sustain ~12,000 requests in flight:
 # 32 workers x 512 concurrency = 16,384 capacity.
 load_generator_workers: 32
-worker_concurrency: 512
+worker_concurrency: 256
 request_timeout_seconds: 30
 
 prompt_sample_fraction: 0.001
