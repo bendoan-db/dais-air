@@ -64,7 +64,7 @@ parameters:
     sft_volume: training_data
     checkpoint_volume: checkpoints
     uc_model_name: qwen3_4b_instruct_finetuned
-    endpoint_name: qwen3_4b_instruct_finetuned_lora
+    endpoint_name: qwen3_4b_instruct_finetuned
 
     model_name: unsloth/Qwen3-4B-Instruct-2507
     # Optional UC volume snapshot of the base model weights. When set

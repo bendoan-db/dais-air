@@ -84,7 +84,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC %md
 # MAGIC # Fine-tune Qwen3 4B for fraud decisions with AI Runtime
 # MAGIC
-# MAGIC ![](/Workspace/Users/ben.doan@databricks.com/dais-air/train/images/Screenshot 2026-06-11 at 12.04.39 PM.png)
+# MAGIC ![](./images/Screenshot 2026-06-11 at 12.04.39 PM.png)
 # MAGIC
 # MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime. 
 # MAGIC
@@ -103,8 +103,9 @@ print(f"SFT table: {sft_table_q}")
 
 # MAGIC %md
 # MAGIC ## Business scenario and model contract
-# MAGIC
 # MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it. We will finetune Qwen3-4B-Instruct-2507` to emit a structured fraud decision with additional triage steps.
+# MAGIC
+# MAGIC ![](./images/Screenshot 2026-06-11 at 3.39.46 PM.png)
 # MAGIC
 # MAGIC The output contract is a compact JSON object with:
 # MAGIC
@@ -147,7 +148,7 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <img src="/Workspace/Users/ben.doan@databricks.com/dais-air/train/images/unsloth_green_sticker_cME6ryC59BlZg-VtqGN4p.avif" alt="drawing" width="200"/>
+# MAGIC <img src="./images/unsloth_green_sticker_cME6ryC59BlZg-VtqGN4p.avif" alt="drawing" width="200"/>
 # MAGIC
 # MAGIC ## Fine-tune Qwen3 4B Instruct with Unsloth
 # MAGIC
@@ -187,9 +188,9 @@ from serverless_gpu import distributed
 
 # Override sampling fraction (set to 1.0 to use all data). Notebook runs use
 # this value; train.yaml's training_sample_fraction is only the AIR CLI default.
-TRAINING_SAMPLE_FRACTION = 0.001
+TRAINING_SAMPLE_FRACTION = 0.00001
 
-@distributed(gpus=8, gpu_type="h100")
+@distributed(gpus=1, gpu_type="h100")
 def run_training_job():
     import sys
 
@@ -435,9 +436,9 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_name=FULL_MODEL_NAME,
         entity_version=str(model_version),
         workload_type=workload_type,
-        workload_size=SERVING_WORKLOAD_SIZE,
-        #min_provisioned_concurrency=256,
-        #max_provisioned_concurrency=256,
+        #workload_size=SERVING_WORKLOAD_SIZE,
+        min_provisioned_concurrency=256,
+        max_provisioned_concurrency=256,
         environment_vars={
             # The serving container has no ninja/nvcc, so FlashInfer (shipped in
             # the Databricks AI base env) cannot JIT-compile its sampling kernels
@@ -492,9 +493,9 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         "model_version": str(model_version),
         "served_entity_name": served_entity_name,
         "workload_type": SERVING_WORKLOAD_TYPE,
-        "workload_size": SERVING_WORKLOAD_SIZE,
-        #"min_provisioned_concurrency": 256,
-        #"max_provisioned_concurrency": 256,
+        #"workload_size": SERVING_WORKLOAD_SIZE,
+        "min_provisioned_concurrency": 256,
+        "max_provisioned_concurrency": 256,
         "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
         "config_update": str(getattr(endpoint_state, "config_update", None)),
     }
