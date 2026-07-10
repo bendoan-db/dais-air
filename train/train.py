@@ -186,6 +186,24 @@ def train_qwen3_unsloth(
 
     model = FastLanguageModel.get_peft_model(model, **peft_kwargs)
 
+    # The /Volumes FUSE mount rejects safetensors' serialization write
+    # pattern with EAGAIN (os error 11) — the same limitation that forces
+    # setup/02 to stage its download on local disk — so the trainer must
+    # write checkpoints and the final adapter to node-local disk; the
+    # finished adapter files are copied to the volume sequentially after
+    # training.
+    import shutil
+    import tempfile
+
+    local_disk_tmp = Path("/local_disk0/tmp")
+    staging_base = local_disk_tmp if local_disk_tmp.exists() else Path(tempfile.gettempdir())
+    local_output_dir = str(staging_base / "air-training-output" / run_name)
+    if is_main_process:
+        # Only the world-zero process writes checkpoints (save_on_each_node
+        # is False), so clearing a stale directory from a previous run can't
+        # race the other ranks on this node.
+        shutil.rmtree(local_output_dir, ignore_errors=True)
+
     training_args = SFTConfig(
         per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
@@ -201,7 +219,7 @@ def train_qwen3_unsloth(
         weight_decay=0.01,
         lr_scheduler_type="linear",
         seed=SEED,
-        output_dir=output_dir,
+        output_dir=local_output_dir,
         report_to="none",
         run_name=run_name,
         save_strategy="steps",
@@ -276,9 +294,17 @@ def train_qwen3_unsloth(
                 mlflow.log_metric(f"trainer_{metric_name}", float(metric_value))
 
         if save_artifacts:
-            trainer.save_model(output_dir)
-            tokenizer.save_pretrained(output_dir)
-            _restore_saved_adapter_base_path(output_dir)
+            trainer.save_model(local_output_dir)
+            tokenizer.save_pretrained(local_output_dir)
+            _restore_saved_adapter_base_path(local_output_dir)
+            # Top-level files only: skips the throwaway checkpoint-*/ dirs,
+            # and whole-file sequential copies are the write pattern the
+            # volume mount supports.
+            volume_dir = Path(output_dir)
+            volume_dir.mkdir(parents=True, exist_ok=True)
+            for artifact_file in sorted(Path(local_output_dir).iterdir()):
+                if artifact_file.is_file():
+                    shutil.copy2(artifact_file, volume_dir / artifact_file.name)
             mlflow.log_param("adapter_output_dir", output_dir)
 
         if torch.cuda.is_available():
