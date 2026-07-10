@@ -55,28 +55,22 @@ command: python $CODE_SOURCE_PATH/train.py
 # Demo configuration, carried in the workload's `parameters` field.
 parameters:
   training_config:
-    catalog: doan
-    schema: air_dais
+    catalog: poc-catalog
+    schema: databricks_support
     source_table: fraud_dataset
     sft_table: fraud_sft_dataset
     # Volume holding the parquet export of the SFT table (written by setup);
     # must match setup.yaml's sft_volume.
     sft_volume: training_data
-    checkpoint_volume: checkpoints
+    checkpoint_volume: qwen_checkpoints
     uc_model_name: qwen3_4b_instruct_finetuned
     endpoint_name: qwen3_4b_instruct_finetuned
 
     model_name: unsloth/Qwen3-4B-Instruct-2507
-    # UC volume snapshot of the base model weights, populated by
-    # setup/02_download_base_model_weights.py (which reads this same value as
-    # its download destination). When set (non-empty), training loads the
-    # model and tokenizer from this path instead of downloading from Hugging
-    # Face; model_name is still recorded as the base-model identity in MLflow.
-    # Set to '' to download from Hugging Face at training time instead.
-    model_volume_path: /Volumes/doan/air_dais/base_models/Qwen3-4B-Instruct-2507
+    model_volume_path: '/Volumes/poc-catalog/databricks_support/checkpoints/base_models/qwen3-4b-instruct'
     max_seq_length: 2048
-    max_steps: 10
-    per_device_train_batch_size: 2
+    max_steps: 5
+    per_device_train_batch_size: 48
     gradient_accumulation_steps: 4
     learning_rate: 2e-4
     # Default for AIR CLI runs only — notebook runs set TRAINING_SAMPLE_FRACTION

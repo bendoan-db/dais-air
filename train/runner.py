@@ -180,7 +180,7 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # COMMAND ----------
 
 import mlflow
-mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen3_4b_training")
+mlflow.set_experiment("/Workspace/Shared/databricks-support/air-hackathon-test")
 
 # COMMAND ----------
 
@@ -190,7 +190,7 @@ from serverless_gpu import distributed
 # this value; train.yaml's training_sample_fraction is only the AIR CLI default.
 TRAINING_SAMPLE_FRACTION = 0.00001
 
-@distributed(gpus=1, gpu_type="h100")
+@distributed(gpus=8, gpu_type="H100")
 def run_training_job():
     import sys
 
@@ -437,8 +437,8 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_version=str(model_version),
         workload_type=workload_type,
         #workload_size=SERVING_WORKLOAD_SIZE,
-        min_provisioned_concurrency=256,
-        max_provisioned_concurrency=256,
+        min_provisioned_concurrency=4,
+        max_provisioned_concurrency=4,
         environment_vars={
             # The serving container has no ninja/nvcc, so FlashInfer (shipped in
             # the Databricks AI base env) cannot JIT-compile its sampling kernels
@@ -494,8 +494,8 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         "served_entity_name": served_entity_name,
         "workload_type": SERVING_WORKLOAD_TYPE,
         #"workload_size": SERVING_WORKLOAD_SIZE,
-        "min_provisioned_concurrency": 256,
-        "max_provisioned_concurrency": 256,
+        "min_provisioned_concurrency": 4,
+        "max_provisioned_concurrency": 4,
         "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
         "config_update": str(getattr(endpoint_state, "config_update", None)),
     }
