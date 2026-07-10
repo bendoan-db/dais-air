@@ -32,7 +32,7 @@ from pathlib import Path
 # The helpers module is deliberately NOT named `utils`: the Databricks AI base
 # environment's nvidia_cutlass_dsl package registers its own top-level `utils`
 # module once the torch/CUDA stack loads, which shadows any local utils.py.
-from training_utils import load_training_config
+from training_utils import VOLUME_PATH_PREFIX, load_training_config, stage_model_locally
 
 # Bind the shared configuration into module globals: typed training_config
 # values (MODEL_NAME, MAX_SEQ_LENGTH, hyperparameters, SEED, ...), derived
@@ -60,9 +60,15 @@ def load_unsloth_model(model_name: str, device_map=None):
     if model_name.startswith("/") and not Path(model_name).exists():
         raise FileNotFoundError(
             f"Local model path does not exist: {model_name}. If this is "
-            "model_volume_path from train.yaml, populate the volume first, "
-            f"e.g. `hf download {MODEL_NAME} --local-dir {model_name}`."
+            "model_volume_path from train.yaml, populate the volume first by "
+            "running setup/02_download_base_model_weights.py (or `hf download "
+            f"{MODEL_NAME} --local-dir {model_name}`)."
         )
+    if model_name.startswith(VOLUME_PATH_PREFIX):
+        # safetensors mmap reads through the volume FUSE mount are
+        # latency-bound and take minutes for multi-GB weights; stage the
+        # directory to node-local disk and load from there instead.
+        model_name = stage_model_locally(model_name)
     load_kwargs = {
         "model_name": model_name,
         "max_seq_length": MAX_SEQ_LENGTH,
@@ -74,6 +80,26 @@ def load_unsloth_model(model_name: str, device_map=None):
     if device_map is not None:
         load_kwargs["device_map"] = device_map
     return FastLanguageModel.from_pretrained(**load_kwargs)
+
+
+def _restore_saved_adapter_base_path(output_dir: str) -> None:
+    """Point the saved adapter config back at the configured base source.
+
+    When the base weights come from a volume, training loads them from a
+    node-local staged copy, so PEFT records that ephemeral local path as
+    ``base_model_name_or_path``. Registration runs on a different machine and
+    resolves the base model through this field — rewrite it to the durable
+    MODEL_LOAD_PATH (volume path or HF repo id) after the adapter is saved.
+    """
+    import json
+
+    adapter_config_path = Path(output_dir) / "adapter_config.json"
+    if not adapter_config_path.exists():
+        return
+    adapter_config = json.loads(adapter_config_path.read_text())
+    if adapter_config.get("base_model_name_or_path") != MODEL_LOAD_PATH:
+        adapter_config["base_model_name_or_path"] = MODEL_LOAD_PATH
+        adapter_config_path.write_text(json.dumps(adapter_config, indent=2))
 
 
 def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
@@ -252,6 +278,7 @@ def train_qwen3_unsloth(
         if save_artifacts:
             trainer.save_model(output_dir)
             tokenizer.save_pretrained(output_dir)
+            _restore_saved_adapter_base_path(output_dir)
             mlflow.log_param("adapter_output_dir", output_dir)
 
         if torch.cuda.is_available():

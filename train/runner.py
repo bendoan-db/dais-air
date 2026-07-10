@@ -36,7 +36,7 @@ from training_utils import init_training_workspace, load_training_config
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
-# MAGIC - `model_volume_path` (optional) points at a Unity Catalog volume snapshot of the base model weights; when set, the GPU workers load the model from the volume instead of downloading it from Hugging Face.
+# MAGIC - `model_volume_path` (optional) points at a Unity Catalog volume snapshot of the base model weights, populated by `setup/02_download_base_model_weights.py`; when set, the GPU workers load the model from the volume instead of downloading it from Hugging Face. Volume-hosted weights are first staged to node-local disk (once per node) because safetensors mmap reads through the volume FUSE mount are slow.
 # MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
 # MAGIC - The sampling fraction is set directly in the training cell below (`TRAINING_SAMPLE_FRACTION`), so it can be adjusted live during the demo; `train.yaml`'s `training_sample_fraction` only serves as the AI Runtime CLI default.
 # MAGIC

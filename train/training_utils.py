@@ -81,6 +81,93 @@ def get_spark_session():
     return DatabricksSession.builder.serverless().getOrCreate()
 
 
+VOLUME_PATH_PREFIX = "/Volumes/"
+
+
+def _staging_fingerprint(source_dir: Path, source_files: list[Path]) -> str:
+    """Hash the source path plus per-file (name, size, mtime) so a retrained
+    adapter written to the same volume path stages a fresh copy."""
+    import hashlib
+
+    manifest = [str(source_dir)]
+    for source_file in source_files:
+        file_stat = source_file.stat()
+        manifest.append(f"{source_file.name}:{file_stat.st_size}:{file_stat.st_mtime_ns}")
+    return hashlib.sha256("\n".join(manifest).encode()).hexdigest()[:12]
+
+
+def stage_model_locally(source_dir: str) -> str:
+    """Copy a model directory from a UC volume to node-local disk; return the copy.
+
+    safetensors loading memory-maps the weight files, and mmap page faults
+    against the /Volumes FUSE mount turn into thousands of small,
+    latency-bound object-store reads — minutes for multi-GB weights. The
+    mount is fast at sequential streaming, so one copy to local disk plus a
+    local mmap load is far faster than loading from the volume directly.
+
+    Only top-level regular files are copied — everything from_pretrained
+    reads — which skips training checkpoint-*/ subdirectories and Hugging
+    Face .cache folders. Concurrent callers (GPU ranks sharing a node) are
+    serialized with an flock plus a completion marker so the copy happens
+    once per node. When the staged directory is a LoRA adapter whose recorded
+    base model is itself a volume path, the base weights are staged too and
+    the local copy of adapter_config.json is pointed at them (the volume copy
+    is never modified).
+    """
+    import fcntl
+    import json
+    import shutil
+    import tempfile
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    source = Path(source_dir)
+    source_files = sorted(path for path in source.iterdir() if path.is_file())
+    if not source_files:
+        raise FileNotFoundError(f"No files to stage in {source}")
+    total_gb = sum(source_file.stat().st_size for source_file in source_files) / 1024**3
+
+    local_disk_tmp = Path("/local_disk0/tmp")
+    staging_base = local_disk_tmp if local_disk_tmp.exists() else Path(tempfile.gettempdir())
+    staging_root = staging_base / "air-model-staging"
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    destination = staging_root / f"{source.name}-{_staging_fingerprint(source, source_files)}"
+    marker = destination.with_name(destination.name + ".complete")
+    lock_path = destination.with_name(destination.name + ".lock")
+
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if marker.exists():
+            print(f"Reusing staged model copy: {destination}")
+        else:
+            start = time.monotonic()
+            destination.mkdir(parents=True, exist_ok=True)
+            with ThreadPoolExecutor(max_workers=min(8, len(source_files))) as pool:
+                list(
+                    pool.map(
+                        lambda source_file: shutil.copy2(source_file, destination / source_file.name),
+                        source_files,
+                    )
+                )
+
+            adapter_config_path = destination / "adapter_config.json"
+            if adapter_config_path.exists():
+                adapter_config = json.loads(adapter_config_path.read_text())
+                base_model_path = str(adapter_config.get("base_model_name_or_path") or "")
+                if base_model_path.startswith(VOLUME_PATH_PREFIX):
+                    adapter_config["base_model_name_or_path"] = stage_model_locally(base_model_path)
+                    adapter_config_path.write_text(json.dumps(adapter_config, indent=2))
+
+            print(
+                f"Staged {len(source_files)} files ({total_gb:.2f} GB) from {source} "
+                f"to {destination} in {time.monotonic() - start:.1f}s"
+            )
+            marker.touch()
+
+    return str(destination)
+
+
 def load_training_config() -> dict:
     """Load the ``parameters.training_config`` section and derive shared names.
 
