@@ -118,6 +118,10 @@ def load_training_config() -> dict:
     uc_volume = config_str(config, "checkpoint_volume")
     uc_model_name = config_str(config, "uc_model_name")
     max_steps = config_int(config, "max_steps")
+    model_name = config_str(config, "model_name")
+    # Optional UC volume snapshot of the base weights; empty or missing means
+    # download from Hugging Face by model_name.
+    model_volume_path = str(config.get("model_volume_path") or "").strip()
     output_root = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume}/{uc_model_name}"
 
     return {
@@ -129,7 +133,11 @@ def load_training_config() -> dict:
         "UC_VOLUME": uc_volume,
         "UC_MODEL_NAME": uc_model_name,
         "ENDPOINT_NAME": config_str(config, "endpoint_name"),
-        "MODEL_NAME": config_str(config, "model_name"),
+        "MODEL_NAME": model_name,
+        "MODEL_VOLUME_PATH": model_volume_path,
+        # Where FastLanguageModel.from_pretrained reads the base weights:
+        # the UC volume snapshot when configured, else the HF repo id.
+        "MODEL_LOAD_PATH": model_volume_path or model_name,
         "MAX_SEQ_LENGTH": config_int(config, "max_seq_length"),
         "MAX_STEPS": max_steps,
         "PER_DEVICE_TRAIN_BATCH_SIZE": config_int(config, "per_device_train_batch_size"),

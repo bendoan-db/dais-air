@@ -52,6 +52,17 @@ LAUNCHER = "air-cli" if LAUNCHED_VIA_AIR_CLI else "notebook"
 
 
 def load_unsloth_model(model_name: str, device_map=None):
+    # model_name is either a Hugging Face repo id or a local directory — the
+    # UC volume snapshot of the base weights (model_volume_path in train.yaml)
+    # or a trained adapter dir. Fail fast on a missing local path so the error
+    # isn't unsloth/transformers treating it as a repo id and dying with an
+    # HF 401/404.
+    if model_name.startswith("/") and not Path(model_name).exists():
+        raise FileNotFoundError(
+            f"Local model path does not exist: {model_name}. If this is "
+            "model_volume_path from train.yaml, populate the volume first, "
+            f"e.g. `hf download {MODEL_NAME} --local-dir {model_name}`."
+        )
     load_kwargs = {
         "model_name": model_name,
         "max_seq_length": MAX_SEQ_LENGTH,
@@ -99,7 +110,7 @@ def train_qwen3_unsloth(
         preserve_index=False,
     )
 
-    model, tokenizer = load_unsloth_model(MODEL_NAME, device_map=device_map)
+    model, tokenizer = load_unsloth_model(MODEL_LOAD_PATH, device_map=device_map)
 
     def formatting_prompts_func(examples):
         texts = [
@@ -213,6 +224,7 @@ def train_qwen3_unsloth(
             mlflow.log_params(
                 {
                     "base_model": MODEL_NAME,
+                    "base_model_load_path": MODEL_LOAD_PATH,
                     "training_mode": training_mode,
                     "num_gpus": num_gpus,
                     "rank": rank,

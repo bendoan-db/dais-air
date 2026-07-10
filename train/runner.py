@@ -36,6 +36,7 @@ from training_utils import init_training_workspace, load_training_config
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
+# MAGIC - `model_volume_path` (optional) points at a Unity Catalog volume snapshot of the base model weights; when set, the GPU workers load the model from the volume instead of downloading it from Hugging Face.
 # MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
 # MAGIC - The sampling fraction is set directly in the training cell below (`TRAINING_SAMPLE_FRACTION`), so it can be adjusted live during the demo; `train.yaml`'s `training_sample_fraction` only serves as the AI Runtime CLI default.
 # MAGIC
@@ -62,6 +63,7 @@ print(f"Training config: {CONFIG_PATH}")
 print(f"Source table: {SOURCE_TABLE}")
 print(f"SFT table: {SFT_TABLE}")
 print(f"Base model: {MODEL_NAME}")
+print(f"Base weights source: {MODEL_LOAD_PATH}")
 print(f"Training output dir: {TRAINING_OUTPUT_DIR}")
 print(f"Register model: {REGISTER_MODEL}")
 print(f"Deploy endpoint: {DEPLOY_ENDPOINT}")

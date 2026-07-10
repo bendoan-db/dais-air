@@ -67,6 +67,15 @@ parameters:
     endpoint_name: qwen3_4b_instruct_finetuned_lora
 
     model_name: unsloth/Qwen3-4B-Instruct-2507
+    # Optional UC volume snapshot of the base model weights. When set
+    # (non-empty), training loads the model and tokenizer from this path
+    # instead of downloading from Hugging Face; model_name is still recorded
+    # as the base-model identity in MLflow. Populate the volume once, e.g.:
+    #   hf download unsloth/Qwen3-4B-Instruct-2507 \
+    #     --local-dir /Volumes/doan/air_dais/base_models/Qwen3-4B-Instruct-2507
+    # then set:
+    #   model_volume_path: /Volumes/doan/air_dais/base_models/Qwen3-4B-Instruct-2507
+    model_volume_path: ''
     max_seq_length: 2048
     max_steps: 10
     per_device_train_batch_size: 2
