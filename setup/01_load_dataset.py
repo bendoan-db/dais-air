@@ -37,13 +37,13 @@ except NameError:
     notebook_path = notebook_context.notebookPath().get()
     script_dir = Path("/Workspace") / notebook_path.lstrip("/").rsplit("/", 1)[0]
 
-# training_utils is a plain Python module in 01_train/ shared across the demo;
+# training_utils is a plain Python module in train/ shared across the demo;
 # the same import works for workspace-notebook and local-script runs. (It is
 # not named `utils` because GPU base environments ship packages that register
 # a top-level `utils` module, shadowing any local one.)
 import sys
 
-train_module_dir = str((script_dir.parent / "01_train").resolve())
+train_module_dir = str((script_dir.parent / "train").resolve())
 if train_module_dir not in sys.path:
     sys.path.insert(0, train_module_dir)
 
@@ -52,6 +52,7 @@ from training_utils import (
     config_str,
     ensure_uc_object,
     get_spark_session,
+    load_global_config,
     quote_identifier,
 )
 
@@ -60,12 +61,13 @@ config_path = script_dir / "setup.yaml"
 with config_path.open("r", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
-# setup.yaml is self-contained; the values it shares with train.yaml
-# (catalog, schema, table names) are checked for agreement by
-# scripts/validate_config.py.
-catalog = config_str(config, "catalog")
-schema = config_str(config, "schema")
-table = config_str(config, "table")
+# Stage keys come from setup.yaml; the pipeline-wide identity comes from
+# the repo-root global.yaml.
+global_config_path, global_config = load_global_config()
+catalog = config_str(global_config, "catalog")
+schema = config_str(global_config, "schema")
+table = config_str(global_config, "source_table")
+
 staging_volume = config_str(config, "staging_volume")
 dataset_name = config_str(config, "dataset_name")
 source_url = config_str(config, "source_url")
@@ -95,7 +97,8 @@ archive_path = dataset_root / archive_filename
 
 dataset_root.mkdir(parents=True, exist_ok=True)
 
-print(f"Config path: {config_path}")
+print(f"Stage config: {config_path}")
+print(f"Global config: {global_config_path}")
 print(f"Target table: {full_table_name}")
 print(f"Staging path: {dataset_root}")
 

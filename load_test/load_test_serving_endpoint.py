@@ -36,14 +36,14 @@
 
 # COMMAND ----------
 
-# training_utils is a plain Python module in 01_train/ (not a notebook), so
+# training_utils is a plain Python module in train/ (not a notebook), so
 # it is imported rather than %run. The notebook's working directory is the
-# notebook's folder on serverless, so ../../01_train resolves to the module's
+# notebook's folder on serverless, so ../train resolves to the module's
 # directory.
 import sys
 from pathlib import Path
 
-TRAIN_MODULE_DIR = str((Path.cwd().parents[1] / "01_train").resolve())
+TRAIN_MODULE_DIR = str((Path.cwd().parents[1] / "train").resolve())
 if TRAIN_MODULE_DIR not in sys.path:
     sys.path.insert(0, TRAIN_MODULE_DIR)
 
@@ -54,6 +54,7 @@ from training_utils import (
     ensure_uc_object,
     full_name,
     get_spark_session,
+    load_global_config,
     load_yaml_config,
 )
 
@@ -76,13 +77,13 @@ from pyspark.sql import functions as F
 
 config_path, load_test_config = load_yaml_config("serving_load_test.yaml", base_dir=Path.cwd())
 
-# serving_load_test.yaml is self-contained; the values it shares with
-# train.yaml (catalog, schema, sft_table, endpoint_name) are checked for
-# agreement by scripts/validate_config.py.
-UC_CATALOG = config_str(load_test_config, "catalog")
-UC_SCHEMA = config_str(load_test_config, "schema")
-SFT_TABLE_NAME = config_str(load_test_config, "sft_table")
-ENDPOINT_NAME = config_str(load_test_config, "endpoint_name")
+# Load-generator settings come from serving_load_test.yaml; the
+# pipeline-wide identity comes from the repo-root global.yaml.
+_, global_config = load_global_config()
+UC_CATALOG = config_str(global_config, "catalog")
+UC_SCHEMA = config_str(global_config, "schema")
+SFT_TABLE_NAME = config_str(global_config, "sft_table")
+ENDPOINT_NAME = config_str(global_config, "endpoint_name")
 RESULTS_TABLE_NAME = config_str(load_test_config, "results_table")
 
 TARGET_QPS = config_int(load_test_config, "target_qps")

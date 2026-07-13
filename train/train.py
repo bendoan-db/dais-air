@@ -61,7 +61,7 @@ def load_unsloth_model(model_name: str, device_map=None):
         raise FileNotFoundError(
             f"Local model path does not exist: {model_name}. If this is "
             "model_volume_path from train.yaml, populate the volume first by "
-            "running 00_setup/03_download_base_model_weights.py (or `hf download "
+            "running setup/03_download_base_model_weights.py (or `hf download "
             f"{MODEL_NAME} --local-dir {model_name}`)."
         )
     if model_name.startswith(VOLUME_PATH_PREFIX):
@@ -363,8 +363,8 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     if not shard_dirs:
         raise FileNotFoundError(
             f"No SFT parquet shards found under {SFT_FILES_DIR}. "
-            "Run 00_setup/02_stage_training_data.py first (after "
-            "00_setup/01_load_tabformer_dataset.py) to build and export the SFT records."
+            "Run setup/02_stage_training_data.py first (after "
+            "setup/01_load_dataset.py) to build and export the SFT records."
         )
 
     rank_shard_dirs = [

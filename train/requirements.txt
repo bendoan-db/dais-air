@@ -1,0 +1,43 @@
+# Consolidated environment for the train-and-deploy stage. One file, three
+# consumers: the notebooks (%pip install -r requirements.txt), AIR CLI runs
+# (train.yaml's environment references it via `-r requirements.txt`), and the
+# serving container (deploy_config's serving_requirements_file points here;
+# the parsed list is passed to mlflow log_model as pip_requirements).
+#
+# transformers is pinned <5 so one file can serve training and serving
+# alike: vllm 0.11.0 reads tokenizer attributes that transformers 5 removed.
+# vllm 0.11.0 + opencv-python-headless 4.12 is the FIPS-safe combination for
+# Model Serving pods as of mid-2026 (4.13+ opencv builds bundle an OpenSSL
+# that fails the pods' FIPS self-test, and vllm>=0.15 floors opencv at 4.13).
+# The base model's architecture must be in this vLLM version's supported
+# list — re-verify these pins before changing the base model.
+
+# Shared notebook/runtime utilities.
+pyyaml>=6.0.2
+pandas>=2.2.0
+
+# Databricks data access, experiment tracking, and model registration.
+databricks-connect>=17.0.0
+databricks-sdk>=0.102.0
+mlflow>=3.12.0
+
+# Hugging Face and Unsloth fine-tuning stack.
+accelerate>=1.11.0
+bitsandbytes>=0.46.0
+datasets>=3.6.0
+einops>=0.8.1
+hf_transfer>=0.1.9
+peft>=0.19.1
+safetensors>=0.5.0
+torch
+transformers>=4.56.0,<5
+trl>=0.24.0
+unsloth
+unsloth_zoo>=2026.4.8
+torchao>=0.16.0
+xformers>=0.0.31.post1
+
+# Serving stack: only exercised inside the Model Serving container (the vLLM
+# OpenAI-compatible entrypoint); inert but installed in the training env.
+vllm==0.11.0
+opencv-python-headless==4.12.0.88

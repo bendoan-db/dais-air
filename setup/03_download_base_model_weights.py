@@ -5,7 +5,7 @@
 # MAGIC
 # MAGIC This setup notebook snapshots open-source models from Hugging Face into Unity Catalog volumes so downstream jobs load governed, workspace-local weights instead of downloading from Hugging Face on every GPU worker.
 # MAGIC
-# MAGIC The download list is the `models:` section of `00_setup/setup.yaml` — each entry pairs a Hugging Face repo id (`huggingface_path`) with the volume directory that receives the weights (`volume_path`). Point `01_train/train.yaml`'s `model_volume_path` at the entry the fine-tune should load; a final cell cross-checks that coupling.
+# MAGIC The download list is the `models:` section of `setup/setup.yaml` — each entry pairs a Hugging Face repo id (`huggingface_path`) with the volume directory that receives the weights (`volume_path`). Point `train/train.yaml`'s `model_volume_path` at the entry the fine-tune should load; a final cell cross-checks that coupling.
 # MAGIC Rerunning is cheap: a download is skipped when its volume already holds a complete snapshot.
 # MAGIC
 # MAGIC Run this as a Databricks workspace notebook on serverless (CPU) compute. It writes through the `/Volumes` FUSE mount, which is not available to local Databricks Connect runs.
@@ -32,15 +32,15 @@ except NameError:
     notebook_path = notebook_context.notebookPath().get()
     script_dir = Path("/Workspace") / notebook_path.lstrip("/").rsplit("/", 1)[0]
 
-# training_utils is a plain Python module in 01_train/ shared across the demo;
+# training_utils is a plain Python module in train/ shared across the demo;
 # the same import works for workspace-notebook and local-script runs. (It is
 # not named `utils` because GPU base environments ship packages that register
 # a top-level `utils` module, shadowing any local one.)
-train_module_dir = str((script_dir.parent / "01_train").resolve())
+train_module_dir = str((script_dir.parent / "train").resolve())
 if train_module_dir not in sys.path:
     sys.path.insert(0, train_module_dir)
 
-from training_utils import ensure_uc_object, full_name, get_spark_session, load_training_config
+from training_utils import ensure_uc_object, full_name, get_spark_session, load_global_config
 
 config_path = script_dir / "setup.yaml"
 with config_path.open("r", encoding="utf-8") as config_file:
@@ -222,28 +222,28 @@ for model in models:
 # MAGIC %md
 # MAGIC ## Cross-check against the training config
 # MAGIC
-# MAGIC Training loads base weights from `model_volume_path` in `01_train/train.yaml`'s `training_config`. This advisory cell confirms that path is covered by one of the snapshots above so the fine-tune doesn't fail at model load (it does not stop the notebook — the models list may legitimately serve other workloads).
+# MAGIC Training loads base weights from `model_volume_path` in `train/train.yaml`'s `training_config`. This advisory cell confirms that path is covered by one of the snapshots above so the fine-tune doesn't fail at model load (it does not stop the notebook — the models list may legitimately serve other workloads).
 
 # COMMAND ----------
 
-training_context = load_training_config()
-train_model_volume_path = training_context["MODEL_VOLUME_PATH"].rstrip("/")
+_, global_config = load_global_config()
+train_model_volume_path = str(global_config.get("model_volume_path") or "").rstrip("/")
 
 if not train_model_volume_path:
     print(
-        "01_train/train.yaml has no model_volume_path set — training will download "
-        f"{training_context['MODEL_NAME']} from Hugging Face on each GPU worker. "
+        "global.yaml has no model_volume_path set — training will download "
+        f"{global_config.get('model_name')} from Hugging Face on each GPU worker. "
         "Point model_volume_path at one of the snapshots above to load "
         "workspace-local weights instead."
     )
 elif train_model_volume_path in {str(model["destination_dir"]) for model in models}:
     print(
-        "01_train/train.yaml's model_volume_path matches a downloaded snapshot: "
+        "global.yaml's model_volume_path matches a downloaded snapshot: "
         f"{train_model_volume_path}"
     )
 else:
     print(
-        "WARNING: 01_train/train.yaml's model_volume_path is not among the snapshots "
+        "WARNING: global.yaml's model_volume_path is not among the snapshots "
         f"this notebook downloads: {train_model_volume_path}. Training will fail at "
         "model load unless that directory is populated some other way — add a "
         "matching entry to setup.yaml's models list or update model_volume_path."

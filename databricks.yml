@@ -27,20 +27,20 @@ targets:
 resources:
   jobs:
     # Serverless job covering the data/setup stages. Training itself runs
-    # interactively in 01_train/runner.py (Serverless GPU + AI Runtime) or via
-    # the AI Runtime CLI (01_train/train.yaml); see README.
+    # interactively in train/01_runner.py (Serverless GPU + AI Runtime) or
+    # via the AI Runtime CLI (train/train.yaml); see README.
     data_setup:
       name: air-finetune-data-setup
       tasks:
         - task_key: load_dataset
           notebook_task:
-            notebook_path: ./00_setup/01_load_tabformer_dataset.py
+            notebook_path: ./setup/01_load_dataset.py
         - task_key: stage_training_data
           depends_on:
             - task_key: load_dataset
           notebook_task:
-            notebook_path: ./00_setup/02_stage_training_data.py
+            notebook_path: ./setup/02_stage_training_data.py
         # Independent of the data tasks; runs in parallel.
         - task_key: download_base_model_weights
           notebook_task:
-            notebook_path: ./00_setup/03_download_base_model_weights.py
+            notebook_path: ./setup/03_download_base_model_weights.py

@@ -3,12 +3,12 @@
 # MAGIC %md
 # MAGIC # Register the fine-tuned model and deploy it to Model Serving
 # MAGIC
-# MAGIC This is the first module of the deployment (MLOps) stage: it takes a training run produced by `01_train`, merges the run's LoRA adapter into the base model, registers the merged model to Unity Catalog as a custom LLM, and creates or updates a Mosaic AI Model Serving endpoint for it.
+# MAGIC This is the deployment step of this stage: it takes a training run produced by `01_runner.py` (or the AIR CLI), merges the run's LoRA adapter into the base model, registers the merged model to Unity Catalog as a custom LLM, and creates or updates a Mosaic AI Model Serving endpoint for it.
 # MAGIC
-# MAGIC Run selection is driven by `deploy.yaml`:
+# MAGIC Run selection is driven by the `deploy_config` section of `train.yaml` (this directory's shared config file):
 # MAGIC
 # MAGIC - `run_id` set — register exactly that MLflow run's adapter.
-# MAGIC - `run_id` empty — search the configured `experiment_name` for FINISHED runs and pick the best one by `best_run_metric` / `best_run_metric_goal`.
+# MAGIC - `run_id` empty — search the global experiment (`experiment_name` in the repo-root `global.yaml`, the same experiment training logs to) for FINISHED runs and pick the best one by `best_run_metric` / `best_run_metric_goal`.
 # MAGIC
 # MAGIC Either way, the adapter location is read from the run's `adapter_output_dir` parameter (logged by training), so this notebook needs no knowledge of checkpoint-volume layout.
 # MAGIC
@@ -16,72 +16,36 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install -qqq -r ../01_train/requirements.txt
+# MAGIC %pip install -qqq -r requirements.txt
 # MAGIC %restart_python
 
 # COMMAND ----------
 
-# training_utils and train.py are plain Python modules in 01_train/ (not
-# notebooks), shared across the pipeline; insert that directory into sys.path
-# and import them.
+# training_utils and train.py are plain Python modules in this directory
+# (not notebooks), shared across the pipeline; put the notebook directory on
+# sys.path and import them.
 import json
 import sys
 from pathlib import Path
 
 import pandas as pd
 
-TRAIN_MODULE_DIR = str((Path.cwd().parent / "01_train").resolve())
-if TRAIN_MODULE_DIR not in sys.path:
-    sys.path.insert(0, TRAIN_MODULE_DIR)
+NOTEBOOK_DIR = str(Path.cwd())
+if NOTEBOOK_DIR not in sys.path:
+    sys.path.insert(0, NOTEBOOK_DIR)
 
-from training_utils import (
-    config_bool,
-    config_float,
-    config_int,
-    config_str,
-    load_yaml_config,
-)
+from training_utils import load_deploy_config
 
-# deploy.yaml is self-contained; the values it shares with other stages
-# (catalog, schema, experiment_name, endpoint_name) are checked for agreement
-# by scripts/validate_config.py.
-config_path, deploy_config = load_yaml_config("deploy.yaml", base_dir=Path.cwd())
+# Registration/serving settings come from the deploy_config section of
+# train.yaml — training and deployment share this directory's one config
+# file, so catalog/schema and the experiment are identical by construction.
+# Values shared with other stages (endpoint_name with the load test,
+# inference_table_prefix with the monitor) are checked by
+# scripts/validate_config.py.
+deploy_context = load_deploy_config()
+globals().update(deploy_context)
 
-UC_CATALOG = config_str(deploy_config, "catalog")
-UC_SCHEMA = config_str(deploy_config, "schema")
-
-RUN_ID = str(deploy_config.get("run_id") or "").strip()
-EXPERIMENT_NAME = config_str(deploy_config, "experiment_name")
-BEST_RUN_METRIC = config_str(deploy_config, "best_run_metric")
-BEST_RUN_METRIC_GOAL = config_str(deploy_config, "best_run_metric_goal").lower()
-if BEST_RUN_METRIC_GOAL not in {"minimize", "maximize"}:
-    raise ValueError(
-        f"best_run_metric_goal must be 'minimize' or 'maximize', got {BEST_RUN_METRIC_GOAL!r}."
-    )
-
-UC_MODEL_NAME = config_str(deploy_config, "uc_model_name")
-SERVED_MODEL_NAME = config_str(deploy_config, "served_model_name")
-SERVING_PIP_REQUIREMENTS = deploy_config.get("serving_pip_requirements")
-if not isinstance(SERVING_PIP_REQUIREMENTS, list) or not SERVING_PIP_REQUIREMENTS:
-    raise ValueError("serving_pip_requirements must be a non-empty list in deploy.yaml")
-SERVING_PIP_REQUIREMENTS = [str(requirement) for requirement in SERVING_PIP_REQUIREMENTS]
-
-VLLM_DTYPE = config_str(deploy_config, "vllm_dtype")
-VLLM_MAX_MODEL_LEN = config_int(deploy_config, "vllm_max_model_len")
-VLLM_GPU_MEMORY_UTILIZATION = config_float(deploy_config, "vllm_gpu_memory_utilization")
-
-ENDPOINT_NAME = config_str(deploy_config, "endpoint_name")
-ENDPOINT_DESCRIPTION = config_str(deploy_config, "endpoint_description")
-SERVING_WORKLOAD_TYPE = config_str(deploy_config, "serving_workload_type")
-SERVING_PROVISIONED_CONCURRENCY = config_int(deploy_config, "serving_provisioned_concurrency")
-SERVING_WORKLOAD_SIZE = str(deploy_config.get("serving_workload_size") or "").strip()
-SERVING_SCALE_TO_ZERO = config_bool(deploy_config, "serving_scale_to_zero")
-
-INFERENCE_TABLE_PREFIX = config_str(deploy_config, "inference_table_prefix")
-
-FULL_MODEL_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_MODEL_NAME}"
-
-print(f"Deploy config: {config_path}")
+print(f"Deploy config: {DEPLOY_CONFIG_PATH} (parameters.deploy_config)")
 print(f"Registered model target: {FULL_MODEL_NAME}")
 print(f"Serving endpoint: {ENDPOINT_NAME}")
 print(f"Run selection: {'run_id=' + RUN_ID if RUN_ID else f'best {BEST_RUN_METRIC} ({BEST_RUN_METRIC_GOAL}) in {EXPERIMENT_NAME}'}")
@@ -113,12 +77,12 @@ experiment = mlflow.get_experiment_by_name(experiment_path)
 if experiment is None:
     raise ValueError(
         f"MLflow experiment not found: {experiment_path}. Run training "
-        "(01_train) first, or fix experiment_name in deploy.yaml."
+        "(01_runner.py or the AIR CLI) first, or fix experiment_name in global.yaml."
     )
 
 if RUN_ID:
     source_run = mlflow.get_run(RUN_ID)
-    selection_reason = "run_id from deploy.yaml"
+    selection_reason = "run_id from train.yaml's deploy_config"
     selection_metric_value = source_run.data.metrics.get(BEST_RUN_METRIC)
 else:
     metric_order = "ASC" if BEST_RUN_METRIC_GOAL == "minimize" else "DESC"
@@ -133,7 +97,7 @@ else:
         raise ValueError(
             f"No finished runs in {experiment_path} logged both "
             f"{BEST_RUN_METRIC!r} and adapter_output_dir — nothing to deploy. "
-            "Complete a training run first or set run_id in deploy.yaml."
+            "Complete a training run first or set run_id in train.yaml's deploy_config."
         )
     candidate_runs = runs_pdf[
         runs_pdf[metric_column].notna() & runs_pdf[adapter_column].notna()
@@ -142,7 +106,7 @@ else:
         raise ValueError(
             f"No finished run in {experiment_path} has both {BEST_RUN_METRIC!r} "
             "and adapter_output_dir. Complete a training run first or set "
-            "run_id in deploy.yaml."
+            "run_id in train.yaml's deploy_config."
         )
     best_row = candidate_runs.iloc[0]
     source_run = mlflow.get_run(best_row["run_id"])
@@ -191,7 +155,7 @@ display(
 # MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
 # MAGIC - The entrypoint launches from the MLflow model's `artifacts/` folder, so the `--model` path is the bare artifact name relative to that folder.
 # MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
-# MAGIC - The serving container installs its packages from `deploy.yaml`'s `serving_pip_requirements`, not from `requirements.txt`. The pinned `vllm==0.11.0` + `transformers<5` + `opencv-python-headless==4.12.0.88` combination is what runs on Model Serving's FIPS-enabled pods, and the base model's architecture must be in that vLLM's supported model list (a preflight check below prints the architecture to verify).
+# MAGIC - The serving container installs its packages from the consolidated `requirements.txt` (referenced by `deploy_config`'s `serving_requirements_file`), which pins `transformers<5` so the same file satisfies both the training environment and this vLLM serving stack. The pinned `vllm==0.11.0` + `transformers<5` + `opencv-python-headless==4.12.0.88` combination is what runs on Model Serving's FIPS-enabled pods, and the base model's architecture must be in that vLLM's supported model list (a preflight check below prints the architecture to verify).
 # MAGIC
 # MAGIC Registration is separate from training so a failed registration or deployment can be rerun without re-training.
 
@@ -287,8 +251,8 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
         architectures = model_config.get("architectures", [])
         print(
             f"Base model architecture(s): {architectures} — verify these appear in "
-            "the supported-models list of the vLLM pinned in deploy.yaml's "
-            "serving_pip_requirements before deploying."
+            "the supported-models list of the vLLM pinned in "
+            "requirements.txt before deploying."
         )
 
         with mlflow.start_run(run_name=run_name, log_system_metrics=True) as run:
@@ -311,9 +275,11 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 python_model=CustomLlmEntrypointPlaceholder(),
                 artifacts={CUSTOM_LLM_MODEL_ARTIFACT_NAME: str(merged_model_dir)},
                 input_example=input_example,
-                # The serving container's packages come from deploy.yaml's
-                # serving_pip_requirements — the FIPS-safe vLLM combination;
-                # see the comments there before changing pins or base model.
+                # The serving container's packages come from the
+                # consolidated requirements.txt (deploy_config's
+                # serving_requirements_file) — including the FIPS-safe vLLM
+                # pins; see the comments there before changing pins or base
+                # model.
                 pip_requirements=SERVING_PIP_REQUIREMENTS,
                 metadata=metadata,
             )
@@ -351,16 +317,16 @@ display(pd.DataFrame([registration_result]))
 # MAGIC
 # MAGIC This cell creates or updates a Mosaic AI Model Serving endpoint for the registered custom LLM, routing 100% of traffic to the version registered above.
 # MAGIC
-# MAGIC The endpoint configuration is controlled by `deploy.yaml`:
+# MAGIC The endpoint configuration is controlled by `train.yaml`'s `deploy_config`:
 # MAGIC
-# MAGIC - `endpoint_name` is the serving endpoint name used by the load-test notebook.
+# MAGIC - `endpoint_name` (from the repo-root `global.yaml`) is the serving endpoint name used by the load-test notebook.
 # MAGIC - `serving_workload_type` selects the GPU class, such as `GPU_MEDIUM` for A10 or `GPU_XLARGE` for H100.
 # MAGIC - `serving_provisioned_concurrency` sets the fixed provisioned capacity behind the endpoint (custom LLM serving does not autoscale during beta — size for peak traffic).
 # MAGIC - `serving_scale_to_zero` is useful for development, but should be disabled for latency-sensitive production traffic.
 # MAGIC
 # MAGIC The served entity also sets `VLLM_USE_FLASHINFER_SAMPLER=0`: the serving container cannot JIT-compile FlashInfer kernels (no `ninja`/`nvcc`), so vLLM must use its native PyTorch sampler.
 # MAGIC
-# MAGIC **Inference logging is always enabled** as part of the deployment: the endpoint's AI Gateway configuration logs every request/response to `<catalog>.<schema>.<inference_table_prefix>_payload` — the raw table the monitoring stage (`03_monitor`) unpacks. AI Gateway inference tables are the recommended capture mechanism for custom model endpoints (the legacy `auto_capture_config` path is retired); logs are delivered within about an hour of traffic.
+# MAGIC **Inference logging is always enabled** as part of the deployment: the endpoint's AI Gateway configuration logs every request/response to `<catalog>.<schema>.<inference_table_prefix>_payload` — the raw table the monitoring stage (`monitor/`) unpacks. AI Gateway inference tables are the recommended capture mechanism for custom model endpoints (the legacy `auto_capture_config` path is retired); logs are delivered within about an hour of traffic.
 
 # COMMAND ----------
 
@@ -373,7 +339,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
     if SERVING_WORKLOAD_TYPE == "GPU_XLARGE" and SERVING_SCALE_TO_ZERO:
         raise ValueError(
             "Custom LLM serving beta does not support scale-to-zero for GPU_XLARGE. "
-            "Set serving_scale_to_zero: false in deploy.yaml."
+            "Set serving_scale_to_zero: false in train.yaml's deploy_config."
         )
 
     from datetime import timedelta
@@ -491,5 +457,5 @@ display(pd.DataFrame([deployment_result]))
 # MAGIC
 # MAGIC The endpoint serves the fine-tuned model behind the OpenAI-compatible chat contract (`/serving-endpoints/<endpoint_name>/invocations`).
 # MAGIC
-# MAGIC - Load test it with `02_deploy/load_test/load_test_serving_endpoint.py`, which samples real prompts from the SFT table and records throughput/latency to a results table.
+# MAGIC - Load test it with `load_test/load_test_serving_endpoint.py`, which samples real prompts from the SFT table and records throughput/latency to a results table.
 # MAGIC - Rerunning this notebook after a new training run re-selects the best run (or honors `run_id`), registers a new model version, and rolls the endpoint to it.

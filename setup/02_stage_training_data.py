@@ -3,7 +3,7 @@
 # MAGIC %md
 # MAGIC # Stage the supervised fine-tuning data in a Unity Catalog volume
 # MAGIC
-# MAGIC This setup notebook builds the supervised fine-tuning records from the cleaned transaction table written by `01_load_tabformer_dataset.py` and stages them for AI Runtime training:
+# MAGIC This setup notebook builds the supervised fine-tuning records from the cleaned transaction table written by `01_load_dataset.py` and stages them for AI Runtime training:
 # MAGIC
 # MAGIC 1. Writes the SFT Delta table with `prompt`, `assistant_response`, and stable `shard_id` columns. Prompt text, assistant JSON, and shard IDs are generated with Spark expressions so the work runs in parallel instead of row by row in Python.
 # MAGIC 2. Exports the SFT records to a Unity Catalog volume as Parquet files partitioned by `shard_id`, per the AI Runtime data-loading guidance for large Delta tables:
@@ -30,13 +30,13 @@ except NameError:
     notebook_path = notebook_context.notebookPath().get()
     script_dir = Path("/Workspace") / notebook_path.lstrip("/").rsplit("/", 1)[0]
 
-# training_utils is a plain Python module in 01_train/ shared across the demo;
+# training_utils is a plain Python module in train/ shared across the demo;
 # the same import works for workspace-notebook and local-script runs. (It is
 # not named `utils` because GPU base environments ship packages that register
 # a top-level `utils` module, shadowing any local one.)
 import sys
 
-train_module_dir = str((script_dir.parent / "01_train").resolve())
+train_module_dir = str((script_dir.parent / "train").resolve())
 if train_module_dir not in sys.path:
     sys.path.insert(0, train_module_dir)
 
@@ -46,6 +46,7 @@ from training_utils import (
     config_str,
     ensure_uc_object,
     get_spark_session,
+    load_global_config,
     quote_identifier,
 )
 
@@ -54,14 +55,14 @@ config_path = script_dir / "setup.yaml"
 with config_path.open("r", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
-# setup.yaml is self-contained; the values it shares with train.yaml
-# (catalog, schema, table, sft_table, sft_volume) are checked for agreement
-# by scripts/validate_config.py.
-catalog = config_str(config, "catalog")
-schema = config_str(config, "schema")
-table = config_str(config, "table")
-sft_table = config_str(config, "sft_table")
-sft_volume = config_str(config, "sft_volume")
+# Stage keys come from setup.yaml; the pipeline-wide identity comes from
+# the repo-root global.yaml.
+global_config_path, global_config = load_global_config()
+catalog = config_str(global_config, "catalog")
+schema = config_str(global_config, "schema")
+table = config_str(global_config, "source_table")
+sft_table = config_str(global_config, "sft_table")
+sft_volume = config_str(global_config, "sft_volume")
 sft_files_path = f"/Volumes/{catalog}/{schema}/{sft_volume}/{sft_table}"
 
 suspicious_amount_threshold = config_float(config, "suspicious_amount_threshold")
@@ -96,7 +97,7 @@ try:
 except Exception as exc:
     raise RuntimeError(
         f"Source table {full_table_name} is not readable. Run "
-        "00_setup/01_load_tabformer_dataset.py first to download TabFormer and "
+        "setup/01_load_dataset.py first to download TabFormer and "
         "write the cleaned transaction table."
     ) from exc
 
@@ -107,10 +108,11 @@ if missing_shard_key_columns:
     raise ValueError(
         f"sft_shard_key_columns not found in {full_table_name}: "
         f"{missing_shard_key_columns}. Update sft_shard_key_columns in "
-        "00_setup/setup.yaml to columns that exist in the source table."
+        "setup/setup.yaml to columns that exist in the source table."
     )
 
-print(f"Config path: {config_path}")
+print(f"Stage config: {config_path}")
+print(f"Global config: {global_config_path}")
 print(f"Source table: {full_table_name} ({len(source_columns)} columns)")
 print(f"Target SFT table: {full_sft_table_name}")
 print(f"Target SFT parquet export: {sft_files_path}")
@@ -320,4 +322,4 @@ if export_row_count != table_row_count:
         f"{table_row_count} — the export is incomplete; rerun this notebook."
     )
 
-print("Training data staged. Next: 01_train/runner.py (or `air run --file train.yaml` from 01_train/).")
+print("Training data staged. Next: train/01_runner.py (or `air run --file train.yaml` from train/).")

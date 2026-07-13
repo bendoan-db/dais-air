@@ -1,15 +1,11 @@
-# Configuration for the monitoring stage (03_monitor). This file is
-# self-contained so the module runs standalone. Values shared with other
-# stages must agree and are checked by scripts/validate_config.py:
-# catalog/schema with every stage, and inference_table must equal
-# 02_deploy/deploy.yaml's inference_table_prefix + '_payload' (the table the
-# endpoint's AI Gateway inference logging writes).
-catalog: poc-catalog
-schema: databricks_support
+# Stage-specific configuration for the monitoring stage. The pipeline-wide
+# identity (catalog, schema, inference_table_prefix) lives in the repo-root
+# global.yaml, loaded through training_utils.load_global_config(); the
+# payload table name is derived as <inference_table_prefix>_payload, so it
+# always matches what the endpoint writes. scripts/validate_config.py fails
+# if this file re-introduces a global key.
 
 # ---- 01_unpack_inference_table.py ----
-# Raw payload table written by the endpoint (AI Gateway inference table).
-inference_table: qwen3_4b_instruct_finetuned_payload
 # Delta table receiving one unpacked row per request. Created on first run
 # with change data feed enabled (required for efficient incremental monitor
 # refreshes) and partitioned by request_date.

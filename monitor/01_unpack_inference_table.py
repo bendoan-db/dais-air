@@ -3,7 +3,7 @@
 # MAGIC %md
 # MAGIC # Unpack the serving endpoint's inference table
 # MAGIC
-# MAGIC This is the first module of the monitoring stage: it converts the raw payload table that the serving endpoint writes (AI Gateway inference logging, enabled by `02_deploy/01_register_and_deploy.py`) into an analysis-ready Delta table with one row per request — the table the data-quality monitor is created over in the next module.
+# MAGIC This is the first module of the monitoring stage: it converts the raw payload table that the serving endpoint writes (AI Gateway inference logging, enabled by `train/02_register_and_deploy.py`) into an analysis-ready Delta table with one row per request — the table the data-quality monitor is created over in the next module.
 # MAGIC
 # MAGIC The payload table stores each request/response pair as raw JSON strings alongside delivery metadata. This notebook:
 # MAGIC
@@ -21,12 +21,12 @@
 
 # COMMAND ----------
 
-# training_utils is a plain Python module in 01_train/ (not a notebook),
+# training_utils is a plain Python module in train/ (not a notebook),
 # shared across the pipeline; insert that directory into sys.path.
 import sys
 from pathlib import Path
 
-TRAIN_MODULE_DIR = str((Path.cwd().parent / "01_train").resolve())
+TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
 if TRAIN_MODULE_DIR not in sys.path:
     sys.path.insert(0, TRAIN_MODULE_DIR)
 
@@ -36,17 +36,20 @@ from training_utils import (
     ensure_uc_object,
     full_name,
     get_spark_session,
+    load_global_config,
     load_yaml_config,
 )
 
-# monitor.yaml is self-contained; the values it shares with other stages
-# (catalog, schema, inference table name) are checked for agreement by
-# scripts/validate_config.py.
+# Stage keys come from monitor.yaml; the pipeline-wide identity comes from
+# the repo-root global.yaml. The payload table name is derived from the
+# global inference_table_prefix — the endpoint always writes
+# <prefix>_payload, so the two can never drift.
 config_path, monitor_config = load_yaml_config("monitor.yaml", base_dir=Path.cwd())
+_, global_config = load_global_config()
 
-UC_CATALOG = config_str(monitor_config, "catalog")
-UC_SCHEMA = config_str(monitor_config, "schema")
-INFERENCE_TABLE_NAME = config_str(monitor_config, "inference_table")
+UC_CATALOG = config_str(global_config, "catalog")
+UC_SCHEMA = config_str(global_config, "schema")
+INFERENCE_TABLE_NAME = f"{config_str(global_config, 'inference_table_prefix')}_payload"
 UNPACKED_TABLE_NAME = config_str(monitor_config, "unpacked_table")
 CHECKPOINT_VOLUME = config_str(monitor_config, "checkpoint_volume")
 INCLUDE_FAILED_REQUESTS = config_bool(monitor_config, "include_failed_requests")
@@ -82,7 +85,7 @@ try:
 except Exception as exc:
     raise RuntimeError(
         f"Payload table {payload_table_q} is not readable. Deploy the endpoint "
-        "first (02_deploy/01_register_and_deploy.py enables inference logging "
+        "first (train/02_register_and_deploy.py enables inference logging "
         "automatically) and send it some traffic — logs are delivered within "
         "~1 hour of a request."
     ) from exc

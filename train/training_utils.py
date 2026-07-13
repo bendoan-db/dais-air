@@ -31,6 +31,32 @@ def load_yaml_config(config_filename: str, base_dir: Path | None = None) -> tupl
     return config_path, config
 
 
+GLOBAL_CONFIG_FILENAME = "global.yaml"
+
+
+def load_global_config() -> tuple[Path, dict]:
+    """Load the repo-root ``global.yaml`` (pipeline-wide shared parameters).
+
+    Searched at this module's parent directory (the repository root) with a
+    cwd fallback, which covers workspace notebooks, local scripts, and AIR
+    CLI runs — the code snapshot roots at the repository (train.yaml's
+    ``root_path: ..``) precisely so this file ships with ``train/``.
+    """
+    candidates = [
+        MODULE_DIR.parent / GLOBAL_CONFIG_FILENAME,
+        Path.cwd() / GLOBAL_CONFIG_FILENAME,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return load_yaml_config(GLOBAL_CONFIG_FILENAME, base_dir=candidate.parent)
+    raise FileNotFoundError(
+        "global.yaml not found (searched: "
+        + ", ".join(str(candidate) for candidate in candidates)
+        + "). It lives at the repository root; AIR CLI snapshots include it "
+        "because train.yaml's code_source roots at the repo (root_path: ..)."
+    )
+
+
 def config_value(config: dict, key: str):
     if key not in config:
         raise KeyError(f"Missing required config key: {key}")
@@ -189,7 +215,6 @@ def load_training_config() -> dict:
     import os
 
     hyperparameters_path = os.environ.get("HYPERPARAMETERS_PATH")
-    workload_config: dict = {}
     if hyperparameters_path:
         config_path = Path(hyperparameters_path)
         with config_path.open("r", encoding="utf-8") as config_file:
@@ -198,25 +223,30 @@ def load_training_config() -> dict:
         # `parameters` dict, but v0.1.0b1 points it at the full workload
         # YAML — accept either shape.
         parameters = loaded.get("parameters", loaded)
-        if "parameters" in loaded:
-            workload_config = loaded
     else:
         config_path, workload_config = load_yaml_config("train.yaml")
         parameters = config_value(workload_config, "parameters")
     config = config_value(parameters, "training_config")
 
-    uc_catalog = config_str(config, "catalog")
-    uc_schema = config_str(config, "schema")
-    source_table_name = config_str(config, "source_table")
-    sft_table_name = config_str(config, "sft_table")
-    sft_volume = config_str(config, "sft_volume")
-    uc_volume = config_str(config, "checkpoint_volume")
-    uc_model_name = config_str(config, "uc_model_name")
-    max_steps = config_int(config, "max_steps")
-    model_name = config_str(config, "model_name")
+    # Pipeline-wide identity comes from the repo-root global.yaml; the
+    # training_config section holds only training-stage keys.
+    _, global_config = load_global_config()
+    uc_catalog = config_str(global_config, "catalog")
+    uc_schema = config_str(global_config, "schema")
+    source_table_name = config_str(global_config, "source_table")
+    sft_table_name = config_str(global_config, "sft_table")
+    sft_volume = config_str(global_config, "sft_volume")
+    uc_model_name = config_str(global_config, "uc_model_name")
+    model_name = config_str(global_config, "model_name")
     # Optional UC volume snapshot of the base weights; empty or missing means
     # download from Hugging Face by model_name.
-    model_volume_path = str(config.get("model_volume_path") or "").strip()
+    model_volume_path = str(global_config.get("model_volume_path") or "").strip()
+    # The AIR CLI schema also requires experiment_name at train.yaml's top
+    # level; scripts/validate_config.py keeps the two copies equal.
+    experiment_name = config_str(global_config, "experiment_name")
+
+    uc_volume = config_str(config, "checkpoint_volume")
+    max_steps = config_int(config, "max_steps")
     output_root = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume}/{uc_model_name}"
 
     lora_target_modules = config_value(config, "lora_target_modules")
@@ -227,14 +257,6 @@ def load_training_config() -> dict:
     # part of the text train_on_responses_only matches against.
     response_instruction_part = str(config_value(config, "response_instruction_part"))
     response_part = str(config_value(config, "response_part"))
-
-    # The workspace experiment name comes from the workload-level
-    # experiment_name (the same value the AIR CLI uses); it is absent when
-    # HYPERPARAMETERS_PATH carries only the parameters dict, so fall back to a
-    # model-derived name.
-    experiment_name = str(
-        workload_config.get("experiment_name") or f"{uc_model_name}_finetuning"
-    ).strip()
 
     return {
         "CONFIG_PATH": config_path,
@@ -285,6 +307,85 @@ def load_training_config() -> dict:
     }
 
 
+def load_deploy_config() -> dict:
+    """Load ``parameters.deploy_config`` (registration/serving settings).
+
+    The deployment notebook (``02_register_and_deploy.py``) shares
+    ``train.yaml`` with training. The pipeline-wide identity (catalog,
+    schema, experiment, uc_model_name, endpoint_name,
+    inference_table_prefix) comes from the repo-root ``global.yaml`` via
+    :func:`load_global_config`/:func:`load_training_config`;
+    ``deploy_config`` holds only the deployment-stage keys. Returns a flat
+    dict intended for ``globals().update(...)``, like the training loader.
+    """
+    config_path, workload_config = load_yaml_config("train.yaml")
+    parameters = config_value(workload_config, "parameters")
+    config = config_value(parameters, "deploy_config")
+
+    training_context = load_training_config()
+    uc_catalog = training_context["UC_CATALOG"]
+    uc_schema = training_context["UC_SCHEMA"]
+    uc_model_name = training_context["UC_MODEL_NAME"]
+
+    _, global_config = load_global_config()
+    endpoint_name = config_str(global_config, "endpoint_name")
+    inference_table_prefix = config_str(global_config, "inference_table_prefix")
+
+    best_run_metric_goal = config_str(config, "best_run_metric_goal").lower()
+    if best_run_metric_goal not in {"minimize", "maximize"}:
+        raise ValueError(
+            "best_run_metric_goal must be 'minimize' or 'maximize', "
+            f"got {best_run_metric_goal!r} (train.yaml deploy_config)."
+        )
+
+    # The serving container's packages come from a requirements file (the
+    # consolidated requirements.txt by default) instead of an inline YAML
+    # list; read it here so registration can pass the parsed list to
+    # log_model.
+    serving_requirements_file = config_str(config, "serving_requirements_file")
+    serving_requirements_path = Path(serving_requirements_file)
+    if not serving_requirements_path.is_absolute():
+        serving_requirements_path = MODULE_DIR / serving_requirements_path
+    if not serving_requirements_path.exists():
+        raise FileNotFoundError(
+            f"serving_requirements_file not found: {serving_requirements_path} "
+            "(deploy_config in train.yaml; relative paths resolve against the "
+            "train.yaml directory)."
+        )
+    serving_pip_requirements = [
+        line.strip()
+        for line in serving_requirements_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not serving_pip_requirements:
+        raise ValueError(f"{serving_requirements_path} contains no requirements.")
+
+    return {
+        "DEPLOY_CONFIG_PATH": config_path,
+        "UC_CATALOG": uc_catalog,
+        "UC_SCHEMA": uc_schema,
+        "EXPERIMENT_NAME": training_context["EXPERIMENT_NAME"],
+        "RUN_ID": str(config.get("run_id") or "").strip(),
+        "BEST_RUN_METRIC": config_str(config, "best_run_metric"),
+        "BEST_RUN_METRIC_GOAL": best_run_metric_goal,
+        "UC_MODEL_NAME": uc_model_name,
+        "SERVED_MODEL_NAME": config_str(config, "served_model_name"),
+        "SERVING_PIP_REQUIREMENTS": [str(requirement) for requirement in serving_pip_requirements],
+        "VLLM_DTYPE": config_str(config, "vllm_dtype"),
+        "VLLM_MAX_MODEL_LEN": config_int(config, "vllm_max_model_len"),
+        "VLLM_GPU_MEMORY_UTILIZATION": config_float(config, "vllm_gpu_memory_utilization"),
+        "INFERENCE_TABLE_PREFIX": inference_table_prefix,
+        "ENDPOINT_NAME": endpoint_name,
+        "ENDPOINT_DESCRIPTION": config_str(config, "endpoint_description"),
+        "SERVING_WORKLOAD_TYPE": config_str(config, "serving_workload_type"),
+        "SERVING_PROVISIONED_CONCURRENCY": config_int(config, "serving_provisioned_concurrency"),
+        # Optional legacy sizing knob; passed through only when non-empty.
+        "SERVING_WORKLOAD_SIZE": str(config.get("serving_workload_size") or "").strip(),
+        "SERVING_SCALE_TO_ZERO": config_bool(config, "serving_scale_to_zero"),
+        "FULL_MODEL_NAME": f"{uc_catalog}.{uc_schema}.{uc_model_name}",
+    }
+
+
 def ensure_uc_object(spark, ddl_statement: str) -> None:
     """Run a ``CREATE ... IF NOT EXISTS`` statement with a permission-friendly error.
 
@@ -301,7 +402,7 @@ def ensure_uc_object(spark, ddl_statement: str) -> None:
             "exist, the current user likely lacks the required Unity Catalog "
             "privilege — ask an admin for USE CATALOG plus CREATE SCHEMA / "
             "CREATE VOLUME / CREATE TABLE on the configured catalog and "
-            "schema, or point 01_train/train.yaml's training_config at objects "
+            "schema, or point train/train.yaml's training_config at objects "
             "that already exist."
         ) from exc
 

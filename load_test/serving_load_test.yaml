@@ -1,11 +1,8 @@
-# Configuration for the load-test notebook. This file is self-contained so
-# the load test runs standalone. catalog, schema, sft_table, and
-# endpoint_name must agree with 01_train/train.yaml's training_config;
-# scripts/validate_config.py checks every agreement.
-catalog: poc-catalog
-schema: databricks_support
-sft_table: fraud_sft_dataset
-endpoint_name: qwen3_4b_instruct_finetuned
+# Stage-specific configuration for the load-test notebook. The
+# pipeline-wide identity (catalog, schema, sft_table, endpoint_name) lives
+# in the repo-root global.yaml, loaded through
+# training_utils.load_global_config(); scripts/validate_config.py fails if
+# this file re-introduces a global key.
 
 # Delta table (in the shared catalog.schema) that accumulates one summary row
 # per load-test run.

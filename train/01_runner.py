@@ -30,13 +30,13 @@ from training_utils import init_training_workspace, load_training_config
 # MAGIC %md
 # MAGIC ## Training configuration
 # MAGIC
-# MAGIC Training settings are loaded from the `training_config` section of `01_train/train.yaml` — the same file that defines the AI Runtime CLI workload, so the notebook and CLI launch paths share one configuration. (Registration and serving settings live in the deployment stage's `02_deploy/deploy.yaml`.)
+# MAGIC Training settings are loaded from the `training_config` section of `train/train.yaml` — the same file that defines the AI Runtime CLI workload, so the notebook and CLI launch paths share one configuration. (Registration and serving settings live in the `deploy_config` section of the same file, read by `02_register_and_deploy.py`.)
 # MAGIC This keeps the notebook body stable while making the experiment easy to tune:
 # MAGIC
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
-# MAGIC - `model_volume_path` (optional) points at a Unity Catalog volume snapshot of the base model weights, populated by `00_setup/03_download_base_model_weights.py`; when set, the GPU workers load the model from the volume instead of downloading it from Hugging Face. Volume-hosted weights are first staged to node-local disk (once per node) because safetensors mmap reads through the volume FUSE mount are slow.
+# MAGIC - `model_volume_path` (optional) points at a Unity Catalog volume snapshot of the base model weights, populated by `setup/03_download_base_model_weights.py`; when set, the GPU workers load the model from the volume instead of downloading it from Hugging Face. Volume-hosted weights are first staged to node-local disk (once per node) because safetensors mmap reads through the volume FUSE mount are slow.
 # MAGIC - `max_steps`, batch size, learning rate, and the LoRA settings control the training cost and quality.
 # MAGIC - `training_sample_fraction` controls how much of the staged SFT data is used; the training cell reads it from the config and can override it inline for quick smoke runs.
 # MAGIC - `notebook_gpus` / `notebook_gpu_type` size the `@distributed` training cell. Start with 1 GPU to validate the workflow, then raise `notebook_gpus` to scale out — the training code is unchanged.
@@ -76,7 +76,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC
 # MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime. 
 # MAGIC
-# MAGIC The workflow uses the IBM TabFormer credit-card dataset prepared by the setup notebooks: `00_setup/01_load_tabformer_dataset.py` writes the cleaned transaction table, and `00_setup/02_stage_training_data.py` builds the supervised fine-tuning table with prompt/response records and stages it in a Unity Catalog volume. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, and logs with MLflow; registration and serving are handled by the deployment stage (`02_deploy/01_register_and_deploy.py`).
+# MAGIC The workflow uses the IBM TabFormer credit-card dataset prepared by the setup notebooks: `setup/01_load_dataset.py` writes the cleaned transaction table, and `setup/02_stage_training_data.py` builds the supervised fine-tuning table with prompt/response records and stages it in a Unity Catalog volume. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, and logs with MLflow; registration and serving are handled by the deployment notebook (`02_register_and_deploy.py`, next in this directory).
 # MAGIC
 # MAGIC **Features demonstrated in this notebook**
 # MAGIC
@@ -147,10 +147,10 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # MAGIC
 # MAGIC - MLflow records parameters, metrics, and run metadata.
 # MAGIC - Checkpoints and adapters are saved to a Unity Catalog volume.
-# MAGIC - Model registration and deployment are handled by the deployment stage (`02_deploy`) after training completes.
+# MAGIC - Model registration and deployment are handled by `02_register_and_deploy.py` (next in this directory) after training completes.
 # MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the `gpus=1` and `gpus>1` runs.
 # MAGIC
-# MAGIC The training implementation lives in `01_train/train.py`, a plain Python module shared by two launchers: this notebook's `@distributed` cell and the AI Runtime CLI (`air run --file train.yaml`), which runs the same file standalone on serverless GPUs.
+# MAGIC The training implementation lives in `train/train.py`, a plain Python module shared by two launchers: this notebook's `@distributed` cell and the AI Runtime CLI (`air run --file train.yaml`), which runs the same file standalone on serverless GPUs.
 
 # COMMAND ----------
 
@@ -204,11 +204,11 @@ print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Next: register and deploy (02_deploy)
+# MAGIC ## Next: register and deploy (02_register_and_deploy.py)
 # MAGIC
 # MAGIC Training is done. The run ID printed above identifies this run in MLflow, and the adapter's volume location is logged on the run as the `adapter_output_dir` parameter.
 # MAGIC
-# MAGIC `02_deploy/01_register_and_deploy.py` merges the adapter into the base model, registers it to Unity Catalog as a custom LLM, and creates or updates the serving endpoint. Point `02_deploy/deploy.yaml`'s `run_id` at the run ID above — or leave it empty to auto-select the best finished run in this experiment by the configured metric (`best_run_metric` / `best_run_metric_goal`).
+# MAGIC `02_register_and_deploy.py` (next in this directory) merges the adapter into the base model, registers it to Unity Catalog as a custom LLM, and creates or updates the serving endpoint. Point `run_id` in `train.yaml`'s `deploy_config` section at the run ID above — or leave it empty to auto-select the best finished run in this experiment by the configured metric (`best_run_metric` / `best_run_metric_goal`).
 
 # COMMAND ----------
 
@@ -221,7 +221,7 @@ print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
 # MAGIC - Supervised chat records are generated from real table rows during ingestion and stored in the prepared SFT Delta table.
 # MAGIC - AI Runtime provides managed serverless GPU compute for model training.
 # MAGIC - The same training cell supports `gpus=1` validation and a scaled multi-GPU path.
-# MAGIC - MLflow captures the experiment record; the deployment stage (`02_deploy/01_register_and_deploy.py`) registers the model to Unity Catalog and creates or updates the custom LLM serving endpoint.
+# MAGIC - MLflow captures the experiment record; the deployment notebook (`02_register_and_deploy.py`) registers the model to Unity Catalog and creates or updates the custom LLM serving endpoint.
 # MAGIC
 # MAGIC The main platform outcome is speed with control: teams can move from governed data to GPU fine-tuning to registered model artifacts without leaving Databricks or stitching together separate infrastructure.
 # MAGIC
