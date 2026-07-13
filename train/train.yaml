@@ -1,19 +1,26 @@
-# Combined AI Runtime CLI workload definition and demo training configuration.
+# Combined AI Runtime CLI workload definition and pipeline configuration.
 #
 # Submit training from this directory with:
 #   air run --file train.yaml --watch
 #
 # The top-level fields follow the AI Runtime workload schema
 # (https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/).
-# The parameters.training_config section is the demo's own configuration,
+# The parameters.training_config section is this project's own configuration,
 # read by train.py and by the runner notebook (training, registration, and
 # serving settings). AIR also exposes it on the cluster via
 # $HYPERPARAMETERS_PATH, which load_training_config() prefers so that
 # `air run --override` values reach the training script.
+#
+# Each stage's YAML is self-contained so the modules run standalone. The
+# values training_config shares with setup/setup.yaml and
+# load_test/serving_load_test.yaml (catalog, schema, source_table, sft_table,
+# sft_volume, endpoint_name) must agree across those files —
+# scripts/validate_config.py checks every agreement.
 experiment_name: unsloth_qwen3_4b_instruct_training
 environment:
   version: '5'
-  # Keep in sync with train/requirements.txt.
+  # Keep in sync with train/requirements.txt (checked by
+  # scripts/validate_config.py).
   dependencies:
     - pyyaml>=6.0.2
     - pandas>=2.2.0
@@ -35,8 +42,10 @@ environment:
     - xformers>=0.0.31.post1
 compute:
   num_accelerators: 1
-  # GPU_1xA10 is enough for the 4B LoRA validation run; switch to GPU_8xH100
-  # for the scaled multi-GPU demo run.
+  # GPU_1xA10 is enough for a 4B LoRA validation run; switch to GPU_8xH100
+  # for a scaled multi-GPU run. (This block sizes AIR CLI runs only — the
+  # runner notebook's @distributed cell uses notebook_gpus/notebook_gpu_type
+  # below.)
   accelerator_type: GPU_1xA10
 env_variables:
   # AIR CLI nodes don't set this, but the runtime image's bundled
@@ -52,50 +61,97 @@ code_source:
     root_path: .
 command: python $CODE_SOURCE_PATH/train.py
 
-# Demo configuration, carried in the workload's `parameters` field.
+# Pipeline configuration, carried in the workload's `parameters` field.
 parameters:
   training_config:
+    # ---- Unity Catalog identity (shared by setup, training, and load test) ----
     catalog: poc-catalog
     schema: databricks_support
     source_table: fraud_dataset
     sft_table: fraud_sft_dataset
-    # Volume holding the parquet export of the SFT table (written by setup);
-    # must match setup.yaml's sft_volume.
+    # Volume holding the parquet export of the SFT table, written by
+    # setup/02_stage_training_data.py and read by training.
     sft_volume: training_data
     checkpoint_volume: qwen_checkpoints
     uc_model_name: qwen3_4b_instruct_finetuned
     endpoint_name: qwen3_4b_instruct_finetuned
 
+    # ---- Base model ----
     model_name: unsloth/Qwen3-4B-Instruct-2507
     # Optional UC volume snapshot of the base model weights. When set
     # (non-empty), training loads the model and tokenizer from this path
     # instead of downloading from Hugging Face; model_name is still recorded
-    # as the base-model identity in MLflow. Populate the volume once, e.g.:
-    #   hf download unsloth/Qwen3-4B-Instruct-2507 \
-    #     --local-dir /Volumes/doan/air_dais/base_models/Qwen3-4B-Instruct-2507
-    # then set:
-    #   model_volume_path: /Volumes/doan/air_dais/base_models/Qwen3-4B-Instruct-2507
+    # as the base-model identity in MLflow. Populate the volume by adding a
+    # matching entry (huggingface_path: model_name, volume_path: this path)
+    # to setup/setup.yaml's models list and running
+    # setup/03_download_base_model_weights.py.
     model_volume_path: '/Volumes/poc-catalog/databricks_support/checkpoints/base_models/qwen3-4b-instruct'
+
+    # ---- Training ----
     max_seq_length: 2048
     max_steps: 5
     per_device_train_batch_size: 48
     gradient_accumulation_steps: 4
     learning_rate: 2e-4
-    # Default for AIR CLI runs only — notebook runs set TRAINING_SAMPLE_FRACTION
-    # directly in the runner's training cell, which overrides this value.
-    training_sample_fraction: 0.001
+    warmup_steps: 5
+    # Fraction of the staged SFT data to train on. Notebook runs read this
+    # value too and can override it inline in the training cell.
+    training_sample_fraction: 1.0
+    seed: 3407
+
+    # LoRA adapter settings.
+    lora_r: 16
+    lora_alpha: 16
+    lora_dropout: 0.0
+    lora_target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+    # Chat-template markers for response-only loss masking; they must match
+    # the base model's chat template. Defaults are for Qwen3. For example,
+    # Llama 3 uses "<|start_header_id|>user<|end_header_id|>\n\n" and
+    # "<|start_header_id|>assistant<|end_header_id|>\n\n".
+    response_instruction_part: "<|im_start|>user\n"
+    response_part: "<|im_start|>assistant\n"
+
+    # GPUs for the runner notebook's @distributed training cell. Start with
+    # 1 to validate the workflow, then raise notebook_gpus to scale out.
+    notebook_gpus: 1
+    notebook_gpu_type: A10
+
+    # ---- Registration and serving ----
     register_model: true
     deploy_endpoint: true
     serving_workload_type: GPU_MEDIUM
-    # workload_size sets a FIXED replica count (no autoscaling during beta) —
-    # size for peak traffic. Measured on this workload: one A10 replica
-    # sustains ~150 QPS; requests beyond provisioned capacity get 429s.
-    # For the full 10K QPS demo, pair Large with GPU_XLARGE (H100,
-    # us-west-2 + beta enrollment required).
-    serving_workload_size: Large
+    # Fixed provisioned capacity behind the endpoint (custom LLM serving does
+    # not autoscale during beta) — size for peak traffic before load testing.
+    serving_provisioned_concurrency: 4
+    # Optional legacy sizing knob; when non-empty it is passed through as the
+    # served entity's workload_size.
+    serving_workload_size: ''
     serving_scale_to_zero: false
     served_model_name: qwen3_4b_instruct_finetuned
+    endpoint_description: 'Custom LLM endpoint serving the fine-tuned model from the AIR pipeline.'
     vllm_dtype: float16
     vllm_max_model_len: 2048
     vllm_gpu_memory_utilization: 0.9
-    seed: 3407
+    # Packages installed in the serving container (NOT requirements.txt).
+    # This set is the FIPS-safe combination for Model Serving pods as of
+    # mid-2026: vllm 0.11.0 is the newest vLLM whose opencv floor still
+    # admits opencv 4.12 (4.13+ bundles an OpenSSL that fails FIPS self-test
+    # on serving pods), and vLLM of this era needs transformers 4.x. The
+    # base model's architecture must be in this vLLM version's supported
+    # list — re-verify these pins before changing the base model.
+    serving_pip_requirements:
+      - mlflow>=3.12.0
+      - vllm==0.11.0
+      - transformers>=4.56.0,<5
+      - opencv-python-headless==4.12.0.88
+      - accelerate>=1.11.0
+      - safetensors>=0.5.0
+      - torch

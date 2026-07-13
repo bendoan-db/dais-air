@@ -1,4 +1,4 @@
-"""Shared helpers for the AIR fraud fine-tuning demo.
+"""Shared helpers for the AIR fine-tuning pipeline.
 
 This is a plain Python module (NOT a Databricks notebook): the workspace
 refuses ordinary imports of notebook-formatted files (NotebookImportException),
@@ -171,6 +171,11 @@ def stage_model_locally(source_dir: str) -> str:
 def load_training_config() -> dict:
     """Load the ``parameters.training_config`` section and derive shared names.
 
+    Each pipeline stage owns its full configuration so the modules run
+    standalone; the values ``train.yaml`` shares with the setup and load-test
+    YAMLs (catalog, schema, table/volume/endpoint names) are checked for
+    agreement by ``scripts/validate_config.py``.
+
     Under an AI Runtime CLI workload the parameters arrive via the YAML file
     at ``$HYPERPARAMETERS_PATH`` (which reflects ``air run --override``
     values); otherwise they are read from ``train.yaml`` next to this file.
@@ -184,6 +189,7 @@ def load_training_config() -> dict:
     import os
 
     hyperparameters_path = os.environ.get("HYPERPARAMETERS_PATH")
+    workload_config: dict = {}
     if hyperparameters_path:
         config_path = Path(hyperparameters_path)
         with config_path.open("r", encoding="utf-8") as config_file:
@@ -192,6 +198,8 @@ def load_training_config() -> dict:
         # `parameters` dict, but v0.1.0b1 points it at the full workload
         # YAML — accept either shape.
         parameters = loaded.get("parameters", loaded)
+        if "parameters" in loaded:
+            workload_config = loaded
     else:
         config_path, workload_config = load_yaml_config("train.yaml")
         parameters = config_value(workload_config, "parameters")
@@ -210,6 +218,27 @@ def load_training_config() -> dict:
     # download from Hugging Face by model_name.
     model_volume_path = str(config.get("model_volume_path") or "").strip()
     output_root = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume}/{uc_model_name}"
+
+    lora_target_modules = config_value(config, "lora_target_modules")
+    if not isinstance(lora_target_modules, list) or not lora_target_modules:
+        raise ValueError("lora_target_modules must be a non-empty list in training_config")
+
+    serving_pip_requirements = config_value(config, "serving_pip_requirements")
+    if not isinstance(serving_pip_requirements, list) or not serving_pip_requirements:
+        raise ValueError("serving_pip_requirements must be a non-empty list in training_config")
+
+    # Chat-template markers are read without strip(): trailing newlines are
+    # part of the text train_on_responses_only matches against.
+    response_instruction_part = str(config_value(config, "response_instruction_part"))
+    response_part = str(config_value(config, "response_part"))
+
+    # The workspace experiment name comes from the workload-level
+    # experiment_name (the same value the AIR CLI uses); it is absent when
+    # HYPERPARAMETERS_PATH carries only the parameters dict, so fall back to a
+    # model-derived name.
+    experiment_name = str(
+        workload_config.get("experiment_name") or f"{uc_model_name}_finetuning"
+    ).strip()
 
     return {
         "CONFIG_PATH": config_path,
@@ -230,13 +259,31 @@ def load_training_config() -> dict:
         "PER_DEVICE_TRAIN_BATCH_SIZE": config_int(config, "per_device_train_batch_size"),
         "GRADIENT_ACCUMULATION_STEPS": config_int(config, "gradient_accumulation_steps"),
         "LEARNING_RATE": config_float(config, "learning_rate"),
+        "WARMUP_STEPS": config_int(config, "warmup_steps"),
         "TRAINING_SAMPLE_FRACTION": config_float(config, "training_sample_fraction"),
+        "LORA_R": config_int(config, "lora_r"),
+        "LORA_ALPHA": config_int(config, "lora_alpha"),
+        "LORA_DROPOUT": config_float(config, "lora_dropout"),
+        "LORA_TARGET_MODULES": [str(module) for module in lora_target_modules],
+        "RESPONSE_INSTRUCTION_PART": response_instruction_part,
+        "RESPONSE_PART": response_part,
+        # GPUs for the runner notebook's @distributed cell; the AIR CLI path
+        # sizes compute from the workload-level `compute` block instead.
+        "NOTEBOOK_GPUS": config_int(config, "notebook_gpus"),
+        "NOTEBOOK_GPU_TYPE": config_str(config, "notebook_gpu_type"),
+        "EXPERIMENT_NAME": experiment_name,
         "REGISTER_MODEL": config_bool(config, "register_model"),
         "DEPLOY_ENDPOINT": config_bool(config, "deploy_endpoint"),
         "SERVING_WORKLOAD_TYPE": config_str(config, "serving_workload_type"),
-        "SERVING_WORKLOAD_SIZE": config_str(config, "serving_workload_size"),
+        # Optional: recent custom LLM serving APIs size capacity via
+        # provisioned concurrency; workload_size is passed through only when
+        # set non-empty.
+        "SERVING_WORKLOAD_SIZE": str(config.get("serving_workload_size") or "").strip(),
+        "SERVING_PROVISIONED_CONCURRENCY": config_int(config, "serving_provisioned_concurrency"),
         "SERVING_SCALE_TO_ZERO": config_bool(config, "serving_scale_to_zero"),
         "SERVED_MODEL_NAME": config_str(config, "served_model_name"),
+        "ENDPOINT_DESCRIPTION": config_str(config, "endpoint_description"),
+        "SERVING_PIP_REQUIREMENTS": [str(requirement) for requirement in serving_pip_requirements],
         "VLLM_DTYPE": config_str(config, "vllm_dtype"),
         "VLLM_MAX_MODEL_LEN": config_int(config, "vllm_max_model_len"),
         "VLLM_GPU_MEMORY_UTILIZATION": config_float(config, "vllm_gpu_memory_utilization"),
@@ -251,12 +298,33 @@ def load_training_config() -> dict:
         "FULL_MODEL_NAME": f"{uc_catalog}.{uc_schema}.{uc_model_name}",
         "OUTPUT_ROOT": output_root,
         "TRAINING_OUTPUT_DIR": f"{output_root}/training_demo",
-        "TRAINING_RUN_NAME": f"air-demo-{uc_model_name}-training-steps{max_steps}",
+        "TRAINING_RUN_NAME": f"{uc_model_name}-training-steps{max_steps}",
         "schema_q": full_name(uc_catalog, uc_schema),
         "volume_q": full_name(uc_catalog, uc_schema, uc_volume),
         "source_table_q": full_name(uc_catalog, uc_schema, source_table_name),
         "sft_table_q": full_name(uc_catalog, uc_schema, sft_table_name),
     }
+
+
+def ensure_uc_object(spark, ddl_statement: str) -> None:
+    """Run a ``CREATE ... IF NOT EXISTS`` statement with a permission-friendly error.
+
+    The pipeline creates schemas and volumes on first run; in customer
+    workspaces the most common failure is a missing Unity Catalog privilege,
+    which surfaces from Spark as a generic AnalysisException. Reframe it with
+    the grants to ask for.
+    """
+    try:
+        spark.sql(ddl_statement)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to run `{ddl_statement}`. If the object does not already "
+            "exist, the current user likely lacks the required Unity Catalog "
+            "privilege — ask an admin for USE CATALOG plus CREATE SCHEMA / "
+            "CREATE VOLUME / CREATE TABLE on the configured catalog and "
+            "schema, or point train/train.yaml's training_config at objects "
+            "that already exist."
+        ) from exc
 
 
 def init_training_workspace(training_context: dict):
@@ -267,8 +335,8 @@ def init_training_workspace(training_context: dict):
     """
     spark = get_spark_session()
 
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS {training_context['schema_q']}")
-    spark.sql(f"CREATE VOLUME IF NOT EXISTS {training_context['volume_q']}")
+    ensure_uc_object(spark, f"CREATE SCHEMA IF NOT EXISTS {training_context['schema_q']}")
+    ensure_uc_object(spark, f"CREATE VOLUME IF NOT EXISTS {training_context['volume_q']}")
 
     Path(training_context["TRAINING_OUTPUT_DIR"]).mkdir(parents=True, exist_ok=True)
 

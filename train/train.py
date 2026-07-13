@@ -1,4 +1,4 @@
-"""Standalone training entrypoint for the AIR fraud fine-tuning demo.
+"""Standalone training entrypoint for the AIR fine-tuning pipeline.
 
 This module owns the Unsloth LoRA training implementation and runs two ways:
 
@@ -61,7 +61,7 @@ def load_unsloth_model(model_name: str, device_map=None):
         raise FileNotFoundError(
             f"Local model path does not exist: {model_name}. If this is "
             "model_volume_path from train.yaml, populate the volume first by "
-            "running setup/02_download_base_model_weights.py (or `hf download "
+            "running setup/03_download_base_model_weights.py (or `hf download "
             f"{MODEL_NAME} --local-dir {model_name}`)."
         )
     if model_name.startswith(VOLUME_PATH_PREFIX):
@@ -161,18 +161,10 @@ def train_qwen3_unsloth(
     )
 
     peft_kwargs = {
-        "r": 16,
-        "target_modules": [
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-        "lora_alpha": 16,
-        "lora_dropout": 0,
+        "r": LORA_R,
+        "target_modules": LORA_TARGET_MODULES,
+        "lora_alpha": LORA_ALPHA,
+        "lora_dropout": LORA_DROPOUT,
         "bias": "none",
         # Unsloth's custom checkpointing is reentrant and fires DDP gradient hooks
         # twice per LoRA param under multi-GPU runs; non-reentrant HF checkpointing
@@ -207,7 +199,7 @@ def train_qwen3_unsloth(
     training_args = SFTConfig(
         per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        warmup_steps=5,
+        warmup_steps=WARMUP_STEPS,
         max_steps=MAX_STEPS,
         learning_rate=LEARNING_RATE,
         fp16=not is_bfloat16_supported(),
@@ -239,10 +231,12 @@ def train_qwen3_unsloth(
     )
 
     try:
+        # Marker strings come from train.yaml (response_instruction_part /
+        # response_part) and must match the base model's chat template.
         trainer = train_on_responses_only(
             trainer,
-            instruction_part="<|im_start|>user\n",
-            response_part="<|im_start|>assistant\n",
+            instruction_part=RESPONSE_INSTRUCTION_PART,
+            response_part=RESPONSE_PART,
             num_proc=1,
         )
     except Exception as exc:
@@ -278,8 +272,9 @@ def train_qwen3_unsloth(
                     "rank_0_training_record_count": len(examples_pdf),
                     "source_table": SOURCE_TABLE,
                     "sft_table": SFT_TABLE,
-                    "lora_r": 16,
-                    "lora_alpha": 16,
+                    "lora_r": LORA_R,
+                    "lora_alpha": LORA_ALPHA,
+                    "lora_dropout": LORA_DROPOUT,
                 }
             )
 
@@ -368,7 +363,8 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     if not shard_dirs:
         raise FileNotFoundError(
             f"No SFT parquet shards found under {SFT_FILES_DIR}. "
-            "Run setup/01_load_tabformer_dataset.py first."
+            "Run setup/02_stage_training_data.py first (after "
+            "setup/01_load_tabformer_dataset.py) to build and export the SFT records."
         )
 
     rank_shard_dirs = [

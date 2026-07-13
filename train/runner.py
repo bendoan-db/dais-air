@@ -36,12 +36,12 @@ from training_utils import init_training_workspace, load_training_config
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
-# MAGIC - `model_volume_path` (optional) points at a Unity Catalog volume snapshot of the base model weights, populated by `setup/02_download_base_model_weights.py`; when set, the GPU workers load the model from the volume instead of downloading it from Hugging Face. Volume-hosted weights are first staged to node-local disk (once per node) because safetensors mmap reads through the volume FUSE mount are slow.
-# MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
-# MAGIC - The sampling fraction is set directly in the training cell below (`TRAINING_SAMPLE_FRACTION`), so it can be adjusted live during the demo; `train.yaml`'s `training_sample_fraction` only serves as the AI Runtime CLI default.
+# MAGIC - `model_volume_path` (optional) points at a Unity Catalog volume snapshot of the base model weights, populated by `setup/03_download_base_model_weights.py`; when set, the GPU workers load the model from the volume instead of downloading it from Hugging Face. Volume-hosted weights are first staged to node-local disk (once per node) because safetensors mmap reads through the volume FUSE mount are slow.
+# MAGIC - `max_steps`, batch size, learning rate, and the LoRA settings control the training cost and quality.
+# MAGIC - `training_sample_fraction` controls how much of the staged SFT data is used; the training cell reads it from the config and can override it inline for quick smoke runs.
+# MAGIC - `notebook_gpus` / `notebook_gpu_type` size the `@distributed` training cell. Start with 1 GPU to validate the workflow, then raise `notebook_gpus` to scale out — the training code is unchanged.
 # MAGIC
-# MAGIC The demo uses one training cell. Run it first with `@distributed(gpus=1, gpu_type="h100")`, then change only `gpus` to a larger value such as `8` to distribute the same training workflow.
-# MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare runs in MLflow.
+# MAGIC For a quick validation run, keep `max_steps` low. For a real fine-tune, increase `max_steps` (or train on the full data), and compare runs in MLflow.
 
 # COMMAND ----------
 
@@ -68,7 +68,7 @@ print(f"Training output dir: {TRAINING_OUTPUT_DIR}")
 print(f"Register model: {REGISTER_MODEL}")
 print(f"Deploy endpoint: {DEPLOY_ENDPOINT}")
 print(f"Serving endpoint: {ENDPOINT_NAME}")
-print(f"Serving workload: {SERVING_WORKLOAD_TYPE} / {SERVING_WORKLOAD_SIZE}")
+print(f"Serving workload: {SERVING_WORKLOAD_TYPE} @ provisioned concurrency {SERVING_PROVISIONED_CONCURRENCY}")
 
 # COMMAND ----------
 
@@ -84,12 +84,11 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC %md
 # MAGIC # Fine-tune Qwen3 4B for fraud decisions with AI Runtime
 # MAGIC
-# MAGIC ![](./images/Screenshot 2026-06-11 at 12.04.39 PM.png)
+# MAGIC ![](./images/air-finetuning-workflow.png)
 # MAGIC
 # MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime. 
 # MAGIC
-# MAGIC The workflow uses the IBM TabFormer credit-card dataset loaded and prepared by `setup/01_load_tabformer_dataset.py`.
-# MAGIC The setup notebook creates both a cleaned transaction table and a supervised fine-tuning table with prompt/response records. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
+# MAGIC The workflow uses the IBM TabFormer credit-card dataset prepared by the setup notebooks: `setup/01_load_tabformer_dataset.py` writes the cleaned transaction table, and `setup/02_stage_training_data.py` builds the supervised fine-tuning table with prompt/response records and stages it in a Unity Catalog volume. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
 # MAGIC
 # MAGIC **Features demonstrated in this notebook**
 # MAGIC
@@ -105,7 +104,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC ## Business scenario and model contract
 # MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it. We will finetune Qwen3-4B-Instruct-2507` to emit a structured fraud decision with additional triage steps.
 # MAGIC
-# MAGIC ![](./images/Screenshot 2026-06-11 at 3.39.46 PM.png)
+# MAGIC ![](./images/fraud-decision-contract.png)
 # MAGIC
 # MAGIC The output contract is a compact JSON object with:
 # MAGIC
@@ -168,11 +167,11 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Scale training by changing one decorator parameter
+# MAGIC ## Scale training by changing one config value
 # MAGIC
-# MAGIC This is the only training cell in the demo: a thin wrapper that imports `train.py` on each GPU worker and runs one rank of training.
-# MAGIC Run it first with `gpus=1` to validate the workflow, then change the decorator to `gpus=8` and rerun the same cell to distribute training across multiple GPUs.
-# MAGIC `TRAINING_SAMPLE_FRACTION` at the top of the cell controls how much of each rank's shard slice is used — raise it here to broaden the dataset between runs without touching `train.yaml`.
+# MAGIC This is the only training cell in the pipeline: a thin wrapper that imports `train.py` on each GPU worker and runs one rank of training.
+# MAGIC Run it first with `notebook_gpus: 1` to validate the workflow, then raise `notebook_gpus` in `train.yaml` (for example to `8`) and rerun the same cell to distribute training across multiple GPUs.
+# MAGIC `TRAINING_SAMPLE_FRACTION` comes from `train.yaml`'s `training_sample_fraction`; override it inline below for a quick smoke run without editing the config.
 # MAGIC
 # MAGIC Each worker reads its rank-assigned `shard_id=N` parquet directories from the UC volume inside `run_rank_training`, so nothing large ships from the notebook driver to the GPU workers.
 # MAGIC The same function runs without a notebook through the AI Runtime CLI: `air run --file train.yaml` executes `python train.py` on serverless GPUs.
@@ -180,17 +179,22 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # COMMAND ----------
 
 import mlflow
-mlflow.set_experiment("/Workspace/Shared/databricks-support/air-hackathon-test")
+from databricks.sdk import WorkspaceClient
+
+# The experiment lands under the current user's workspace folder, named by
+# train.yaml's experiment_name — the same experiment AIR CLI runs resolve to.
+current_user = WorkspaceClient().current_user.me().user_name
+mlflow.set_experiment(f"/Users/{current_user}/{EXPERIMENT_NAME}")
 
 # COMMAND ----------
 
 from serverless_gpu import distributed
 
-# Override sampling fraction (set to 1.0 to use all data). Notebook runs use
-# this value; train.yaml's training_sample_fraction is only the AIR CLI default.
-TRAINING_SAMPLE_FRACTION = 0.00001
+# From train.yaml's training_sample_fraction; override inline (e.g. 0.01) for
+# a quick smoke run without editing the config.
+TRAINING_SAMPLE_FRACTION = training_context["TRAINING_SAMPLE_FRACTION"]
 
-@distributed(gpus=8, gpu_type="H100")
+@distributed(gpus=NOTEBOOK_GPUS, gpu_type=NOTEBOOK_GPU_TYPE)
 def run_training_job():
     import sys
 
@@ -223,7 +227,7 @@ print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
 # MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
 # MAGIC - The entrypoint launches from the MLflow model's `artifacts/` folder, so the `--model` path is the bare artifact name relative to that folder.
 # MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
-# MAGIC - The serving container installs vLLM from `pip_requirements`, not from `requirements.txt`. The pins `vllm==0.11.0`, `transformers<5`, and `opencv-python-headless==4.12.0.88` are the combination that runs on Model Serving's FIPS-enabled pods, and the base model architecture (`Qwen3ForCausalLM`) is in this vLLM's supported model list.
+# MAGIC - The serving container installs its packages from `train.yaml`'s `serving_pip_requirements`, not from `requirements.txt`. The pinned `vllm==0.11.0` + `transformers<5` + `opencv-python-headless==4.12.0.88` combination is what runs on Model Serving's FIPS-enabled pods, and the base model's architecture must be in that vLLM's supported model list (a preflight check below prints the architecture to verify).
 # MAGIC
 # MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration or deployment fails, rerun only this section.
 
@@ -232,7 +236,9 @@ print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
 from train import load_unsloth_model
 
 CUSTOM_LLM_TASK = "llm/v1/chat"
-CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen3_fraud_model"
+# Bare directory name for the merged weights inside the MLflow model's
+# artifacts/ folder (the vLLM entrypoint's --model path).
+CUSTOM_LLM_MODEL_ARTIFACT_NAME = UC_MODEL_NAME
 
 
 def local_model_work_dir() -> Path:
@@ -309,6 +315,18 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
         merged_model.save_pretrained(merged_model_dir, safe_serialization=True)
         tokenizer.save_pretrained(merged_model_dir)
 
+        # Preflight: serving only works for architectures supported by the
+        # vLLM version pinned in serving_pip_requirements. Surface the
+        # architecture here so an unsupported base model is caught before a
+        # failed endpoint rollout.
+        model_config = json.loads((merged_model_dir / "config.json").read_text())
+        architectures = model_config.get("architectures", [])
+        print(
+            f"Base model architecture(s): {architectures} — verify these appear in "
+            "the supported-models list of the vLLM pinned in train.yaml's "
+            "serving_pip_requirements before deploying."
+        )
+
         with mlflow.start_run(run_name=run_name, log_system_metrics=True) as run:
             mlflow.log_params(
                 {
@@ -329,22 +347,10 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 python_model=CustomLlmEntrypointPlaceholder(),
                 artifacts={CUSTOM_LLM_MODEL_ARTIFACT_NAME: str(merged_model_dir)},
                 input_example=input_example,
-                pip_requirements=[
-                    "mlflow>=3.12.0",
-                    # FIPS-safe combination for Model Serving pods: vllm 0.11.0 is
-                    # the newest vLLM whose opencv floor (>=4.11) still admits
-                    # opencv 4.12.0.88 — the 4.13+ builds bundle an OpenSSL that
-                    # dies with FATAL FIPS SELFTEST FAILURE (vllm>=0.15 floors
-                    # opencv at 4.13, so it cannot be made FIPS-safe). vLLM of
-                    # this era also needs transformers 4.x: transformers 5 removed
-                    # tokenizer attributes (all_special_tokens_extended) it reads.
-                    "vllm==0.11.0",
-                    "transformers>=4.56.0,<5",
-                    "opencv-python-headless==4.12.0.88",
-                    "accelerate>=1.11.0",
-                    "safetensors>=0.5.0",
-                    "torch",
-                ],
+                # The serving container's packages come from train.yaml's
+                # serving_pip_requirements — the FIPS-safe vLLM combination;
+                # see the comments there before changing pins or base model.
+                pip_requirements=SERVING_PIP_REQUIREMENTS,
                 metadata=metadata,
             )
             model_version = mlflow.register_model(
@@ -395,8 +401,8 @@ else:
 # MAGIC
 # MAGIC - `endpoint_name` is the serving endpoint name used by the load-test notebook.
 # MAGIC - `serving_workload_type` selects the GPU class, such as `GPU_MEDIUM` for A10 or `GPU_XLARGE` for H100.
-# MAGIC - `serving_workload_size` controls provisioned capacity behind the endpoint.
-# MAGIC - `serving_scale_to_zero` is useful for demos and development, but should be disabled for latency-sensitive production traffic.
+# MAGIC - `serving_provisioned_concurrency` sets the fixed provisioned capacity behind the endpoint (custom LLM serving does not autoscale during beta — size for peak traffic).
+# MAGIC - `serving_scale_to_zero` is useful for development, but should be disabled for latency-sensitive production traffic.
 # MAGIC
 # MAGIC The served entity also sets `VLLM_USE_FLASHINFER_SAMPLER=0`: the serving container cannot JIT-compile FlashInfer kernels (no `ninja`/`nvcc`), so vLLM must use its native PyTorch sampler.
 # MAGIC
@@ -431,14 +437,14 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
     w = WorkspaceClient()
     workload_type = ServingModelWorkloadType(SERVING_WORKLOAD_TYPE)
     served_entity_name = served_entity_name_for_version(FULL_MODEL_NAME, model_version)
-    served_entity = ServedEntityInput(
+    served_entity_kwargs = dict(
         name=served_entity_name,
         entity_name=FULL_MODEL_NAME,
         entity_version=str(model_version),
         workload_type=workload_type,
-        #workload_size=SERVING_WORKLOAD_SIZE,
-        min_provisioned_concurrency=4,
-        max_provisioned_concurrency=4,
+        # Fixed capacity — custom LLM serving does not autoscale during beta.
+        min_provisioned_concurrency=SERVING_PROVISIONED_CONCURRENCY,
+        max_provisioned_concurrency=SERVING_PROVISIONED_CONCURRENCY,
         environment_vars={
             # The serving container has no ninja/nvcc, so FlashInfer (shipped in
             # the Databricks AI base env) cannot JIT-compile its sampling kernels
@@ -446,6 +452,9 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
             "VLLM_USE_FLASHINFER_SAMPLER": "0",
         },
     )
+    if SERVING_WORKLOAD_SIZE:
+        served_entity_kwargs["workload_size"] = SERVING_WORKLOAD_SIZE
+    served_entity = ServedEntityInput(**served_entity_kwargs)
     traffic_config = TrafficConfig(
         routes=[
             Route(
@@ -472,7 +481,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
                 served_entities=[served_entity],
                 traffic_config=traffic_config,
             ),
-            description="AIR demo custom LLM endpoint for TabFormer fraud decisions.",
+            description=ENDPOINT_DESCRIPTION,
             timeout=timedelta(minutes=60),
         )
         deployment_action = "created"
@@ -493,9 +502,8 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         "model_version": str(model_version),
         "served_entity_name": served_entity_name,
         "workload_type": SERVING_WORKLOAD_TYPE,
-        #"workload_size": SERVING_WORKLOAD_SIZE,
-        "min_provisioned_concurrency": 4,
-        "max_provisioned_concurrency": 4,
+        "workload_size": SERVING_WORKLOAD_SIZE or None,
+        "provisioned_concurrency": SERVING_PROVISIONED_CONCURRENCY,
         "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
         "config_update": str(getattr(endpoint_state, "config_update", None)),
     }
@@ -522,21 +530,12 @@ else:
 
 # COMMAND ----------
 
-sample_transaction_prompt = (
-    "You are a fraud decision model for a credit-card transaction stream. "
-    "Classify the transaction as legitimate, suspicious, or likely_fraud. "
-    "Return only compact JSON with keys risk, action, and reason.\n\n"
-    "Transaction:\n"
-    "- user_id: 492\n"
-    "- card_id: 3\n"
-    "- timestamp: 2026-06-08 13:45:00\n"
-    "- amount_usd: 2499.99\n"
-    "- use_chip: Online Transaction\n"
-    "- merchant_city: Miami\n"
-    "- merchant_state: FL\n"
-    "- merchant_category_code: 5732\n"
-    "- errors: Bad PIN"
-)
+# Sample a real prompt from the SFT table so the payload always matches the
+# prompt contract the model was fine-tuned on — no hardcoded copy to drift.
+sample_prompt_rows = spark.table(sft_table_q).select("prompt").limit(1).collect()
+if not sample_prompt_rows:
+    raise ValueError(f"No rows found in {SFT_TABLE}. Run the setup notebooks first.")
+sample_transaction_prompt = sample_prompt_rows[0]["prompt"]
 
 serving_payload = {
     "messages": [
