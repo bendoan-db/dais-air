@@ -1,0 +1,53 @@
+# Configuration for the setup notebooks. This file is self-contained so the
+# setup module runs standalone. The values shared with the other stages —
+# catalog, schema, table (train.yaml's source_table), sft_table, sft_volume,
+# and the models entries' volume_path — must agree with 01_train/train.yaml and
+# 02_deploy/load_test/serving_load_test.yaml; scripts/validate_config.py checks every
+# agreement.
+catalog: poc-catalog
+schema: databricks_support
+# Cleaned transaction table written by 01 (train.yaml's source_table).
+table: fraud_dataset
+# SFT table and export volume written by 02 and read by training.
+sft_table: fraud_sft_dataset
+sft_volume: training_data
+
+# ---- 01_load_tabformer_dataset.py (example dataset ingestion) ----
+staging_volume: setup_assets
+dataset_name: tabformer_credit_card
+source_url: https://github.com/IBM/TabFormer/raw/main/data/credit_card/transactions.tgz
+archive_filename: transactions.tgz
+force_download: false
+
+# ---- 02_stage_training_data.py (SFT records + volume staging) ----
+# Example-specific labeling heuristic for the fraud prompt contract.
+suspicious_amount_threshold: 500.0
+# Number of hash shards in the parquet export. Must divide evenly by every
+# GPU count you plan to train with (128 covers 1/2/4/8/16).
+sft_shards: 128
+# Columns hashed to assign each row a stable shard_id (and a training_id).
+# Any set of columns that uniquely-ish identifies a row works; when bringing
+# your own dataset, list its natural key columns here.
+sft_shard_key_columns:
+  - user_id_text
+  - card_id_text
+  - transaction_ts_text
+  - amount_usd
+  - merchant_city_text
+  - merchant_state_text
+  - mcc_text
+
+# ---- 03_download_base_model_weights.py (model snapshots) ----
+# Optional Databricks secret holding a Hugging Face token, required for gated
+# models (e.g. meta-llama). Leave both empty for public models.
+hf_token_secret_scope: ''
+hf_token_secret_key: ''
+# Hugging Face models that 03_download_base_model_weights.py snapshots into
+# UC volumes. Each entry pairs a Hugging Face repo id with the
+# /Volumes/<catalog>/<schema>/<volume>/... directory that receives the
+# weights. 01_train/train.yaml's model_volume_path must equal the volume_path of
+# the entry the fine-tune loads (with huggingface_path matching its
+# model_name).
+models:
+  - huggingface_path: unsloth/Qwen3-4B-Instruct-2507
+    volume_path: /Volumes/poc-catalog/databricks_support/checkpoints/base_models/qwen3-4b-instruct

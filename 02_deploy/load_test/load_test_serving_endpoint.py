@@ -6,7 +6,7 @@
 # MAGIC This notebook exercises the deployed fraud decision model with high-volume chat requests.
 # MAGIC It follows the Databricks custom LLM serving query contract: send a request to the serving endpoint with a `messages` array, where the user message contains the transaction prompt.
 # MAGIC
-# MAGIC The goal of this notebook is to simulate a **10,000 query-per-second** production traffic pattern and record the achieved throughput, response status distribution, and latency percentiles.
+# MAGIC The goal of this notebook is to simulate a production traffic pattern at a configurable request rate (`target_qps`, scalable to 10,000+ QPS) and record the achieved throughput, response status distribution, and latency percentiles.
 # MAGIC The load generator runs across Spark tasks so the notebook driver does not become the only request source.
 # MAGIC
 # MAGIC References:
@@ -36,13 +36,14 @@
 
 # COMMAND ----------
 
-# training_utils is a plain Python module in train/ (not a notebook), so it is
-# imported rather than %run. The notebook's working directory is the notebook's
-# folder on serverless, so ../train resolves to the module's directory.
+# training_utils is a plain Python module in 01_train/ (not a notebook), so
+# it is imported rather than %run. The notebook's working directory is the
+# notebook's folder on serverless, so ../../01_train resolves to the module's
+# directory.
 import sys
 from pathlib import Path
 
-TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
+TRAIN_MODULE_DIR = str((Path.cwd().parents[1] / "01_train").resolve())
 if TRAIN_MODULE_DIR not in sys.path:
     sys.path.insert(0, TRAIN_MODULE_DIR)
 
@@ -50,6 +51,7 @@ from training_utils import (
     config_float,
     config_int,
     config_str,
+    ensure_uc_object,
     full_name,
     get_spark_session,
     load_yaml_config,
@@ -74,6 +76,9 @@ from pyspark.sql import functions as F
 
 config_path, load_test_config = load_yaml_config("serving_load_test.yaml", base_dir=Path.cwd())
 
+# serving_load_test.yaml is self-contained; the values it shares with
+# train.yaml (catalog, schema, sft_table, endpoint_name) are checked for
+# agreement by scripts/validate_config.py.
 UC_CATALOG = config_str(load_test_config, "catalog")
 UC_SCHEMA = config_str(load_test_config, "schema")
 SFT_TABLE_NAME = config_str(load_test_config, "sft_table")
@@ -107,7 +112,15 @@ schema_q = full_name(UC_CATALOG, UC_SCHEMA)
 sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 results_table_q = full_name(UC_CATALOG, UC_SCHEMA, RESULTS_TABLE_NAME)
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
+ensure_uc_object(spark, f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
+
+planned_requests = TARGET_QPS * DURATION_SECONDS
+print(
+    f"NOTE: this run will send ~{planned_requests:,} requests "
+    f"({TARGET_QPS} QPS x {DURATION_SECONDS}s) of billed traffic to "
+    f"{ENDPOINT_NAME}. Adjust target_qps/duration_seconds in "
+    "serving_load_test.yaml before scaling up."
+)
 
 config_summary = {
     "config_path": str(config_path),
@@ -303,7 +316,7 @@ if (smoke_test_pdf["status_code"] >= 400).any():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Run distributed 10,000 QPS load test
+# MAGIC ## Run the distributed load test
 # MAGIC
 # MAGIC The load test divides `target_qps` across `load_generator_workers` Spark tasks.
 # MAGIC Each task uses asynchronous HTTP requests with bounded concurrency and attempts to pace requests at its assigned share of the target rate.
@@ -535,7 +548,7 @@ display(spark.table(results_table_q))
 # MAGIC ## Interpret the result
 # MAGIC
 # MAGIC Compare `achieved_qps` with `target_qps`.
-# MAGIC If the endpoint does not sustain 10,000 QPS, use the result tables to separate load-generator limits from serving limits:
+# MAGIC If the endpoint does not sustain the configured target, use the result tables to separate load-generator limits from serving limits:
 # MAGIC
 # MAGIC - High client-side failures or exceptions usually indicate the load generator needs more workers, more concurrency, or a longer timeout.
 # MAGIC - HTTP `429`, `503`, or long tail latency usually indicates endpoint queueing or insufficient provisioned serving capacity.

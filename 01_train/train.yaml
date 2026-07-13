@@ -5,21 +5,23 @@
 #
 # The top-level fields follow the AI Runtime workload schema
 # (https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/).
-# The parameters.training_config section is this project's own configuration,
-# read by train.py and by the runner notebook (training, registration, and
-# serving settings). AIR also exposes it on the cluster via
-# $HYPERPARAMETERS_PATH, which load_training_config() prefers so that
-# `air run --override` values reach the training script.
+# The parameters.training_config section is the training stage's own
+# configuration, read by train.py and by the runner notebook. AIR also
+# exposes it on the cluster via $HYPERPARAMETERS_PATH, which
+# load_training_config() prefers so that `air run --override` values reach
+# the training script. (Registration and serving settings live in the
+# deployment stage's 02_deploy/deploy.yaml.)
 #
 # Each stage's YAML is self-contained so the modules run standalone. The
-# values training_config shares with setup/setup.yaml and
-# load_test/serving_load_test.yaml (catalog, schema, source_table, sft_table,
-# sft_volume, endpoint_name) must agree across those files —
-# scripts/validate_config.py checks every agreement.
+# values shared with other stages must agree across files and
+# scripts/validate_config.py checks every agreement: catalog/schema,
+# source_table, sft_table, and sft_volume with 00_setup/setup.yaml (and
+# catalog/schema/sft_table with the load test); experiment_name with
+# 02_deploy/deploy.yaml (run selection searches this experiment).
 experiment_name: unsloth_qwen3_4b_instruct_training
 environment:
   version: '5'
-  # Keep in sync with train/requirements.txt (checked by
+  # Keep in sync with 01_train/requirements.txt (checked by
   # scripts/validate_config.py).
   dependencies:
     - pyyaml>=6.0.2
@@ -70,11 +72,12 @@ parameters:
     source_table: fraud_dataset
     sft_table: fraud_sft_dataset
     # Volume holding the parquet export of the SFT table, written by
-    # setup/02_stage_training_data.py and read by training.
+    # 00_setup/02_stage_training_data.py and read by training.
     sft_volume: training_data
     checkpoint_volume: qwen_checkpoints
+    # Names the training outputs (checkpoint directory and MLflow run names);
+    # the registered-model name is deploy.yaml's own uc_model_name.
     uc_model_name: qwen3_4b_instruct_finetuned
-    endpoint_name: qwen3_4b_instruct_finetuned
 
     # ---- Base model ----
     model_name: unsloth/Qwen3-4B-Instruct-2507
@@ -83,8 +86,8 @@ parameters:
     # instead of downloading from Hugging Face; model_name is still recorded
     # as the base-model identity in MLflow. Populate the volume by adding a
     # matching entry (huggingface_path: model_name, volume_path: this path)
-    # to setup/setup.yaml's models list and running
-    # setup/03_download_base_model_weights.py.
+    # to 00_setup/setup.yaml's models list and running
+    # 00_setup/03_download_base_model_weights.py.
     model_volume_path: '/Volumes/poc-catalog/databricks_support/checkpoints/base_models/qwen3-4b-instruct'
 
     # ---- Training ----
@@ -124,34 +127,3 @@ parameters:
     notebook_gpus: 1
     notebook_gpu_type: A10
 
-    # ---- Registration and serving ----
-    register_model: true
-    deploy_endpoint: true
-    serving_workload_type: GPU_MEDIUM
-    # Fixed provisioned capacity behind the endpoint (custom LLM serving does
-    # not autoscale during beta) — size for peak traffic before load testing.
-    serving_provisioned_concurrency: 4
-    # Optional legacy sizing knob; when non-empty it is passed through as the
-    # served entity's workload_size.
-    serving_workload_size: ''
-    serving_scale_to_zero: false
-    served_model_name: qwen3_4b_instruct_finetuned
-    endpoint_description: 'Custom LLM endpoint serving the fine-tuned model from the AIR pipeline.'
-    vllm_dtype: float16
-    vllm_max_model_len: 2048
-    vllm_gpu_memory_utilization: 0.9
-    # Packages installed in the serving container (NOT requirements.txt).
-    # This set is the FIPS-safe combination for Model Serving pods as of
-    # mid-2026: vllm 0.11.0 is the newest vLLM whose opencv floor still
-    # admits opencv 4.12 (4.13+ bundles an OpenSSL that fails FIPS self-test
-    # on serving pods), and vLLM of this era needs transformers 4.x. The
-    # base model's architecture must be in this vLLM version's supported
-    # list — re-verify these pins before changing the base model.
-    serving_pip_requirements:
-      - mlflow>=3.12.0
-      - vllm==0.11.0
-      - transformers>=4.56.0,<5
-      - opencv-python-headless==4.12.0.88
-      - accelerate>=1.11.0
-      - safetensors>=0.5.0
-      - torch

@@ -1,12 +1,12 @@
 # Databricks notebook source
 # DBTITLE 1,Load IBM TabFormer Credit Card Dataset
 # MAGIC %md
-# MAGIC # Load and prepare IBM TabFormer credit-card transactions
+# MAGIC # Load IBM TabFormer credit-card transactions
 # MAGIC
-# MAGIC This setup notebook downloads the IBM TabFormer credit-card dataset, stages it in a Unity Catalog volume, and overwrites the configured Delta tables.
+# MAGIC This setup notebook downloads the IBM TabFormer credit-card dataset, stages the archive in a Unity Catalog volume, and overwrites the cleaned transaction Delta table.
 # MAGIC
-# MAGIC The table is prepared for the AIR fine-tuning notebook by standardizing column names, casting core fields, creating `transaction_ts`, and adding reusable prompt-ready fields such as `amount_usd`, `*_text`, `errors_text`, `has_error_signal`, and `fraud_label`.
-# MAGIC The setup also creates a supervised fine-tuning table with prompt/response columns and stable shard IDs. Moving these steps into ingestion keeps training focused on data selection, GPU execution, and model fine-tuning.
+# MAGIC The table is prepared for downstream use by standardizing column names, casting core fields, creating `transaction_ts`, and adding reusable prompt-ready fields such as `amount_usd`, `*_text`, `errors_text`, `has_error_signal`, and `fraud_label`.
+# MAGIC The supervised fine-tuning records are built from this table by `02_stage_training_data.py`, which writes the SFT Delta table and stages it in a Unity Catalog volume for AI Runtime training.
 
 # COMMAND ----------
 
@@ -37,21 +37,20 @@ except NameError:
     notebook_path = notebook_context.notebookPath().get()
     script_dir = Path("/Workspace") / notebook_path.lstrip("/").rsplit("/", 1)[0]
 
-# training_utils is a plain Python module in train/ shared across the demo;
+# training_utils is a plain Python module in 01_train/ shared across the demo;
 # the same import works for workspace-notebook and local-script runs. (It is
 # not named `utils` because GPU base environments ship packages that register
 # a top-level `utils` module, shadowing any local one.)
 import sys
 
-train_module_dir = str((script_dir.parent / "train").resolve())
+train_module_dir = str((script_dir.parent / "01_train").resolve())
 if train_module_dir not in sys.path:
     sys.path.insert(0, train_module_dir)
 
 from training_utils import (
     config_bool,
-    config_float,
-    config_int,
     config_str,
+    ensure_uc_object,
     get_spark_session,
     quote_identifier,
 )
@@ -61,40 +60,33 @@ config_path = script_dir / "setup.yaml"
 with config_path.open("r", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
+# setup.yaml is self-contained; the values it shares with train.yaml
+# (catalog, schema, table names) are checked for agreement by
+# scripts/validate_config.py.
 catalog = config_str(config, "catalog")
 schema = config_str(config, "schema")
 table = config_str(config, "table")
-sft_table = config_str(config, "sft_table")
 staging_volume = config_str(config, "staging_volume")
-sft_volume = config_str(config, "sft_volume")
 dataset_name = config_str(config, "dataset_name")
 source_url = config_str(config, "source_url")
 archive_filename = config_str(config, "archive_filename")
 force_download = config_bool(config, "force_download")
-suspicious_amount_threshold = config_float(config, "suspicious_amount_threshold")
-sft_shards = config_int(config, "sft_shards")
 
 spark = get_spark_session()
 
 catalog_q = quote_identifier(catalog)
 schema_q = quote_identifier(schema)
 table_q = quote_identifier(table)
-sft_table_q = quote_identifier(sft_table)
 volume_q = quote_identifier(staging_volume)
-sft_volume_q = quote_identifier(sft_volume)
 
 full_schema_name = f"{catalog_q}.{schema_q}"
 full_table_name = f"{full_schema_name}.{table_q}"
-full_sft_table_name = f"{full_schema_name}.{sft_table_q}"
 full_volume_name = f"{full_schema_name}.{volume_q}"
-full_sft_volume_name = f"{full_schema_name}.{sft_volume_q}"
-sft_files_path = f"/Volumes/{catalog}/{schema}/{sft_volume}/{sft_table}"
 
 # COMMAND ----------
 
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {full_schema_name}")
-spark.sql(f"CREATE VOLUME IF NOT EXISTS {full_volume_name}")
-spark.sql(f"CREATE VOLUME IF NOT EXISTS {full_sft_volume_name}")
+ensure_uc_object(spark, f"CREATE SCHEMA IF NOT EXISTS {full_schema_name}")
+ensure_uc_object(spark, f"CREATE VOLUME IF NOT EXISTS {full_volume_name}")
 
 volume_root = Path(f"/Volumes/{catalog}/{schema}/{staging_volume}")
 dataset_root = volume_root / dataset_name
@@ -105,8 +97,6 @@ dataset_root.mkdir(parents=True, exist_ok=True)
 
 print(f"Config path: {config_path}")
 print(f"Target table: {full_table_name}")
-print(f"Target SFT table: {full_sft_table_name}")
-print(f"Target SFT parquet export: {sft_files_path}")
 print(f"Staging path: {dataset_root}")
 
 # COMMAND ----------
@@ -338,8 +328,8 @@ if {"year", "month", "day", "time"}.issubset(set(df.columns)):
 # MAGIC %md
 # MAGIC ## Prepare training-ready transaction fields
 # MAGIC
-# MAGIC The training notebook consumes a stable set of cleaned fields from the Delta table instead of applying row-by-row Pandas cleanup.
-# MAGIC These fields preserve the raw columns while providing defaults and consistent text formatting for prompt construction.
+# MAGIC Downstream steps consume a stable set of cleaned fields from the Delta table instead of applying row-by-row Pandas cleanup.
+# MAGIC These fields preserve the raw columns while providing defaults and consistent text formatting for prompt construction in `02_stage_training_data.py`.
 
 # COMMAND ----------
 
@@ -462,182 +452,13 @@ print(f"Overwrote Delta table {full_table_name}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Create supervised fine-tuning records
+# MAGIC ## Verify the transaction table
 # MAGIC
-# MAGIC The training notebook reads this table directly instead of building prompts row by row in Python.
-# MAGIC Prompt text, assistant JSON, and `shard_id` are generated with Spark expressions so the work runs in parallel during ingestion.
-# MAGIC
-# MAGIC `shard_id` lets distributed training assign data slices by `rt.get_global_rank()` and `rt.get_world_size()` without loading the full table into every GPU worker.
-
-# COMMAND ----------
-
-prompt_col = F.concat(
-    F.lit("You are a fraud decision model for a credit-card transaction stream. "),
-    F.lit("Classify the transaction as legitimate, suspicious, or likely_fraud. "),
-    F.lit("Return only compact JSON with keys risk, action, and reason.\n\n"),
-    F.lit("Transaction:\n"),
-    F.lit("- user_id: "),
-    F.col("user_id_text"),
-    F.lit("\n- card_id: "),
-    F.col("card_id_text"),
-    F.lit("\n- timestamp: "),
-    F.col("transaction_ts_text"),
-    F.lit("\n- amount_usd: "),
-    F.format_string("%.2f", F.col("amount_usd")),
-    F.lit("\n- use_chip: "),
-    F.col("use_chip_text"),
-    F.lit("\n- merchant_city: "),
-    F.col("merchant_city_text"),
-    F.lit("\n- merchant_state: "),
-    F.col("merchant_state_text"),
-    F.lit("\n- merchant_category_code: "),
-    F.col("mcc_text"),
-    F.lit("\n- errors: "),
-    F.col("errors_text"),
-)
-
-risk_col = (
-    F.when(F.col("is_fraud") == 1, F.lit("likely_fraud"))
-    .when(
-        F.col("has_error_signal") | (F.col("amount_usd") >= F.lit(suspicious_amount_threshold)),
-        F.lit("suspicious"),
-    )
-    .otherwise(F.lit("legitimate"))
-)
-action_col = (
-    F.when(F.col("is_fraud") == 1, F.lit("decline_and_escalate"))
-    .when(
-        F.col("has_error_signal") | (F.col("amount_usd") >= F.lit(suspicious_amount_threshold)),
-        F.lit("step_up_authentication"),
-    )
-    .otherwise(F.lit("approve"))
-)
-reason_col = (
-    F.when(
-        F.col("is_fraud") == 1,
-        F.lit("The historical label marks this transaction as fraud."),
-    )
-    .when(
-        F.col("has_error_signal") | (F.col("amount_usd") >= F.lit(suspicious_amount_threshold)),
-        F.lit("The transaction is not labeled fraud, but amount or error signals warrant review."),
-    )
-    .otherwise(F.lit("The historical label is non-fraud and no strong review signal is present."))
-)
-
-assistant_response_col = F.to_json(
-    F.struct(
-        risk_col.alias("risk"),
-        action_col.alias("action"),
-        reason_col.alias("reason"),
-    )
-)
-
-training_id_col = F.sha2(
-    F.concat_ws(
-        "||",
-        F.col("user_id_text"),
-        F.col("card_id_text"),
-        F.col("transaction_ts_text"),
-        F.format_string("%.2f", F.col("amount_usd")),
-        F.col("merchant_city_text"),
-        F.col("merchant_state_text"),
-        F.col("mcc_text"),
-    ),
-    256,
-)
-
-shard_expr = f"""
-pmod(
-  xxhash64(
-    user_id_text,
-    card_id_text,
-    transaction_ts_text,
-    amount_usd,
-    merchant_city_text,
-    merchant_state_text,
-    mcc_text
-  ),
-  {sft_shards}
-)
-"""
-
-sft_df = (
-    df.withColumn("training_id", training_id_col)
-    .withColumn("prompt", prompt_col)
-    .withColumn("assistant_response", assistant_response_col)
-    .withColumn("shard_id", F.expr(shard_expr).cast("int"))
-    .withColumn(
-        "messages_json",
-        F.to_json(
-            F.array(
-                F.struct(F.lit("user").alias("role"), F.col("prompt").alias("content")),
-                F.struct(F.lit("assistant").alias("role"), F.col("assistant_response").alias("content")),
-            )
-        ),
-    )
-    .select(
-        "training_id",
-        "shard_id",
-        "prompt",
-        "assistant_response",
-        "messages_json",
-        "fraud_label",
-        "is_fraud",
-        "amount_usd",
-        "user_id_text",
-        "card_id_text",
-        "transaction_ts_text",
-        "merchant_city_text",
-        "merchant_state_text",
-        "mcc_text",
-        "errors_text",
-        "has_error_signal",
-    )
-)
-
-(
-    sft_df.write.format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(full_sft_table_name)
-)
-
-spark.sql(
-    f"""
-    COMMENT ON TABLE {full_sft_table_name}
-    IS 'Prompt/response supervised fine-tuning records for the AIR fraud demo'
-    """
-)
-
-print(f"Overwrote SFT Delta table {full_sft_table_name}")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Export SFT records to a Unity Catalog volume as Parquet
-# MAGIC
-# MAGIC AI Runtime's data-loading guidance recommends exporting large Delta tables to a UC volume and reading the files directly during training, which avoids Spark overhead on the GPU workers:
-# MAGIC https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
-# MAGIC
-# MAGIC Parquet is used because the training code (Unsloth) consumes Hugging Face `datasets`, which loads Parquet natively as memory-mapped Arrow tables.
-# MAGIC The export is partitioned by `shard_id`, so the existing rank-sharding contract carries over: each GPU worker claims the `shard_id=N` directories where `N % world_size == rank` and reads only its own files.
-
-# COMMAND ----------
-
-(
-    spark.table(full_sft_table_name)
-    .repartition(sft_shards, "shard_id")
-    .write.mode("overwrite")
-    .partitionBy("shard_id")
-    .parquet(sft_files_path)
-)
-
-print(f"Exported SFT parquet shards to {sft_files_path}")
+# MAGIC Next step: run `02_stage_training_data.py` to build the supervised fine-tuning records from this table and stage them in a Unity Catalog volume for training.
 
 # COMMAND ----------
 
 loaded_df = spark.sql(f"SELECT * FROM {full_table_name}")
-sft_loaded_df = spark.sql(f"SELECT * FROM {full_sft_table_name}")
 
 summary_expressions = [F.count("*").alias("row_count")]
 if "is_fraud" in loaded_df.columns:
@@ -657,27 +478,3 @@ if "transaction_ts" in loaded_df.columns:
 
 display(loaded_df.agg(*summary_expressions))
 display(loaded_df.limit(10))
-
-sft_summary_expressions = [
-    F.count("*").alias("row_count"),
-    F.countDistinct("shard_id").alias("shard_count"),
-    F.min("shard_id").alias("min_shard_id"),
-    F.max("shard_id").alias("max_shard_id"),
-]
-if "is_fraud" in sft_loaded_df.columns:
-    sft_summary_expressions.extend(
-        [
-            F.sum("is_fraud").alias("fraud_row_count"),
-            F.avg("is_fraud").alias("fraud_rate"),
-        ]
-    )
-
-display(sft_loaded_df.agg(*sft_summary_expressions))
-display(sft_loaded_df.select("training_id", "shard_id", "prompt", "assistant_response").limit(10))
-
-sft_shard_dirs = sorted(Path(sft_files_path).glob("shard_id=*"))
-print(f"SFT parquet export: {len(sft_shard_dirs)} shard directories under {sft_files_path}")
-if len(sft_shard_dirs) != sft_shards:
-    raise ValueError(
-        f"Expected {sft_shards} shard directories in the parquet export, found {len(sft_shard_dirs)}."
-    )

@@ -11,9 +11,6 @@
 .codex/
 .mcp.json
 
-# Demo script artifacts
-demo_script/
-
 # Python environments and caches
 .venv/
 __pycache__/
@@ -25,10 +22,11 @@ __pycache__/
 .pyre/
 .ipynb_checkpoints/
 .vscode/
-.github/
+# .github holds local agent skill copies; only CI workflows are tracked.
+.github/*
+!.github/workflows/
 
 # General local caches
 .cache/
 .locks/
-train/unsloth_compiled_cache/
-air/unsloth_compiled_cache/
+01_train/unsloth_compiled_cache/

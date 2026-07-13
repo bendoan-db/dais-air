@@ -223,10 +223,6 @@ def load_training_config() -> dict:
     if not isinstance(lora_target_modules, list) or not lora_target_modules:
         raise ValueError("lora_target_modules must be a non-empty list in training_config")
 
-    serving_pip_requirements = config_value(config, "serving_pip_requirements")
-    if not isinstance(serving_pip_requirements, list) or not serving_pip_requirements:
-        raise ValueError("serving_pip_requirements must be a non-empty list in training_config")
-
     # Chat-template markers are read without strip(): trailing newlines are
     # part of the text train_on_responses_only matches against.
     response_instruction_part = str(config_value(config, "response_instruction_part"))
@@ -248,7 +244,6 @@ def load_training_config() -> dict:
         "SFT_TABLE_NAME": sft_table_name,
         "UC_VOLUME": uc_volume,
         "UC_MODEL_NAME": uc_model_name,
-        "ENDPOINT_NAME": config_str(config, "endpoint_name"),
         "MODEL_NAME": model_name,
         "MODEL_VOLUME_PATH": model_volume_path,
         # Where FastLanguageModel.from_pretrained reads the base weights:
@@ -272,21 +267,6 @@ def load_training_config() -> dict:
         "NOTEBOOK_GPUS": config_int(config, "notebook_gpus"),
         "NOTEBOOK_GPU_TYPE": config_str(config, "notebook_gpu_type"),
         "EXPERIMENT_NAME": experiment_name,
-        "REGISTER_MODEL": config_bool(config, "register_model"),
-        "DEPLOY_ENDPOINT": config_bool(config, "deploy_endpoint"),
-        "SERVING_WORKLOAD_TYPE": config_str(config, "serving_workload_type"),
-        # Optional: recent custom LLM serving APIs size capacity via
-        # provisioned concurrency; workload_size is passed through only when
-        # set non-empty.
-        "SERVING_WORKLOAD_SIZE": str(config.get("serving_workload_size") or "").strip(),
-        "SERVING_PROVISIONED_CONCURRENCY": config_int(config, "serving_provisioned_concurrency"),
-        "SERVING_SCALE_TO_ZERO": config_bool(config, "serving_scale_to_zero"),
-        "SERVED_MODEL_NAME": config_str(config, "served_model_name"),
-        "ENDPOINT_DESCRIPTION": config_str(config, "endpoint_description"),
-        "SERVING_PIP_REQUIREMENTS": [str(requirement) for requirement in serving_pip_requirements],
-        "VLLM_DTYPE": config_str(config, "vllm_dtype"),
-        "VLLM_MAX_MODEL_LEN": config_int(config, "vllm_max_model_len"),
-        "VLLM_GPU_MEMORY_UTILIZATION": config_float(config, "vllm_gpu_memory_utilization"),
         "SEED": config_int(config, "seed"),
         "SFT_VOLUME": sft_volume,
         # Parquet export of the SFT table, written by setup per the AIR
@@ -295,7 +275,6 @@ def load_training_config() -> dict:
         "SFT_FILES_DIR": f"/Volumes/{uc_catalog}/{uc_schema}/{sft_volume}/{sft_table_name}",
         "SOURCE_TABLE": f"{uc_catalog}.{uc_schema}.{source_table_name}",
         "SFT_TABLE": f"{uc_catalog}.{uc_schema}.{sft_table_name}",
-        "FULL_MODEL_NAME": f"{uc_catalog}.{uc_schema}.{uc_model_name}",
         "OUTPUT_ROOT": output_root,
         "TRAINING_OUTPUT_DIR": f"{output_root}/training_demo",
         "TRAINING_RUN_NAME": f"{uc_model_name}-training-steps{max_steps}",
@@ -322,7 +301,7 @@ def ensure_uc_object(spark, ddl_statement: str) -> None:
             "exist, the current user likely lacks the required Unity Catalog "
             "privilege — ask an admin for USE CATALOG plus CREATE SCHEMA / "
             "CREATE VOLUME / CREATE TABLE on the configured catalog and "
-            "schema, or point train/train.yaml's training_config at objects "
+            "schema, or point 01_train/train.yaml's training_config at objects "
             "that already exist."
         ) from exc
 

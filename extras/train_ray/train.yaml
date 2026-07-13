@@ -1,0 +1,52 @@
+# AI Runtime CLI workload for distributed training with Ray Train, following
+# https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/examples/ray-train-distributed
+#
+# Submit from this directory with:
+#   air run -f train.yaml --watch
+experiment_name: air-ray-train-distributed
+
+environment:
+  version: '4'
+  dependencies:
+    - ray[default,train]>=2.30
+    - transformers>=4.45
+    - datasets>=3.0
+    - huggingface_hub>=0.34
+    # The base image ships fsspec 2023.5.0, which is too old for modern
+    # huggingface_hub and breaks dataset/model downloads. Pin a newer fsspec.
+    - fsspec>=2024.6.1
+
+# 8 H100 on a single node. Ray Train launches one worker per GPU.
+compute:
+  num_accelerators: 1
+  accelerator_type: GPU_1xA10
+
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: .
+
+command: |
+  cd $CODE_SOURCE_PATH
+  RAY_HEAD_PORT=6379
+  GPUS_PER_NODE=${LOCAL_WORLD_SIZE:-8}
+  if [ "${NODE_RANK:-0}" = "0" ]; then
+    echo "NODE_RANK=0: starting Ray head with $GPUS_PER_NODE GPU(s)..."
+    ray start --head --port=$RAY_HEAD_PORT --num-gpus="$GPUS_PER_NODE" --dashboard-host=0.0.0.0
+    python train_ray.py
+    ray stop
+  else
+    echo "NODE_RANK=$NODE_RANK: connecting to Ray head at $MASTER_ADDR:$RAY_HEAD_PORT..."
+    for i in $(seq 1 12); do
+      if ray start --address="$MASTER_ADDR:$RAY_HEAD_PORT" --num-gpus="$GPUS_PER_NODE" --block 2>/dev/null; then
+        break
+      fi
+      echo "Attempt $i failed, retrying in 5s..."
+      sleep 5
+    done
+  fi
+
+max_retries: 0
+timeout_minutes: 90
+env_variables:
+  NCCL_SOCKET_IFNAME: eth0

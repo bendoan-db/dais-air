@@ -1,0 +1,38 @@
+# Configuration for the load-test notebook. This file is self-contained so
+# the load test runs standalone. catalog, schema, sft_table, and
+# endpoint_name must agree with 01_train/train.yaml's training_config;
+# scripts/validate_config.py checks every agreement.
+catalog: poc-catalog
+schema: databricks_support
+sft_table: fraud_sft_dataset
+endpoint_name: qwen3_4b_instruct_finetuned
+
+# Delta table (in the shared catalog.schema) that accumulates one summary row
+# per load-test run.
+results_table: serving_load_test_results
+
+# Requests per second across the whole worker fleet. Every planned request is
+# billed serving traffic (planned requests = target_qps x duration_seconds) —
+# start small to validate, then raise toward the endpoint's provisioned
+# capacity. Requests beyond provisioned capacity are rejected with 429s.
+target_qps: 100
+duration_seconds: 60
+# Each worker is one Spark task running its own asyncio loop; workers only run
+# concurrently up to the cluster's task slots (observed ~33-43 on serverless),
+# so keep load_generator_workers at or below the slots actually available and
+# scale per-worker rate/concurrency instead. For a 10,000 QPS test at ~1.2s
+# per request the fleet must sustain ~12,000 requests in flight:
+# 32 workers x 512 concurrency = 16,384 capacity.
+load_generator_workers: 8
+worker_concurrency: 256
+request_timeout_seconds: 30
+
+prompt_sample_fraction: 0.001
+prompt_sample_size: 1000
+smoke_test_requests: 5
+max_latency_samples_per_worker: 10000
+
+# Cap completion length: structured-output workloads are decode-bound, so a
+# tight cap raises endpoint throughput almost linearly and trims latency.
+max_tokens: 64
+temperature: 0.0

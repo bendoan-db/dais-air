@@ -1,19 +1,46 @@
-# This is a Declarative Automation Bundle definition for dais-ai-runtime.
-# The Databricks extension requires databricks.yml configuration file.
-# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+# Declarative Automation Bundle definition for the AIR fine-tuning pipeline.
+# See https://docs.databricks.com/dev-tools/bundles/index.html
+#
+# Before deploying, set the workspace host below (or override it with the
+# DATABRICKS_HOST environment variable / a --profile flag), then:
+#   databricks bundle validate
+#   databricks bundle deploy
+#   databricks bundle run data_setup
 
 bundle:
-  name: dais-ai-runtime
+  name: air-custom-llm-finetune
 
 targets:
   dev:
     mode: development
     default: true
     workspace:
-      host: https://fe-vm-vdm-classic-hkbucz.cloud.databricks.com
+      # TODO: replace with your workspace URL, e.g.
+      # https://my-workspace.cloud.databricks.com
+      host: https://<your-workspace>.cloud.databricks.com
 
-  ## Optionally, there could be 'staging' or 'prod' targets here.
-  #
   # prod:
+  #   mode: production
   #   workspace:
-  #     host: https://fe-vm-vdm-classic-hkbucz.cloud.databricks.com
+  #     host: https://<your-prod-workspace>.cloud.databricks.com
+
+resources:
+  jobs:
+    # Serverless job covering the data/setup stages. Training itself runs
+    # interactively in 01_train/runner.py (Serverless GPU + AI Runtime) or via
+    # the AI Runtime CLI (01_train/train.yaml); see README.
+    data_setup:
+      name: air-finetune-data-setup
+      tasks:
+        - task_key: load_dataset
+          notebook_task:
+            notebook_path: ./00_setup/01_load_tabformer_dataset.py
+        - task_key: stage_training_data
+          depends_on:
+            - task_key: load_dataset
+          notebook_task:
+            notebook_path: ./00_setup/02_stage_training_data.py
+        # Independent of the data tasks; runs in parallel.
+        - task_key: download_base_model_weights
+          notebook_task:
+            notebook_path: ./00_setup/03_download_base_model_weights.py
