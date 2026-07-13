@@ -1,4 +1,4 @@
-# DAIS AI Runtime Demo
+# AI Runtime End to End
 
 This project contains a Databricks AI Runtime demo for fine-tuning a small language model on credit-card fraud transactions, registering it as a custom LLM, deploying it to Mosaic AI Model Serving, and load testing the deployed endpoint.
 
