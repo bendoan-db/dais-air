@@ -19,6 +19,8 @@ The repository ships with a complete worked example — classifying IBM TabForme
 | `02_deploy/deploy.yaml` | Deployment configuration: run selection (experiment, metric), registration names, vLLM settings, and endpoint sizing. |
 | `02_deploy/load_test/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
 | `02_deploy/load_test/serving_load_test.yaml` | Load-test configuration: Unity Catalog locations, endpoint name, and load-generator settings. |
+| `03_monitor/01_unpack_inference_table.py` | Databricks notebook that incrementally unpacks the endpoint's inference table (raw JSON payloads) into an analysis-ready Delta table for monitoring. |
+| `03_monitor/monitor.yaml` | Monitoring configuration: inference/unpacked table names, checkpoint volume, and structured-output field extraction. |
 | `01_train/training_utils.py` | Shared utilities: YAML/config loading, Unity Catalog name handling, and model staging. |
 | `01_train/requirements.txt` | Python dependencies used by the AIR training notebook (kept in sync with `train.yaml`'s environment dependencies). |
 | `scripts/validate_config.py` | Offline validator for the cross-file configuration contracts (also run by CI). |
@@ -37,7 +39,7 @@ The repository ships with a complete worked example — classifying IBM TabForme
 
 ## Configuration
 
-Each stage (setup, train, deploy, load test) is configured by its own self-contained YAML, so the modules can run standalone. The values shared between stages — `catalog`, `schema`, the table/volume names, `experiment_name`, and `endpoint_name` — are duplicated across files by design and must agree; `scripts/validate_config.py` checks every agreement and fails on any mismatch.
+Each stage (setup, train, deploy, load test, monitor) is configured by its own self-contained YAML, so the modules can run standalone. The values shared between stages — `catalog`, `schema`, the table/volume names, `experiment_name`, and `endpoint_name` — are duplicated across files by design and must agree; `scripts/validate_config.py` checks every agreement and fails on any mismatch.
 
 Update before running:
 
@@ -47,9 +49,10 @@ Update before running:
   - training parameters: `max_steps`, batch size, learning rate, `training_sample_fraction`, and the LoRA settings (`lora_r`, `lora_alpha`, `lora_dropout`, `lora_target_modules`)
   - `response_instruction_part` / `response_part` — chat-template markers that must match the base model's template
   - `notebook_gpus` / `notebook_gpu_type` — compute for the notebook training cell (the AIR CLI path uses the top-level `compute` block)
-- `02_deploy/deploy.yaml` — `catalog` / `schema` (shared), `experiment_name` (must match `train.yaml`), and `endpoint_name` (must match the load test), plus deployment-specific keys: `run_id` (empty = auto-select), `best_run_metric` / `best_run_metric_goal`, registration names (`uc_model_name`, `served_model_name`), vLLM settings, endpoint sizing (`serving_workload_type`, `serving_provisioned_concurrency`, `serving_scale_to_zero`), and `serving_pip_requirements`
+- `02_deploy/deploy.yaml` — `catalog` / `schema` (shared), `experiment_name` (must match `train.yaml`), and `endpoint_name` (must match the load test), plus deployment-specific keys: `run_id` (empty = auto-select), `best_run_metric` / `best_run_metric_goal`, registration names (`uc_model_name`, `served_model_name`), vLLM settings, endpoint sizing (`serving_workload_type`, `serving_provisioned_concurrency`, `serving_scale_to_zero`), `serving_pip_requirements`, and `inference_table_prefix` (inference logging is always enabled at deployment)
 - `00_setup/setup.yaml` — `catalog`, `schema`, `table`, `sft_table`, and `sft_volume` (shared with `train.yaml`), plus stage-specific keys: dataset source URL and staging volume, SFT shard settings (`sft_shards`, `sft_shard_key_columns`), the Hugging Face `models` list to snapshot into volumes, and an optional secret reference for gated-model tokens
 - `02_deploy/load_test/serving_load_test.yaml` — `catalog`, `schema`, `sft_table` (shared), and `endpoint_name` (must match `deploy.yaml`), plus load-generator settings: `target_qps`, `duration_seconds`, worker/concurrency settings, and the results table name
+- `03_monitor/monitor.yaml` — `catalog` / `schema` (shared) and `inference_table` (must equal `deploy.yaml`'s `inference_table_prefix` + `_payload`), plus `unpacked_table`, `checkpoint_volume`, and `response_json_fields` for structured-output extraction
 
 After editing, validate the cross-file contracts locally (no workspace connection needed):
 
@@ -103,6 +106,7 @@ python scripts/validate_config.py
    - Resolves the adapter location from the run's `adapter_output_dir` parameter and merges the adapter into the base model.
    - Packages the merged weights with a vLLM OpenAI-compatible server entrypoint (`llm/v1/chat`) and registers the model to Unity Catalog using the Databricks Model Serving environment pack.
    - Creates or updates the configured Model Serving endpoint and routes 100% of traffic to the new version.
+   - Always enables AI Gateway inference logging as part of the deployment, so every request/response lands in the payload table the monitoring stage consumes.
 
 6. Load test the endpoint.
 
@@ -112,6 +116,10 @@ python scripts/validate_config.py
    - Runs a smoke test against the endpoint.
    - Generates asynchronous HTTP traffic from Spark tasks.
    - Records achieved throughput, status counts, latency samples, and summary metrics to a Delta table.
+
+7. Monitor the endpoint.
+
+   Run `03_monitor/01_unpack_inference_table.py` on Databricks serverless compute — on demand or as a scheduled job. The notebook incrementally unpacks the endpoint's inference table (raw JSON request/response payloads captured by AI Gateway inference logging) into an analysis-ready Delta table with prompts, completions, token usage, latency, and any configured structured-output fields, created with change data feed enabled for downstream data-quality monitoring. Logs are delivered to the payload table within about an hour of endpoint traffic. (A follow-up module creates the data-quality monitor over the unpacked table.)
 
 ## Bring Your Own Data and Model
 

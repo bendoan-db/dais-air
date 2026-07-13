@@ -45,6 +45,17 @@ vllm_dtype: float16
 vllm_max_model_len: 2048
 vllm_gpu_memory_utilization: 0.9
 
+# ---- Inference logging (AI Gateway inference tables) ----
+# Inference logging is ALWAYS enabled on the deployed endpoint — the
+# deployment is not considered complete without it, because the monitoring
+# stage (03_monitor) depends on the captured requests. Every request/response
+# is logged as rows in <catalog>.<schema>.<inference_table_prefix>_payload.
+# Requires USE CATALOG / USE SCHEMA / CREATE TABLE on the target schema; logs
+# arrive within ~1 hour of traffic. Note: once AI Gateway inference tables
+# are enabled on an endpoint, it cannot be switched back to legacy inference
+# tables.
+inference_table_prefix: qwen3_4b_instruct_finetuned
+
 # ---- Serving endpoint ----
 endpoint_name: qwen3_4b_instruct_finetuned
 endpoint_description: 'Custom LLM endpoint serving the fine-tuned model from the AIR pipeline.'

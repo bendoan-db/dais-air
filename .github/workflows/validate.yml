@@ -16,6 +16,6 @@ jobs:
       - name: Install validation dependencies
         run: pip install pyyaml
       - name: Compile all Python sources
-        run: python -m compileall -q 00_setup 01_train 02_deploy scripts
+        run: python -m compileall -q 00_setup 01_train 02_deploy 03_monitor scripts
       - name: Validate configuration contracts
         run: python scripts/validate_config.py

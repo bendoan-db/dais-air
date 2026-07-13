@@ -77,6 +77,8 @@ SERVING_PROVISIONED_CONCURRENCY = config_int(deploy_config, "serving_provisioned
 SERVING_WORKLOAD_SIZE = str(deploy_config.get("serving_workload_size") or "").strip()
 SERVING_SCALE_TO_ZERO = config_bool(deploy_config, "serving_scale_to_zero")
 
+INFERENCE_TABLE_PREFIX = config_str(deploy_config, "inference_table_prefix")
+
 FULL_MODEL_NAME = f"{UC_CATALOG}.{UC_SCHEMA}.{UC_MODEL_NAME}"
 
 print(f"Deploy config: {config_path}")
@@ -357,6 +359,8 @@ display(pd.DataFrame([registration_result]))
 # MAGIC - `serving_scale_to_zero` is useful for development, but should be disabled for latency-sensitive production traffic.
 # MAGIC
 # MAGIC The served entity also sets `VLLM_USE_FLASHINFER_SAMPLER=0`: the serving container cannot JIT-compile FlashInfer kernels (no `ninja`/`nvcc`), so vLLM must use its native PyTorch sampler.
+# MAGIC
+# MAGIC **Inference logging is always enabled** as part of the deployment: the endpoint's AI Gateway configuration logs every request/response to `<catalog>.<schema>.<inference_table_prefix>_payload` — the raw table the monitoring stage (`03_monitor`) unpacks. AI Gateway inference tables are the recommended capture mechanism for custom model endpoints (the legacy `auto_capture_config` path is retired); logs are delivered within about an hour of traffic.
 
 # COMMAND ----------
 
@@ -377,6 +381,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors import NotFound, ResourceDoesNotExist
     from databricks.sdk.service.serving import (
+        AiGatewayInferenceTableConfig,
         EndpointCoreConfigInput,
         Route,
         ServedEntityInput,
@@ -436,6 +441,22 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         )
         deployment_action = "created"
 
+    # Inference logging is part of the deployment, not an option: the
+    # monitoring stage depends on the captured requests, so the endpoint is
+    # not considered deployed until its AI Gateway inference table is on.
+    # put_ai_gateway is idempotent and covers both the create and update paths
+    # (update_config does not carry AI Gateway settings).
+    w.serving_endpoints.put_ai_gateway(
+        name=ENDPOINT_NAME,
+        inference_table_config=AiGatewayInferenceTableConfig(
+            catalog_name=UC_CATALOG,
+            schema_name=UC_SCHEMA,
+            table_name_prefix=INFERENCE_TABLE_PREFIX,
+            enabled=True,
+        ),
+    )
+    inference_payload_table = f"{UC_CATALOG}.{UC_SCHEMA}.{INFERENCE_TABLE_PREFIX}_payload"
+
     endpoint_state = getattr(endpoint, "state", None)
     workspace_url = (w.config.host or "").rstrip("/")
     endpoint_url = (
@@ -454,6 +475,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         "workload_type": SERVING_WORKLOAD_TYPE,
         "workload_size": SERVING_WORKLOAD_SIZE or None,
         "provisioned_concurrency": SERVING_PROVISIONED_CONCURRENCY,
+        "inference_payload_table": inference_payload_table,
         "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
         "config_update": str(getattr(endpoint_state, "config_update", None)),
     }

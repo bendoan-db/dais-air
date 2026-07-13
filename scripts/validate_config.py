@@ -11,8 +11,8 @@ this script checks every agreement before any workspace time is spent:
 
 1. 01_train/train.yaml parses and its training_config section loads through
    training_utils.load_training_config() (types, required keys, lists).
-2. catalog and schema agree across all four YAMLs (setup, train, deploy,
-   load test).
+2. catalog and schema agree across all five YAMLs (setup, train, deploy,
+   load test, monitor).
 3. setup.yaml's `table` equals train.yaml's `source_table` (setup writes the
    table training reads).
 4. `sft_table` agrees across setup, train, and load test; `sft_volume` agrees
@@ -24,12 +24,16 @@ this script checks every agreement before any workspace time is spent:
    searches the experiment training logs to), unless deploy.yaml uses an
    absolute workspace path; `best_run_metric_goal` is minimize|maximize and
    the registration/serving keys are present.
-7. When model_volume_path is set, setup.yaml's models list contains a
+7. monitor.yaml's `inference_table` equals deploy.yaml's
+   `inference_table_prefix` + '_payload' (inference logging is always enabled
+   at deployment, and the monitor must unpack the table the endpoint actually
+   writes), and the monitor stage keys are present.
+8. When model_volume_path is set, setup.yaml's models list contains a
    matching entry (volume_path == model_volume_path and huggingface_path ==
    model_name), so the weights setup downloads are the weights training loads.
-8. experiment_name stays alphanumeric/-/_ (it becomes a Jobs API task key).
-9. train.yaml's environment.dependencies and 01_train/requirements.txt stay in
-   sync (same requirement lines, order-insensitive).
+9. experiment_name stays alphanumeric/-/_ (it becomes a Jobs API task key).
+10. train.yaml's environment.dependencies and 01_train/requirements.txt stay
+    in sync (same requirement lines, order-insensitive).
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ sys.path.insert(0, str(REPO_ROOT / "01_train"))
 SETUP_YAML = "00_setup/setup.yaml"
 LOAD_TEST_YAML = "02_deploy/load_test/serving_load_test.yaml"
 DEPLOY_YAML = "02_deploy/deploy.yaml"
+MONITOR_YAML = "03_monitor/monitor.yaml"
 TRAIN_YAML = "01_train/train.yaml (training_config)"
 
 errors: list[str] = []
@@ -99,6 +104,7 @@ def check_shared_identity(
     setup_config: dict,
     load_test_config: dict,
     deploy_config: dict,
+    monitor_config: dict,
     training_context: dict,
 ) -> None:
     check_agreement(
@@ -107,6 +113,7 @@ def check_shared_identity(
             (SETUP_YAML, stage_value(setup_config, "catalog", SETUP_YAML)),
             (LOAD_TEST_YAML, stage_value(load_test_config, "catalog", LOAD_TEST_YAML)),
             (DEPLOY_YAML, stage_value(deploy_config, "catalog", DEPLOY_YAML)),
+            (MONITOR_YAML, stage_value(monitor_config, "catalog", MONITOR_YAML)),
             (TRAIN_YAML, training_context.get("UC_CATALOG")),
         ],
     )
@@ -116,6 +123,7 @@ def check_shared_identity(
             (SETUP_YAML, stage_value(setup_config, "schema", SETUP_YAML)),
             (LOAD_TEST_YAML, stage_value(load_test_config, "schema", LOAD_TEST_YAML)),
             (DEPLOY_YAML, stage_value(deploy_config, "schema", DEPLOY_YAML)),
+            (MONITOR_YAML, stage_value(monitor_config, "schema", MONITOR_YAML)),
             (TRAIN_YAML, training_context.get("UC_SCHEMA")),
         ],
     )
@@ -159,6 +167,9 @@ def check_deploy_config(deploy_config: dict, training_context: dict) -> None:
         "endpoint_description",
         "vllm_dtype",
         "best_run_metric",
+        # Inference logging is unconditional at deployment; the prefix names
+        # the payload table the monitoring stage unpacks.
+        "inference_table_prefix",
     ):
         stage_value(deploy_config, key, DEPLOY_YAML)
 
@@ -185,6 +196,31 @@ def check_deploy_config(deploy_config: dict, training_context: dict) -> None:
                 (TRAIN_YAML, training_context.get("EXPERIMENT_NAME")),
             ],
         )
+
+
+def check_monitor_config(monitor_config: dict, deploy_config: dict) -> None:
+    """Monitor-stage keys, and the payload-table contract with deploy.yaml."""
+    for key in ("inference_table", "unpacked_table", "checkpoint_volume"):
+        stage_value(monitor_config, key, MONITOR_YAML)
+
+    response_json_fields = monitor_config.get("response_json_fields")
+    if response_json_fields is not None and not isinstance(response_json_fields, list):
+        fail(f"{MONITOR_YAML}: response_json_fields must be a list (or omitted).")
+
+    # Deployment always enables inference logging to
+    # <inference_table_prefix>_payload; the monitor must unpack that exact
+    # table.
+    prefix = str(deploy_config.get("inference_table_prefix") or "").strip()
+    monitor_table = str(monitor_config.get("inference_table") or "").strip()
+    if prefix and monitor_table:
+        expected = f"{prefix}_payload"
+        if monitor_table != expected:
+            fail(
+                f"{MONITOR_YAML}: inference_table is {monitor_table!r} but the "
+                f"endpoint logs to {expected!r} ({DEPLOY_YAML}'s "
+                "inference_table_prefix + '_payload') — the monitor would unpack "
+                "a table the endpoint never writes."
+            )
 
 
 def check_models_contract(setup_config: dict, training_context: dict) -> None:
@@ -265,10 +301,14 @@ def main() -> int:
     setup_config = load_yaml(REPO_ROOT / "00_setup" / "setup.yaml")
     load_test_config = load_yaml(REPO_ROOT / "02_deploy" / "load_test" / "serving_load_test.yaml")
     deploy_config = load_yaml(REPO_ROOT / "02_deploy" / "deploy.yaml")
+    monitor_config = load_yaml(REPO_ROOT / "03_monitor" / "monitor.yaml")
 
     if training_context:
-        check_shared_identity(setup_config, load_test_config, deploy_config, training_context)
+        check_shared_identity(
+            setup_config, load_test_config, deploy_config, monitor_config, training_context
+        )
         check_deploy_config(deploy_config, training_context)
+        check_monitor_config(monitor_config, deploy_config)
         check_models_contract(setup_config, training_context)
         check_experiment_name(training_context)
 

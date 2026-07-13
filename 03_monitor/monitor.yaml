@@ -1,0 +1,31 @@
+# Configuration for the monitoring stage (03_monitor). This file is
+# self-contained so the module runs standalone. Values shared with other
+# stages must agree and are checked by scripts/validate_config.py:
+# catalog/schema with every stage, and inference_table must equal
+# 02_deploy/deploy.yaml's inference_table_prefix + '_payload' (the table the
+# endpoint's AI Gateway inference logging writes).
+catalog: poc-catalog
+schema: databricks_support
+
+# ---- 01_unpack_inference_table.py ----
+# Raw payload table written by the endpoint (AI Gateway inference table).
+inference_table: qwen3_4b_instruct_finetuned_payload
+# Delta table receiving one unpacked row per request. Created on first run
+# with change data feed enabled (required for efficient incremental monitor
+# refreshes) and partitioned by request_date.
+unpacked_table: qwen3_4b_instruct_finetuned_requests
+# UC volume holding the streaming checkpoint that makes unpacking
+# incremental: each run processes only payload rows it has not seen yet.
+# Deleting the checkpoint directory reprocesses the full payload table.
+checkpoint_volume: monitoring_assets
+# Only successful (HTTP 200) requests are unpacked by default; failed
+# requests carry no usable completion.
+include_failed_requests: false
+# Optional: string fields to extract from the assistant's JSON response into
+# top-level columns, so the monitor can profile them as categoricals. The
+# fraud example responds with {"risk": ..., "action": ..., "reason": ...} —
+# risk and action are its label-like fields. Leave empty ([]) for free-text
+# response models.
+response_json_fields:
+  - risk
+  - action
