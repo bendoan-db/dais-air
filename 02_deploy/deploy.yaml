@@ -3,8 +3,8 @@
 # stages must agree and are checked by scripts/validate_config.py:
 # catalog/schema with every stage, experiment_name with 01_train/train.yaml,
 # and endpoint_name with load_test/serving_load_test.yaml.
-catalog: poc-catalog
-schema: databricks_support
+catalog: catalog_sandbox_5nwjwb
+schema: air_hackathon
 
 # ---- Run selection (01_register_and_deploy.py) ----
 # MLflow run whose trained adapter should be registered. Leave empty to
@@ -15,7 +15,7 @@ run_id: ''
 # /Users/<current user>/<experiment_name> — where both the runner notebook
 # and AIR CLI runs land; a value starting with '/' is used as an absolute
 # workspace path.
-experiment_name: unsloth_qwen3_4b_instruct_training
+experiment_name: air_hackathon
 # Metric that ranks runs when run_id is empty, and whether lower or higher is
 # better. Training logs trainer_* metrics (e.g. trainer_train_loss).
 best_run_metric: trainer_train_loss
