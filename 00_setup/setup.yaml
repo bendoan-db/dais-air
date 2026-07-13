@@ -4,8 +4,8 @@
 # and the models entries' volume_path — must agree with 01_train/train.yaml and
 # 02_deploy/load_test/serving_load_test.yaml; scripts/validate_config.py checks every
 # agreement.
-catalog: poc-catalog
-schema: databricks_support
+catalog: catalog_sandbox_5nwjwb
+schema: air_hackathon
 # Cleaned transaction table written by 01 (train.yaml's source_table).
 table: fraud_dataset
 # SFT table and export volume written by 02 and read by training.
@@ -50,4 +50,6 @@ hf_token_secret_key: ''
 # model_name).
 models:
   - huggingface_path: unsloth/Qwen3-4B-Instruct-2507
-    volume_path: /Volumes/poc-catalog/databricks_support/checkpoints/base_models/qwen3-4b-instruct
+    volume_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3-4b-instruct
+  - huggingface_path: microsoft/phi-4
+    volume_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/microsoft-phi-4
