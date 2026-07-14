@@ -145,7 +145,7 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # MAGIC
 # MAGIC The implementation highlights the production workflow around training:
 # MAGIC
-# MAGIC - MLflow records parameters, metrics, and run metadata.
+# MAGIC - MLflow records parameters, metrics, and run metadata — including held-out fraud-classification quality (`eval_fraud_accuracy`/`_precision`/`_recall`/`_f1`, scored after training on a stratified holdout the training data excludes; `eval_sample_size` in `train.yaml`).
 # MAGIC - Checkpoints and adapters are saved to a Unity Catalog volume.
 # MAGIC - Model registration and deployment are handled by `02_register_and_deploy.py` (next in this directory) after training completes.
 # MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the `gpus=1` and `gpus>1` runs.

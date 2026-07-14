@@ -111,6 +111,112 @@ def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
     )
 
 
+def parse_risk_prediction(completion: str) -> str | None:
+    """Extract the ``risk`` value from a generated JSON completion.
+
+    Falls back to a regex so a completion truncated by the generation budget
+    still yields a prediction (``risk`` is the first key in the response
+    contract, so it survives truncation).
+    """
+    import json
+    import re
+
+    try:
+        risk = json.loads(completion.strip()).get("risk")
+        return str(risk) if risk is not None else None
+    except Exception:
+        match = re.search(r'"risk"\s*:\s*"([^"]+)"', completion)
+        return match.group(1) if match else None
+
+
+def binary_classification_metrics(
+    ground_truth: list[bool], predictions: list[bool]
+) -> dict[str, float]:
+    """Accuracy/precision/recall/F1 with fraud as the positive class."""
+    true_positives = sum(1 for truth, pred in zip(ground_truth, predictions) if truth and pred)
+    false_positives = sum(1 for truth, pred in zip(ground_truth, predictions) if not truth and pred)
+    false_negatives = sum(1 for truth, pred in zip(ground_truth, predictions) if truth and not pred)
+    true_negatives = sum(
+        1 for truth, pred in zip(ground_truth, predictions) if not truth and not pred
+    )
+    total = len(ground_truth)
+
+    precision_denominator = true_positives + false_positives
+    recall_denominator = true_positives + false_negatives
+    precision = true_positives / precision_denominator if precision_denominator else 0.0
+    recall = true_positives / recall_denominator if recall_denominator else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+    return {
+        "eval_fraud_accuracy": (true_positives + true_negatives) / total if total else 0.0,
+        "eval_fraud_precision": precision,
+        "eval_fraud_recall": recall,
+        "eval_fraud_f1": f1,
+        "eval_fraud_true_positives": float(true_positives),
+        "eval_fraud_false_positives": float(false_positives),
+        "eval_fraud_false_negatives": float(false_negatives),
+        "eval_fraud_true_negatives": float(true_negatives),
+    }
+
+
+def evaluate_fraud_classification(model, tokenizer, eval_pdf, batch_size: int = 16) -> dict:
+    """Score the fine-tuned model as a binary fraud classifier on held-out rows.
+
+    Generates a completion for each held-out prompt, parses the ``risk``
+    field, and treats ``likely_fraud`` as the positive prediction against the
+    records' ``is_fraud`` label. Returns the metrics dict (plus the rate of
+    completions with no parseable ``risk``, which count as non-fraud
+    predictions).
+    """
+    import torch
+
+    FastLanguageModel.for_inference(model)
+    # Decoder-only batched generation needs left padding.
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    prompts = eval_pdf["prompt"].tolist()
+    ground_truth = [bool(int(value) == 1) for value in eval_pdf["is_fraud"].tolist()]
+
+    predictions: list[bool] = []
+    unparseable_count = 0
+    for batch_start in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[batch_start : batch_start + batch_size]
+        chat_texts = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            for prompt in batch_prompts
+        ]
+        inputs = tokenizer(chat_texts, return_tensors="pt", padding=True).to(model.device)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                # The compact JSON answer fits in ~50-60 tokens (the same
+                # budget the serving payloads use); risk is the first key, so
+                # even a truncated reason leaves the prediction parseable.
+                max_new_tokens=64,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+        completions = tokenizer.batch_decode(
+            outputs[:, inputs["input_ids"].shape[1] :], skip_special_tokens=True
+        )
+        for completion in completions:
+            risk = parse_risk_prediction(completion)
+            if risk is None:
+                unparseable_count += 1
+            predictions.append(risk == "likely_fraud")
+
+    metrics = binary_classification_metrics(ground_truth, predictions)
+    metrics["eval_unparseable_rate"] = unparseable_count / len(prompts) if prompts else 0.0
+    return metrics
+
+
 def train_qwen3_unsloth(
     *,
     examples_pdf: pd.DataFrame,
@@ -130,6 +236,36 @@ def train_qwen3_unsloth(
     mlflow.set_registry_uri("databricks-uc")
     is_main_process = rank == 0
     save_artifacts = save_artifacts and is_main_process
+
+    # Hold out rows on rank 0 for post-training fraud-classification metrics
+    # (accuracy/precision/recall/F1 against is_fraud). Stratified: at the
+    # natural ~1% fraud rate a small random sample would carry almost no
+    # positives, leaving recall/precision meaningless. Held-out rows are
+    # dropped from this rank's training data, so the metrics are honest.
+    eval_pdf = None
+    if EVAL_SAMPLE_SIZE > 0 and is_main_process:
+        if "is_fraud" not in examples_pdf.columns:
+            print(
+                "eval_sample_size is set but the SFT records carry no is_fraud "
+                "column — skipping fraud-classification evaluation."
+            )
+        elif len(examples_pdf) > EVAL_SAMPLE_SIZE:
+            fraud_pdf = examples_pdf[examples_pdf["is_fraud"] == 1]
+            non_fraud_pdf = examples_pdf[examples_pdf["is_fraud"] != 1]
+            fraud_count = min(EVAL_SAMPLE_SIZE // 2, len(fraud_pdf))
+            non_fraud_count = min(EVAL_SAMPLE_SIZE - fraud_count, len(non_fraud_pdf))
+            eval_pdf = pd.concat(
+                [
+                    fraud_pdf.sample(n=fraud_count, random_state=SEED),
+                    non_fraud_pdf.sample(n=non_fraud_count, random_state=SEED),
+                ]
+            )
+            examples_pdf = examples_pdf.drop(eval_pdf.index)
+        else:
+            print(
+                f"Rank slice has only {len(examples_pdf)} rows — not holding out "
+                f"{EVAL_SAMPLE_SIZE} for evaluation; skipping."
+            )
 
     dataset = Dataset.from_pandas(
         examples_pdf[["prompt", "assistant_response"]],
@@ -301,6 +437,28 @@ def train_qwen3_unsloth(
                 if artifact_file.is_file():
                     shutil.copy2(artifact_file, volume_dir / artifact_file.name)
             mlflow.log_param("adapter_output_dir", output_dir)
+
+        # Held-out fraud-classification quality of the fine-tuned model. A
+        # failed evaluation logs eval_error but keeps the run FINISHED — a
+        # completed training (and its adapter) should stay deployable.
+        if eval_pdf is not None:
+            try:
+                fraud_metrics = evaluate_fraud_classification(model, tokenizer, eval_pdf)
+                for metric_name, metric_value in fraud_metrics.items():
+                    mlflow.log_metric(metric_name, float(metric_value))
+                mlflow.log_param("eval_sample_size", len(eval_pdf))
+                print(
+                    "Held-out fraud classification — "
+                    f"accuracy: {fraud_metrics['eval_fraud_accuracy']:.3f}, "
+                    f"precision: {fraud_metrics['eval_fraud_precision']:.3f}, "
+                    f"recall: {fraud_metrics['eval_fraud_recall']:.3f}, "
+                    f"f1: {fraud_metrics['eval_fraud_f1']:.3f} "
+                    f"(n={len(eval_pdf)}, unparseable rate "
+                    f"{fraud_metrics['eval_unparseable_rate']:.3f})"
+                )
+            except Exception as exc:
+                mlflow.log_param("eval_error", str(exc)[:250])
+                print(f"Fraud-classification evaluation failed (run continues): {exc}")
 
         if torch.cuda.is_available():
             peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3

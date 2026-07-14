@@ -95,6 +95,7 @@ python scripts/validate_config.py
    - Uses the `@distributed` decorator so the same training cell can run on one GPU or multiple GPUs by changing the `gpus` parameter.
    - Saves rank-0 adapter artifacts to a Unity Catalog volume.
    - Logs training metrics to MLflow, including the adapter location (`adapter_output_dir`) the deployment stage resolves.
+   - Scores the fine-tuned model as a binary fraud classifier on a stratified holdout (excluded from training) and logs `eval_fraud_accuracy`, `eval_fraud_precision`, `eval_fraud_recall`, and `eval_fraud_f1` — set `best_run_metric: eval_fraud_f1` (maximize) in `deploy_config` to deploy the best classifier instead of the lowest loss.
 
    The training implementation lives in `train/train.py` and can also run without the notebook through the AI Runtime CLI — see [Training via the AI Runtime CLI](#training-via-the-ai-runtime-cli).
 

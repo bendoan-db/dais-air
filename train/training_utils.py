@@ -286,6 +286,7 @@ def load_training_config() -> dict:
         "LEARNING_RATE": config_float(config, "learning_rate"),
         "WARMUP_STEPS": config_int(config, "warmup_steps"),
         "TRAINING_SAMPLE_FRACTION": config_float(config, "training_sample_fraction"),
+        "EVAL_SAMPLE_SIZE": config_int(config, "eval_sample_size"),
         "LORA_R": config_int(config, "lora_r"),
         "LORA_ALPHA": config_int(config, "lora_alpha"),
         "LORA_DROPOUT": config_float(config, "lora_dropout"),

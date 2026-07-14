@@ -94,6 +94,14 @@ parameters:
     # value too and can override it inline in the training cell.
     training_sample_fraction: 0.0001
     seed: 3407
+    # Rows held out of rank 0's training slice to score the fine-tuned model
+    # as a binary fraud classifier after training (generated `risk` field vs
+    # the records' is_fraud label). Logged to MLflow as eval_fraud_accuracy /
+    # _precision / _recall / _f1 (fraud = positive class), plus the confusion
+    # counts and the unparseable-completion rate. The sample is stratified
+    # half fraud / half non-fraud so the metrics are measurable at low
+    # natural fraud rates. 0 disables evaluation.
+    eval_sample_size: 200
 
     # LoRA adapter settings.
     lora_r: 16
@@ -128,8 +136,11 @@ parameters:
     # metric settings below.
     run_id: ''
     # Metric that ranks runs when run_id is empty, and whether lower or
-    # higher is better. Training logs trainer_* metrics (e.g.
-    # trainer_train_loss).
+    # higher is better. Training logs trainer_* loss metrics and — when
+    # eval_sample_size > 0 — held-out fraud-classification quality
+    # (eval_fraud_accuracy / _precision / _recall / _f1); to deploy the best
+    # classifier rather than the lowest training loss, use
+    # eval_fraud_f1 with maximize.
     best_run_metric: trainer_train_loss
     best_run_metric_goal: minimize  # minimize | maximize
 
