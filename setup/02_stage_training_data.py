@@ -55,14 +55,15 @@ config_path = script_dir / "setup.yaml"
 with config_path.open("r", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
-# Stage keys come from setup.yaml; the pipeline-wide identity comes from
-# the repo-root global.yaml.
+# Stage keys come from setup.yaml; catalog/schema come from the repo-root
+# global.yaml.
 global_config_path, global_config = load_global_config()
 catalog = config_str(global_config, "catalog")
 schema = config_str(global_config, "schema")
-table = config_str(global_config, "source_table")
-sft_table = config_str(global_config, "sft_table")
-sft_volume = config_str(global_config, "sft_volume")
+
+table = config_str(config, "source_table")
+sft_table = config_str(config, "sft_table")
+sft_volume = config_str(config, "sft_volume")
 sft_files_path = f"/Volumes/{catalog}/{schema}/{sft_volume}/{sft_table}"
 
 suspicious_amount_threshold = config_float(config, "suspicious_amount_threshold")

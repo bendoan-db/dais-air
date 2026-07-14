@@ -1,8 +1,9 @@
-# Stage-specific configuration for the load-test notebook. The
-# pipeline-wide identity (catalog, schema, sft_table, endpoint_name) lives
-# in the repo-root global.yaml, loaded through
-# training_utils.load_global_config(); scripts/validate_config.py fails if
-# this file re-introduces a global key.
+# Stage-specific configuration for the load-test notebook. catalog/schema
+# come from the repo-root global.yaml. sft_table must match setup/train and
+# endpoint_name must match train/train.yaml's deploy_config;
+# scripts/validate_config.py checks both agreements.
+sft_table: fraud_sft_dataset
+endpoint_name: qwen3_4b_instruct_finetuned
 
 # Delta table (in the shared catalog.schema) that accumulates one summary row
 # per load-test run.

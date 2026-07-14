@@ -1,44 +1,8 @@
-# Global configuration — the single source of truth for every parameter
-# shared across the pipeline modules (setup, train+deploy, load test,
-# monitor). Each module loads this file through
-# training_utils.load_global_config(); the per-stage YAMLs hold only
-# stage-specific keys, and scripts/validate_config.py fails if a stage YAML
-# re-introduces one of these keys.
-
-# Unity Catalog identity: where every stage reads and writes.
+# Global configuration — the Unity Catalog identity shared by every
+# pipeline module (setup, train+deploy, load test, monitor). Each module
+# loads this file through training_utils.load_global_config(); all other
+# parameters are stage-owned in each module's YAML, and cross-stage
+# agreements are checked by scripts/validate_config.py (which also fails if
+# a stage YAML re-introduces a key defined here).
 catalog: catalog_sandbox_5nwjwb
 schema: air_hackathon
-
-# MLflow experiment (a bare name resolves to /Users/<current user>/<name>).
-# Training logs runs here; deployment's best-run selection searches it.
-# NOTE: the AIR CLI workload schema also requires experiment_name at the top
-# level of train/train.yaml — keep that copy equal to this one
-# (scripts/validate_config.py checks the agreement).
-experiment_name: air_hackathon
-
-# Cleaned transaction table written by setup/01 and read by setup/02.
-source_table: fraud_dataset
-# SFT training table written by setup/02, read by training, and sampled by
-# the load test.
-sft_table: fraud_sft_dataset
-# Volume holding the parquet shard export of the SFT table (setup/02 writes
-# it, training reads it).
-sft_volume: training_data
-
-# Model identity: names the training outputs and the registered UC model.
-uc_model_name: qwen3_4b_instruct_finetuned
-# Base model (Hugging Face repo id). model_volume_path optionally points at
-# a UC volume snapshot of its weights: when set, training loads from the
-# volume (populate it via setup/03 — its models list must cover this path);
-# when empty, training downloads from Hugging Face on each GPU worker.
-model_name: unsloth/Qwen3-4B-Instruct-2507
-model_volume_path: '/Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3-4b-instruct/'
-
-# Serving endpoint created by the deployment notebook and targeted by the
-# load test.
-endpoint_name: qwen3_4b_instruct_finetuned
-# AI Gateway inference logging (always enabled at deployment) writes to
-# <catalog>.<schema>.<inference_table_prefix>_payload — the table the
-# monitoring stage unpacks. Once enabled on an endpoint it cannot switch
-# back to legacy inference tables; logs arrive within ~1 hour of traffic.
-inference_table_prefix: qwen3_4b_instruct_finetuned

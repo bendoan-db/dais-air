@@ -8,7 +8,7 @@ The repository ships with a complete worked example — classifying IBM TabForme
 
 | Path | Purpose |
 | --- | --- |
-| `global.yaml` | **Global configuration** — the single source of truth for parameters shared across modules: catalog/schema, MLflow experiment, table/volume names, model identity, endpoint name, and inference-table prefix. |
+| `global.yaml` | **Global configuration** — the Unity Catalog identity (`catalog`, `schema`) shared by every module. |
 | `setup/01_load_dataset.py` | Databricks notebook that downloads TabFormer, cleans transaction data, and overwrites the transaction Delta table. |
 | `setup/02_stage_training_data.py` | Databricks notebook that builds the prompt/response SFT Delta table and stages it in a Unity Catalog volume as Parquet shards for AIR training. |
 | `setup/03_download_base_model_weights.py` | Databricks notebook that snapshots the Hugging Face models listed in `setup/setup.yaml` into Unity Catalog volumes. |
@@ -39,7 +39,7 @@ The repository ships with a complete worked example — classifying IBM TabForme
 
 ## Configuration
 
-The repo-root **`global.yaml`** is the single source of truth for every parameter shared across modules — `catalog`, `schema`, `experiment_name`, `source_table`, `sft_table`, `sft_volume`, `uc_model_name`, `model_name`/`model_volume_path`, `endpoint_name`, and `inference_table_prefix`. Every notebook loads it through `training_utils.load_global_config()`, so shared values are configured exactly once and cannot drift. Each stage's own YAML holds only stage-specific keys, and `scripts/validate_config.py` fails if a stage YAML re-introduces a global key. One duplication is unavoidable: the AIR CLI schema requires `experiment_name` at the top of `train.yaml` — keep it equal to `global.yaml`'s (the validator checks this).
+The repo-root **`global.yaml`** holds the Unity Catalog identity every module shares — `catalog` and `schema` — loaded by every notebook through `training_utils.load_global_config()`, so the one thing that must never diverge is configured exactly once (`scripts/validate_config.py` fails if a stage YAML re-introduces either key). Everything else is stage-owned in each module's YAML; the values shared between stages (table/volume names, `endpoint_name`, the inference-table name) are duplicated by design and every agreement is machine-checked by `scripts/validate_config.py`.
 
 Update before running:
 
@@ -127,13 +127,13 @@ The TabFormer ingestion (`setup/01`) and the fraud prompt construction in `setup
 
 **The SFT table contract.** Training consumes a Delta table with two string columns — `prompt` and `assistant_response` — plus the `shard_id` column added at staging. To train on your own data:
 
-1. Produce a Delta table with `prompt`/`assistant_response` columns in the configured catalog and schema: either replace `setup/01` and the record-building cells of `setup/02` with your own logic, or point `sft_table` (in `global.yaml`) at a table you already maintain and keep only `setup/02`'s generic half (shard assignment, Parquet export, verification).
+1. Produce a Delta table with `prompt`/`assistant_response` columns in the configured catalog and schema: either replace `setup/01` and the record-building cells of `setup/02` with your own logic, or point `sft_table` (in `setup/setup.yaml`, `train/train.yaml`, `load_test/serving_load_test.yaml`, and `monitor/monitor.yaml`) at a table you already maintain and keep only `setup/02`'s generic half (shard assignment, Parquet export, verification).
 2. Set `sft_shard_key_columns` in `setup/setup.yaml` to columns that identify your rows — they drive the deterministic shard hash (see [How the Data Sharding Works](#how-the-data-sharding-works)).
 3. Keep the response shape you fine-tune on identical to what clients will request at serving time; the serving smoke-test payload and the load test both sample prompts directly from the SFT table.
 
 **The model contract.** To fine-tune a different open-source model:
 
-1. Change `model_name` in `global.yaml`, add a matching entry to `setup/setup.yaml`'s `models` list, point `global.yaml`'s `model_volume_path` at its `volume_path`, and rerun `setup/03` (set the HF token secret keys in `setup.yaml` for gated models such as Llama).
+1. Change `model_name` in `train/train.yaml`'s `training_config`, add a matching entry to `setup/setup.yaml`'s `models` list, point `model_volume_path` at its `volume_path`, and rerun `setup/03` (set the HF token secret keys in `setup.yaml` for gated models such as Llama).
 2. Update `response_instruction_part` / `response_part` in `train/train.yaml` to the new model's chat-template markers — response-only loss masking silently degrades if these don't match the template.
 3. Confirm the model's architecture is supported by the vLLM version pinned in `train/requirements.txt` (the registration notebook prints the architecture as a preflight), and prefer a non-reasoning variant — see `CLAUDE.md`'s serving constraints for why.
 

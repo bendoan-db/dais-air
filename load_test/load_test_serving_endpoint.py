@@ -13,6 +13,7 @@
 # MAGIC
 # MAGIC - Query custom LLM serving endpoint: https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms#step-7-query-your-endpoint
 # MAGIC - Custom LLM serving monitoring: https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms#monitor-your-endpoint
+# MAGIC - AI Gateway inference tables (this traffic is captured there): https://docs.databricks.com/aws/en/ai-gateway/inference-tables
 
 # COMMAND ----------
 
@@ -23,10 +24,12 @@
 # MAGIC The serving endpoint must already exist and be in a ready state before the load test starts.
 # MAGIC
 # MAGIC The notebook uses `aiohttp` for asynchronous HTTP requests. The Databricks SDK is not used for the hot path because the load test needs connection pooling, high concurrency, and precise request pacing.
+# MAGIC
+# MAGIC This stage deliberately does **not** install `train/requirements.txt`: the consolidated file carries the GPU training and vLLM serving stack (Unsloth, torch, vllm), none of which belongs on a CPU load-generator cluster. Only the lightweight HTTP/data packages above are needed.
 
 # COMMAND ----------
 
-# MAGIC %pip install -qqq "aiohttp>=3.9.0" "pyyaml>=6.0.2" "pandas>=2.2.0" "requests>=2.31.0"
+# MAGIC %pip install -qqq "aiohttp>=3.9.0" "pyyaml>=6.0.2" "pandas>=2.2.0" "requests>=2.31.0" "numpy>=1.24.0"
 # MAGIC %restart_python
 
 # COMMAND ----------
@@ -43,7 +46,7 @@
 import sys
 from pathlib import Path
 
-TRAIN_MODULE_DIR = str((Path.cwd().parents[1] / "train").resolve())
+TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
 if TRAIN_MODULE_DIR not in sys.path:
     sys.path.insert(0, TRAIN_MODULE_DIR)
 
@@ -77,13 +80,13 @@ from pyspark.sql import functions as F
 
 config_path, load_test_config = load_yaml_config("serving_load_test.yaml", base_dir=Path.cwd())
 
-# Load-generator settings come from serving_load_test.yaml; the
-# pipeline-wide identity comes from the repo-root global.yaml.
+# Stage keys come from serving_load_test.yaml; catalog/schema come from the
+# repo-root global.yaml.
 _, global_config = load_global_config()
 UC_CATALOG = config_str(global_config, "catalog")
 UC_SCHEMA = config_str(global_config, "schema")
-SFT_TABLE_NAME = config_str(global_config, "sft_table")
-ENDPOINT_NAME = config_str(global_config, "endpoint_name")
+SFT_TABLE_NAME = config_str(load_test_config, "sft_table")
+ENDPOINT_NAME = config_str(load_test_config, "endpoint_name")
 RESULTS_TABLE_NAME = config_str(load_test_config, "results_table")
 
 TARGET_QPS = config_int(load_test_config, "target_qps")
@@ -113,6 +116,7 @@ schema_q = full_name(UC_CATALOG, UC_SCHEMA)
 sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 results_table_q = full_name(UC_CATALOG, UC_SCHEMA, RESULTS_TABLE_NAME)
 
+spark = get_spark_session()
 ensure_uc_object(spark, f"CREATE SCHEMA IF NOT EXISTS {schema_q}")
 
 planned_requests = TARGET_QPS * DURATION_SECONDS
@@ -324,6 +328,8 @@ if (smoke_test_pdf["status_code"] >= 400).any():
 # MAGIC
 # MAGIC The achieved QPS may be lower than the target if the load-generator compute, network path, endpoint queue, or provisioned endpoint replicas become saturated.
 # MAGIC The summary metrics below make that gap visible.
+# MAGIC
+# MAGIC **Inference logging captures this traffic too**: deployment always enables AI Gateway inference tables, so every load-test request/response lands in the endpoint's `<inference_table_prefix>_payload` table (delivery within ~1 hour) and flows into the monitoring stage's unpacked table on its next run. Large tests inflate both tables — and at sustained very high throughput (roughly >70 MB/s of payloads), log delivery may degrade; consider that when sizing `target_qps` or interpreting monitor metrics for load-test windows.
 
 # COMMAND ----------
 
@@ -552,7 +558,7 @@ display(spark.table(results_table_q))
 # MAGIC If the endpoint does not sustain the configured target, use the result tables to separate load-generator limits from serving limits:
 # MAGIC
 # MAGIC - High client-side failures or exceptions usually indicate the load generator needs more workers, more concurrency, or a longer timeout.
-# MAGIC - HTTP `429`, `503`, or long tail latency usually indicates endpoint queueing or insufficient provisioned serving capacity.
+# MAGIC - HTTP `429`, `503`, or long tail latency usually indicates endpoint queueing or insufficient provisioned serving capacity — raise `serving_provisioned_concurrency` in `train/train.yaml`'s `deploy_config` and rerun the deployment notebook (capacity is fixed during the custom LLM serving beta; requests beyond it are rejected with instant 429s).
 # MAGIC - Low achieved QPS with low endpoint latency usually indicates the notebook load generator is saturated before the endpoint.
 # MAGIC
 # MAGIC For production capacity testing, run this notebook against each endpoint size you plan to evaluate and compare the persisted summaries in the results table.

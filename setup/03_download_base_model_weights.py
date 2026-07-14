@@ -40,7 +40,7 @@ train_module_dir = str((script_dir.parent / "train").resolve())
 if train_module_dir not in sys.path:
     sys.path.insert(0, train_module_dir)
 
-from training_utils import ensure_uc_object, full_name, get_spark_session, load_global_config
+from training_utils import ensure_uc_object, full_name, get_spark_session, load_training_config
 
 config_path = script_dir / "setup.yaml"
 with config_path.open("r", encoding="utf-8") as config_file:
@@ -226,24 +226,24 @@ for model in models:
 
 # COMMAND ----------
 
-_, global_config = load_global_config()
-train_model_volume_path = str(global_config.get("model_volume_path") or "").rstrip("/")
+training_context = load_training_config()
+train_model_volume_path = training_context["MODEL_VOLUME_PATH"].rstrip("/")
 
 if not train_model_volume_path:
     print(
-        "global.yaml has no model_volume_path set — training will download "
-        f"{global_config.get('model_name')} from Hugging Face on each GPU worker. "
+        "train/train.yaml has no model_volume_path set — training will download "
+        f"{training_context['MODEL_NAME']} from Hugging Face on each GPU worker. "
         "Point model_volume_path at one of the snapshots above to load "
         "workspace-local weights instead."
     )
 elif train_model_volume_path in {str(model["destination_dir"]) for model in models}:
     print(
-        "global.yaml's model_volume_path matches a downloaded snapshot: "
+        "train/train.yaml's model_volume_path matches a downloaded snapshot: "
         f"{train_model_volume_path}"
     )
 else:
     print(
-        "WARNING: global.yaml's model_volume_path is not among the snapshots "
+        "WARNING: train/train.yaml's model_volume_path is not among the snapshots "
         f"this notebook downloads: {train_model_volume_path}. Training will fail at "
         "model load unless that directory is populated some other way — add a "
         "matching entry to setup.yaml's models list or update model_volume_path."

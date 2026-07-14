@@ -10,7 +10,8 @@
 # MAGIC 1. Reads the payload table **incrementally** with Structured Streaming (`trigger(availableNow=True)` plus a checkpoint in a UC volume), so each run processes only new rows and the notebook can be scheduled as a recurring job.
 # MAGIC 2. Parses the OpenAI-compatible chat payloads: the prompt (last user message), the completion text, finish reason, and token usage.
 # MAGIC 3. Optionally extracts fields from structured JSON completions into top-level columns (`response_json_fields` in `monitor.yaml`) so the monitor can profile them as categoricals — the fraud example extracts `risk` and `action`.
-# MAGIC 4. Appends to the unpacked Delta table, created on first run with **change data feed** enabled (data profiling refreshes incrementally from CDF) and partitioned by `request_date`.
+# MAGIC 4. Optionally parses the transaction features embedded in every prompt's fixed `- key: value` block (`prompt_fields` in `monitor.yaml`) into typed `txn_*` columns — the input-feature-drift signals the monitor profiles. A changed template yields nulls, never a stream failure (and rising `txn_*` null rates are themselves a monitored signal).
+# MAGIC 5. Appends to the unpacked Delta table, created on first run with **change data feed** enabled (data profiling refreshes incrementally from CDF) and partitioned by `request_date`.
 # MAGIC
 # MAGIC Run on Databricks serverless (CPU) compute — on demand, or scheduled (Databricks recommends at least weekly; hourly/daily keeps monitor metrics fresh).
 # MAGIC
@@ -21,15 +22,25 @@
 
 # COMMAND ----------
 
-# training_utils is a plain Python module in train/ (not a notebook),
-# shared across the pipeline; insert that directory into sys.path.
+# training_utils (train/) and monitoring_utils (this folder) are plain
+# Python modules, not notebooks; insert their directories into sys.path.
 import sys
 from pathlib import Path
 
 TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
-if TRAIN_MODULE_DIR not in sys.path:
-    sys.path.insert(0, TRAIN_MODULE_DIR)
+MONITOR_MODULE_DIR = str(Path.cwd().resolve())
+for module_dir in (TRAIN_MODULE_DIR, MONITOR_MODULE_DIR):
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
 
+from monitoring_utils import (
+    PROMPT_COLUMN_PREFIX,
+    RESPONSE_COLUMN_PREFIX,
+    parse_prompt_fields,
+    parse_response_json_fields,
+    with_prompt_fields,
+    with_response_fields,
+)
 from training_utils import (
     config_bool,
     config_str,
@@ -40,24 +51,21 @@ from training_utils import (
     load_yaml_config,
 )
 
-# Stage keys come from monitor.yaml; the pipeline-wide identity comes from
-# the repo-root global.yaml. The payload table name is derived from the
-# global inference_table_prefix — the endpoint always writes
-# <prefix>_payload, so the two can never drift.
+# Stage keys come from monitor.yaml; catalog/schema come from the repo-root
+# global.yaml. inference_table must equal the endpoint's
+# <inference_table_prefix>_payload (checked by scripts/validate_config.py).
 config_path, monitor_config = load_yaml_config("monitor.yaml", base_dir=Path.cwd())
 _, global_config = load_global_config()
 
 UC_CATALOG = config_str(global_config, "catalog")
 UC_SCHEMA = config_str(global_config, "schema")
-INFERENCE_TABLE_NAME = f"{config_str(global_config, 'inference_table_prefix')}_payload"
+INFERENCE_TABLE_NAME = config_str(monitor_config, "inference_table")
 UNPACKED_TABLE_NAME = config_str(monitor_config, "unpacked_table")
 CHECKPOINT_VOLUME = config_str(monitor_config, "checkpoint_volume")
 INCLUDE_FAILED_REQUESTS = config_bool(monitor_config, "include_failed_requests")
 
-RESPONSE_JSON_FIELDS = monitor_config.get("response_json_fields") or []
-if not isinstance(RESPONSE_JSON_FIELDS, list):
-    raise ValueError("response_json_fields must be a list (or empty) in monitor.yaml")
-RESPONSE_JSON_FIELDS = [str(field) for field in RESPONSE_JSON_FIELDS]
+RESPONSE_JSON_FIELDS = parse_response_json_fields(monitor_config)
+PROMPT_FIELDS = parse_prompt_fields(monitor_config)
 
 payload_table_q = full_name(UC_CATALOG, UC_SCHEMA, INFERENCE_TABLE_NAME)
 unpacked_table_q = full_name(UC_CATALOG, UC_SCHEMA, UNPACKED_TABLE_NAME)
@@ -72,6 +80,10 @@ print(f"Payload (inference) table: {payload_table_q}")
 print(f"Unpacked requests table: {unpacked_table_q}")
 print(f"Streaming checkpoint: {checkpoint_path}")
 print(f"Response JSON fields: {RESPONSE_JSON_FIELDS or '(none — free-text responses)'}")
+print(
+    "Prompt fields: "
+    f"{[name for name, _ in PROMPT_FIELDS] or '(none — no feature extraction)'}"
+)
 
 # COMMAND ----------
 
@@ -218,18 +230,14 @@ def unpack_payloads(payloads: DataFrame) -> DataFrame:
     # Structured-output models: surface configured fields of the assistant's
     # JSON completion as top-level columns (null when the completion is not
     # valid JSON or the field is absent), so the monitor can profile them.
-    if RESPONSE_JSON_FIELDS:
-        response_fields_schema = T.StructType(
-            [T.StructField(field, T.StringType()) for field in RESPONSE_JSON_FIELDS]
-        )
-        unpacked = unpacked.withColumn(
-            "_response_fields", F.from_json(F.col("response_text"), response_fields_schema)
-        )
-        for field in RESPONSE_JSON_FIELDS:
-            unpacked = unpacked.withColumn(
-                f"response_{field}", F.col(f"_response_fields.{field}")
-            )
-        unpacked = unpacked.drop("_response_fields")
+    unpacked = with_response_fields(unpacked, RESPONSE_JSON_FIELDS, "response_text")
+
+    # Transaction features: parse the prompt's fixed "- key: value" block
+    # into typed txn_* columns (null when the template does not match), so
+    # the monitor can measure true input-feature drift. The baseline builder
+    # in 02_create_quality_monitor.py applies the same extraction to the SFT
+    # records, making baseline drift a serving-vs-training comparison.
+    unpacked = with_prompt_fields(unpacked, PROMPT_FIELDS)
 
     return unpacked
 
@@ -290,7 +298,7 @@ else:
 # MAGIC
 # MAGIC The payload table is read as a stream and drained with `trigger(availableNow=True)`: the run picks up exactly the rows added since the checkpoint's last position, appends their unpacked form, and exits — safe to schedule as a recurring job.
 # MAGIC
-# MAGIC To reprocess from scratch (for example after changing `response_json_fields`), delete the checkpoint directory and the unpacked table, then rerun.
+# MAGIC To reprocess from scratch (for example after changing `response_json_fields` or `prompt_fields`, which change the table's schema), delete the checkpoint directory and the unpacked table, then rerun.
 
 # COMMAND ----------
 
@@ -322,10 +330,19 @@ summary_columns = [
     F.avg("execution_duration_ms").alias("avg_execution_ms"),
     F.avg("completion_tokens").alias("avg_completion_tokens"),
 ]
+# Null rates of the extracted columns are the contract-integrity signals:
+# response_* nulls mean the model broke its JSON output format, txn_* nulls
+# mean the prompt template no longer matches prompt_fields.
 for field in RESPONSE_JSON_FIELDS:
     summary_columns.append(
-        F.avg(F.col(f"response_{field}").isNull().cast("int")).alias(
-            f"response_{field}_null_rate"
+        F.avg(F.col(f"{RESPONSE_COLUMN_PREFIX}{field}").isNull().cast("int")).alias(
+            f"{RESPONSE_COLUMN_PREFIX}{field}_null_rate"
+        )
+    )
+for name, _ in PROMPT_FIELDS:
+    summary_columns.append(
+        F.avg(F.col(f"{PROMPT_COLUMN_PREFIX}{name}").isNull().cast("int")).alias(
+            f"{PROMPT_COLUMN_PREFIX}{name}_null_rate"
         )
     )
 
@@ -338,4 +355,4 @@ display(unpacked_df.orderBy(F.col("request_time").desc()).limit(10))
 # MAGIC %md
 # MAGIC ## Next steps
 # MAGIC
-# MAGIC The unpacked table now holds one analysis-ready row per serving request. The next module in this stage creates a data-quality monitor (data profiling) over it — tracking request volume, latency, token usage, and drift in the extracted response fields — and refreshes its metrics on a schedule.
+# MAGIC The unpacked table now holds one analysis-ready row per serving request. `02_create_quality_monitor.py` builds the training-set baseline table and creates the data quality monitor over this table — profiling request volume, latency, token usage, the extracted `response_*` prediction fields, and the `txn_*` transaction features, with drift measured window-over-window and against the training baseline. Schedule this notebook and a monitor refresh together (unpack → refresh) so metrics never lag the data.

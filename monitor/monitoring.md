@@ -4,7 +4,14 @@ Design for the second module of the monitoring stage: a **Databricks data qualit
 monitor** (formerly Lakehouse Monitoring,
 [docs](https://learn.microsoft.com/en-us/azure/databricks/data-governance/unity-catalog/data-quality-monitoring/))
 over the unpacked requests table that `monitor/01_unpack_inference_table.py`
-produces. The model is treated as a **classifier**: every request/response pair
+produces.
+
+> **Status: implemented.** The prompt-feature extraction lives in
+> `monitor/monitoring_utils.py` (shared plain module) and is wired into
+> module 01; the baseline build and monitor creation are
+> `monitor/02_create_quality_monitor.py`; the config keys are in
+> `monitor/monitor.yaml` and validated by `scripts/validate_config.py`.
+> Phase 2 (§9) and the SQL alerts (§11) remain to be set up per workspace. The model is treated as a **classifier**: every request/response pair
 follows the shape in `monitor/example_inputs.py` — a single user message whose
 prompt always ends with a fixed transaction block:
 
@@ -221,25 +228,36 @@ prompts use the **same transaction template** as serving traffic, the baseline
 carries the training-time *feature* distribution, not just the label
 distribution.
 
-`monitor/02_create_quality_monitor.py` builds `<unpacked_table>_baseline` from
-the SFT table (`fraud_sft_dataset`, the same table training and the load test
-read):
+`monitor/02_create_quality_monitor.py` builds the baseline table
+(`baseline_table` in `monitor.yaml`) from the SFT table (`sft_table` in
+`monitor.yaml`, agreement-checked against setup/train — the same table
+training and the load test read):
 
-1. Parse the `prompt` column with the **same** `prompt_fields` extraction from
+1. Sample the SFT records (`baseline_sample_fraction`, seeded so reruns are
+   stable) — distribution baselines need far fewer rows than training does,
+   and the SFT table can run to tens of millions of rows.
+2. Parse the `prompt` column with the **same** `prompt_fields` extraction from
    `monitoring_utils.py` (§4) → `txn_amount_usd`, `txn_use_chip`, ... columns.
    Baseline feature drift is therefore covariate shift measured against exactly
    what the model saw in training.
-2. Parse `assistant_response` with `from_json` using the same
-   `response_json_fields` schema module 01 uses → `response_risk`,
-   `response_action` columns.
-3. Add `served_entity_id = 'training_baseline'` — the baseline must carry the
-   `model_id_col`. Baseline drift is computed only for columns present in both
-   tables; columns with no training-time analogue (`prompt_tokens`,
-   `execution_duration_ms`, `finish_reason`, ...) are simply absent from the
-   baseline and skipped.
-4. Overwrite the baseline table on every run of module 02, mirroring the
+3. Parse `assistant_response` with the same `response_json_fields` schema
+   module 01 uses → `response_risk`, `response_action` columns.
+4. Keep `prompt`, rename `assistant_response` → `response_text`, and add a
+   synthetic `finish_reason = 'stop'` plus
+   `served_entity_id = 'training_baseline'` (the monitor's `model_id_col`) —
+   so **every column the custom metrics reference exists on both sides**, and
+   the baseline values of those metrics are the healthy reference (≈0 JSON
+   breakage, ≈0 truncation). Columns with no training-time analogue
+   (`prompt_tokens`, `execution_duration_ms`, ...) are simply absent from the
+   baseline; the monitor skips them for baseline drift.
+5. Overwrite the baseline table on every run of module 02, mirroring the
    pipeline's overwrite-on-rerun convention — after a retrain on new data,
-   rerunning module 02 refreshes the baseline to match.
+   rerunning module 02 refreshes the baseline to match. The run fails fast if
+   the extraction produces a fully-null prediction column or fully-null
+   `txn_*` columns (a baseline that parsed nothing would make every drift
+   comparison meaningless), and if the unpacked table lacks columns the
+   baseline derives (module 01 predates the current field configuration —
+   delete its checkpoint and table and rerun it).
 
 ## 7. Custom metrics — contract-integrity signals
 
@@ -253,7 +271,7 @@ Built-in profiling covers distributions; the SLM-specific breakage signals are
 | `prompt_parse_failure_rate` | `avg(CASE WHEN prompt IS NOT NULL AND txn_amount_usd IS NULL AND txn_use_chip IS NULL AND txn_merchant_state IS NULL THEN 1.0 ELSE 0.0 END)` *(all-fields-null test generated from `prompt_fields`)* | The prompt template changed or clients send free-form prompts — feature extraction (and therefore feature-drift monitoring) has gone blind. Per-field `percent_null` catches partial template changes (one renamed field). |
 | `invalid_risk_rate` | `avg(CASE WHEN response_risk IS NOT NULL AND response_risk NOT IN ('legitimate','suspicious','likely_fraud') THEN 1.0 ELSE 0.0 END)` | Out-of-vocabulary labels. The value list comes from `expected_prediction_values` in `monitor.yaml`, not hardcoded. |
 | `truncation_rate` | `avg(CASE WHEN finish_reason = 'length' THEN 1.0 ELSE 0.0 END)` | Hitting `max_tokens` — reasoning leakage or verbosity regressions (the example payload finishes with `stop` at 28 completion tokens against `max_tokens: 64`; healthy traffic should stay there). |
-| `likely_fraud_rate` | `avg(CASE WHEN response_risk = 'likely_fraud' THEN 1.0 ELSE 0.0 END)` | The business-level block rate as a single scalar time series — the number an on-call person checks first. |
+| `<prediction>_<value>_rate` (one per `expected_prediction_values` entry, e.g. `risk_likely_fraud_rate`) | `avg(CASE WHEN response_risk = '<value>' THEN 1.0 ELSE 0.0 END)` | Each class as a single scalar time series — for the fraud example, `risk_likely_fraud_rate` is the business-level block rate an on-call person checks first. |
 
 `completion_tokens` and `response_chars` need no custom metric: numeric profile
 stats plus drift tests already flag verbosity creep.
@@ -362,7 +380,7 @@ WHERE column_name = ':table'
   AND count = 0;
 ```
 
-A fifth alert on `likely_fraud_rate` (both absolute bounds and
+A fifth alert on `risk_likely_fraud_rate` (both absolute bounds and
 consecutive-window drift) guards the business metric directly. Reading alerts 1
 and 2 together disambiguates cause: both firing points at the world changing;
 alert 2 alone points at the model or its serving stack.
@@ -393,55 +411,70 @@ prompt_fields:
 # ---- 02_create_quality_monitor.py ----
 # Prediction field: must be one of response_json_fields above.
 prediction_field: risk
-# Closed vocabulary for the prediction; drives the invalid-value custom metric.
+# Closed vocabulary for the prediction; drives the invalid-value custom
+# metric and one per-class rate metric per value.
 expected_prediction_values: [legitimate, suspicious, likely_fraud]
-# Extracted response fields to slice profile metrics by (response_<field>).
+# Extracted fields to slice profile metrics by: response_json_fields entries
+# map to response_<field>, prompt_fields entries to txn_<field>.
 slicing_fields: [action]
 # Monitor windows; each granularity adds refresh cost.
 granularities: ["1 day"]
-# Baseline drift source: the SFT table training read. Both its prompt column
-# (feature baseline) and assistant_response (label baseline) are parsed.
-# Must match sft_table in setup/train/load-test configs (validate_config.py).
-sft_table: fraud_sft_dataset
-# Derived baseline table name (overwritten on each run of module 02).
+# Baseline table name (overwritten on each run of module 02). The baseline
+# source is monitor.yaml's own sft_table, agreement-checked against
+# setup/train by scripts/validate_config.py so the baseline cannot point at
+# a different table than training read.
 baseline_table: qwen3_4b_instruct_finetuned_requests_baseline
+# Fraction of the SFT table sampled into the baseline (seeded).
+baseline_sample_fraction: 0.05
 # Where metrics tables land; empty = same catalog.schema as the monitored table.
 monitor_output_schema: ""
 # Phase 2: ground-truth column joined into the unpacked table; empty = unset.
 label_field: ""
 ```
 
-### New / changed files
+### Files (implemented)
 
 - `monitor/monitoring_utils.py` — **plain Python module** (no notebook header;
-  same precedent as `train/train.py`): builds the `txn_*` extraction expressions
-  from `prompt_fields`, shared by modules 01 and 02 so serving and baseline
-  tables parse identically. Documented as a notebook-format exception in
-  CLAUDE.md.
+  same precedent as `train/train.py`): the `txn_*`/`response_*` extraction
+  helpers plus `parse_quality_monitor_config()`, shared by modules 01 and 02 so
+  serving and baseline tables parse identically. pyspark imports stay inside
+  the DataFrame helpers so `scripts/validate_config.py` can import the parsers
+  in CI (where only pyyaml is installed). Documented as a notebook-format
+  exception in CLAUDE.md.
 - `monitor/01_unpack_inference_table.py` — extended with the prompt-feature
   extraction (§4). Schema change ⇒ existing deployments delete the checkpoint
   and unpacked table and reprocess.
-- `monitor/02_create_quality_monitor.py` — new Databricks notebook (serverless
+- `monitor/02_create_quality_monitor.py` — Databricks notebook (serverless
   CPU): builds the baseline table (features + labels) from the SFT table,
-  creates-or-updates the monitor, triggers the first refresh, prints the
-  dashboard link. Imports shared helpers from `train/training_utils.py` via
-  `sys.path`, like module 01.
-- *(Phase 2)* `monitor/03_join_ground_truth.py` — label MERGE task.
+  creates-or-updates the monitor idempotently (keeping the existing dashboard
+  on update), waits for `ACTIVE`, triggers a refresh, and prints the metrics
+  table names and dashboard pointer.
+- *(Phase 2, future)* `monitor/03_join_ground_truth.py` — label MERGE task.
 
-### Cross-file contract updates (`scripts/validate_config.py`)
+### Validation (`scripts/validate_config.py`, implemented)
 
-- `monitor.yaml`'s `sft_table` must equal `sft_table` in `setup.yaml`,
-  `train.yaml`, and `serving_load_test.yaml` (the baseline must come from the
-  same table training read).
-- `prompt_fields` entries must have a non-empty `name` and a `type` in
-  `{string, int, double, timestamp}`; names must be unique and must not collide
-  with `response_json_fields` or the built-in unpacked columns.
-- `prompt_fields` names should be a subset of `setup.yaml`'s prompt-template
-  fields (the columns `setup/02_stage_training_data.py` concatenates) — warn on
-  mismatch, since a field absent from the template will be 100% null.
-- `prediction_field` must be a member of `response_json_fields`.
-- `slicing_fields` must reference extracted columns (`response_*` or `txn_*`).
-- `expected_prediction_values` must be non-empty when `prediction_field` is set.
+The validator imports `monitoring_utils.parse_quality_monitor_config` — the
+same parser both notebooks use — so every rule below fails in CI exactly as it
+would fail at runtime:
+
+- `prompt_fields` entries must be `{name, type}` mappings with identifier-safe
+  unique names and a `type` in `{string, int, double, timestamp}`;
+  `response_json_fields` must not use the reserved names `text`/`model`/`chars`
+  (built-in `response_*` columns).
+- `prediction_field` must be a member of `response_json_fields`;
+  `expected_prediction_values` must be a non-empty unique list.
+- `slicing_fields` must reference extracted fields (a `response_json_fields`
+  or `prompt_fields` entry); `granularities` must use supported window
+  spellings; `baseline_sample_fraction` must be in `(0, 1]`;
+  `baseline_table` is required.
+- **Warning (non-fatal)**: a `prompt_fields` name with no `- <name>: ` line in
+  `setup/02_stage_training_data.py`'s prompt template — the `txn_` column
+  would be 100% null on prompts built by this repo's setup stage. A warning
+  rather than an error because the template is example-specific.
+- catalog/schema live only in the repo-root `global.yaml` (the no-shadowing
+  check keeps stage YAMLs from re-introducing them); `sft_table` and the
+  payload-table name are stage-owned and agreement-checked by
+  `scripts/validate_config.py`.
 
 ### Permissions
 

@@ -5,30 +5,39 @@ Run from anywhere (no Databricks connection needed):
 
     python scripts/validate_config.py
 
-The repo-root global.yaml is the single source of truth for every parameter
-shared across the pipeline modules (setup, train+deploy, load test,
-monitor); each stage YAML holds only stage-specific keys. This script checks
-that structure before any workspace time is spent:
+The repo-root global.yaml holds the Unity Catalog identity every module
+shares (catalog, schema); all other parameters are stage-owned in each
+module's YAML, with the cross-stage agreements validated here before any
+workspace time is spent:
 
-1. global.yaml parses and defines every required shared key (catalog,
-   schema, experiment_name, source_table, sft_table, sft_volume,
-   uc_model_name, model_name, endpoint_name, inference_table_prefix;
-   model_volume_path may be empty).
+1. global.yaml parses, defines catalog and schema, and no stage YAML
+   re-introduces either key (shadowed copies would be silently ignored by
+   the notebooks and drift).
 2. train/train.yaml's training_config and deploy_config sections load
    through the real loaders (types, required keys, lists, metric goal,
    serving_requirements_file resolution) — which also proves global.yaml
    resolves from the train module.
-3. No stage YAML re-introduces a global key (shadowed copies would be
-   silently ignored by the notebooks and drift).
-4. global.yaml's experiment_name equals train.yaml's top-level
-   experiment_name (the AIR CLI schema requires the key there too — the one
-   unavoidable duplication).
-5. When model_volume_path is set, setup.yaml's models list contains a
-   matching entry (volume_path == model_volume_path and huggingface_path ==
-   model_name), so the weights setup downloads are the weights training loads.
-6. experiment_name stays alphanumeric/-/_ (it becomes a Jobs API task key).
-7. Every `-r <file>` reference in train.yaml's environment resolves.
-8. The monitor stage's own keys are present and well-typed.
+3. Cross-stage values agree: setup.yaml's source_table/sft_table/sft_volume
+   with train.yaml's training_config; sft_table also with the load test and
+   the monitor (its baseline source); endpoint_name between train.yaml's
+   deploy_config and the load test; and monitor.yaml's inference_table
+   equals deploy_config's inference_table_prefix + '_payload' (the monitor
+   must unpack the table the endpoint actually writes).
+4. When model_volume_path is set (training_config), setup.yaml's models
+   list contains a matching entry (volume_path == model_volume_path and
+   huggingface_path == model_name), so the weights setup downloads are the
+   weights training loads.
+5. experiment_name (train.yaml top level — the key the AIR CLI reads) stays
+   alphanumeric/-/_ (it becomes a Jobs API task key).
+6. Every `-r <file>` reference in train.yaml's environment resolves.
+7. The monitor stage's own keys are present and well-typed: the field
+   extraction and quality-monitor settings load through the real parser
+   (monitor/monitoring_utils.parse_quality_monitor_config — field name and
+   type validity, prediction_field membership in response_json_fields,
+   slicing_fields resolving to extracted fields, granularity spellings,
+   baseline settings). A prompt_fields entry missing from the prompt
+   template built by setup/02_stage_training_data.py warns (the txn_ column
+   would be 100% null) without failing — the template is example-specific.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "train"))
+sys.path.insert(0, str(REPO_ROOT / "monitor"))
 
 GLOBAL_YAML = "global.yaml"
 SETUP_YAML = "setup/setup.yaml"
@@ -49,42 +59,27 @@ MONITOR_YAML = "monitor/monitor.yaml"
 TRAIN_YAML = "train/train.yaml"
 
 # Keys owned by global.yaml. Stage YAMLs must not redefine them (the
-# notebooks would ignore the copies). Includes retired aliases (`table`,
-# `inference_table`) so old-style keys cannot creep back in.
+# notebooks read them only from global.yaml, so copies would be ignored).
 GLOBAL_KEYS = {
     "catalog",
     "schema",
-    "experiment_name",
-    "source_table",
-    "table",
-    "sft_table",
-    "sft_volume",
-    "uc_model_name",
-    "model_name",
-    "model_volume_path",
-    "endpoint_name",
-    "inference_table_prefix",
-    "inference_table",
 }
 
 REQUIRED_GLOBAL_KEYS = (
     "catalog",
     "schema",
-    "experiment_name",
-    "source_table",
-    "sft_table",
-    "sft_volume",
-    "uc_model_name",
-    "model_name",
-    "endpoint_name",
-    "inference_table_prefix",
 )
 
 errors: list[str] = []
+warnings: list[str] = []
 
 
 def fail(message: str) -> None:
     errors.append(message)
+
+
+def warn(message: str) -> None:
+    warnings.append(message)
 
 
 def load_yaml(path: Path) -> dict:
@@ -130,6 +125,79 @@ def check_deploy_context() -> dict:
         return {}
 
 
+def stage_value(config: dict, key: str, location: str) -> str | None:
+    """Fetch a required stage-YAML key, recording an error when missing."""
+    value = str(config.get(key) or "").strip()
+    if not value:
+        fail(f"{location}: missing required key `{key}`.")
+        return None
+    return value
+
+
+def check_agreement(description: str, entries: list[tuple[str, str | None]]) -> None:
+    """All present values must be identical (missing ones already errored)."""
+    present = [(location, value) for location, value in entries if value is not None]
+    if len({value for _, value in present}) > 1:
+        details = "; ".join(f"{location} has {value!r}" for location, value in present)
+        fail(
+            f"{description} must agree across files ({details}) — the stages "
+            "would otherwise read/write different Unity Catalog objects."
+        )
+
+
+def check_stage_agreements(
+    setup_config: dict,
+    load_test_config: dict,
+    monitor_config: dict,
+    training_context: dict,
+    deploy_context: dict,
+) -> None:
+    check_agreement(
+        "source_table",
+        [
+            (SETUP_YAML, stage_value(setup_config, "source_table", SETUP_YAML)),
+            (TRAIN_YAML, training_context.get("SOURCE_TABLE_NAME")),
+        ],
+    )
+    check_agreement(
+        "sft_table",
+        [
+            (SETUP_YAML, stage_value(setup_config, "sft_table", SETUP_YAML)),
+            (LOAD_TEST_YAML, stage_value(load_test_config, "sft_table", LOAD_TEST_YAML)),
+            (MONITOR_YAML, stage_value(monitor_config, "sft_table", MONITOR_YAML)),
+            (TRAIN_YAML, training_context.get("SFT_TABLE_NAME")),
+        ],
+    )
+    check_agreement(
+        "sft_volume",
+        [
+            (SETUP_YAML, stage_value(setup_config, "sft_volume", SETUP_YAML)),
+            (TRAIN_YAML, training_context.get("SFT_VOLUME")),
+        ],
+    )
+    check_agreement(
+        "endpoint_name",
+        [
+            (f"{TRAIN_YAML} (deploy_config)", deploy_context.get("ENDPOINT_NAME")),
+            (LOAD_TEST_YAML, stage_value(load_test_config, "endpoint_name", LOAD_TEST_YAML)),
+        ],
+    )
+
+    # Deployment always enables inference logging to <prefix>_payload; the
+    # monitor must unpack that exact table.
+    prefix = str(deploy_context.get("INFERENCE_TABLE_PREFIX") or "").strip()
+    monitor_table = str(monitor_config.get("inference_table") or "").strip()
+    if not monitor_table:
+        fail(f"{MONITOR_YAML}: missing required key `inference_table`.")
+    elif prefix and monitor_table != f"{prefix}_payload":
+        fail(
+            f"{MONITOR_YAML}: inference_table is {monitor_table!r} but the "
+            f"endpoint logs to {prefix + '_payload'!r} ({TRAIN_YAML} "
+            "deploy_config's inference_table_prefix + '_payload') — the monitor "
+            "would unpack a table the endpoint never writes."
+        )
+
+
 def check_no_global_shadowing(path: str, config: dict) -> None:
     shadowed = sorted(GLOBAL_KEYS & set(config))
     if shadowed:
@@ -140,33 +208,21 @@ def check_no_global_shadowing(path: str, config: dict) -> None:
         )
 
 
-def check_experiment_name_duplicate(global_config: dict) -> None:
-    """The AIR CLI schema requires experiment_name at train.yaml's top level;
-    it must equal global.yaml's copy."""
+def check_experiment_name() -> None:
+    """train.yaml's top-level experiment_name is the key the AIR CLI reads
+    and the loaders resolve for notebook runs."""
     train_yaml = load_yaml(REPO_ROOT / "train" / "train.yaml")
-    workload_experiment = str(train_yaml.get("experiment_name") or "").strip()
-    global_experiment = str(global_config.get("experiment_name") or "").strip()
-    if not workload_experiment:
+    experiment_name = str(train_yaml.get("experiment_name") or "").strip()
+    if not experiment_name:
         fail(f"{TRAIN_YAML}: missing top-level experiment_name (required by the AIR CLI).")
-    elif global_experiment and workload_experiment != global_experiment:
+    elif not re.fullmatch(r"[A-Za-z0-9_-]+", experiment_name):
         fail(
-            f"experiment_name mismatch: {GLOBAL_YAML} has {global_experiment!r} "
-            f"but {TRAIN_YAML}'s top-level key has {workload_experiment!r} — "
-            "AIR CLI runs would log to a different experiment than the one "
-            "deployment searches. Keep the two equal."
-        )
-
-
-def check_experiment_name_charset(global_config: dict) -> None:
-    experiment_name = str(global_config.get("experiment_name") or "").strip()
-    if experiment_name and not re.fullmatch(r"[A-Za-z0-9_-]+", experiment_name):
-        fail(
-            f"{GLOBAL_YAML}: experiment_name {experiment_name!r} must be "
+            f"{TRAIN_YAML}: experiment_name {experiment_name!r} must be "
             "alphanumeric/-/_ (it becomes a Jobs API task key under AIR)."
         )
 
 
-def check_models_contract(setup_config: dict, global_config: dict) -> None:
+def check_models_contract(setup_config: dict, training_context: dict) -> None:
     models = setup_config.get("models") or []
     if not isinstance(models, list) or not models:
         fail(f"{SETUP_YAML}: `models:` must be a non-empty list.")
@@ -191,19 +247,19 @@ def check_models_contract(setup_config: dict, global_config: dict) -> None:
             fail(f"{SETUP_YAML}: duplicate volume_path in models: {volume_path}")
         volume_paths[volume_path] = huggingface_path
 
-    model_volume_path = str(global_config.get("model_volume_path") or "").rstrip("/")
-    model_name = str(global_config.get("model_name") or "").strip()
+    model_volume_path = str(training_context.get("MODEL_VOLUME_PATH") or "").rstrip("/")
+    model_name = str(training_context.get("MODEL_NAME") or "").strip()
     if model_volume_path:
         if model_volume_path not in volume_paths:
             fail(
-                f"{GLOBAL_YAML}: model_volume_path ({model_volume_path}) has no "
+                f"{TRAIN_YAML}: model_volume_path ({model_volume_path}) has no "
                 f"matching volume_path in {SETUP_YAML}'s models list — training "
                 "would load weights setup never downloads."
             )
         elif volume_paths[model_volume_path] != model_name:
             fail(
                 f"{SETUP_YAML}: the models entry for {model_volume_path} downloads "
-                f"{volume_paths[model_volume_path]!r}, but {GLOBAL_YAML}'s model_name "
+                f"{volume_paths[model_volume_path]!r}, but {TRAIN_YAML}'s model_name "
                 f"is {model_name!r} — the snapshot would not match the training base model."
             )
 
@@ -232,9 +288,39 @@ def check_monitor_config(monitor_config: dict) -> None:
         if not str(monitor_config.get(key) or "").strip():
             fail(f"{MONITOR_YAML}: missing required key `{key}`.")
 
-    response_json_fields = monitor_config.get("response_json_fields")
-    if response_json_fields is not None and not isinstance(response_json_fields, list):
-        fail(f"{MONITOR_YAML}: response_json_fields must be a list (or omitted).")
+    # Exercise the real parser (the same one both monitor notebooks use) so
+    # field/type errors surface here instead of at workspace runtime.
+    from monitoring_utils import parse_quality_monitor_config
+
+    try:
+        monitor_settings = parse_quality_monitor_config(monitor_config)
+    except Exception as exc:
+        fail(f"{MONITOR_YAML}: parse_quality_monitor_config() failed: {exc}")
+        return
+
+    check_prompt_template_coverage(monitor_settings)
+
+
+def check_prompt_template_coverage(monitor_settings: dict) -> None:
+    """Warn when a prompt_fields entry is absent from the prompt template.
+
+    setup/02_stage_training_data.py builds the prompt with literal
+    "- <field>: " line prefixes; a prompt_fields name that never appears
+    there extracts a 100% null txn_ column. Warning, not error — the
+    template is example-specific and a customer's own prompts may differ.
+    """
+    staging_source_path = REPO_ROOT / "setup" / "02_stage_training_data.py"
+    if not staging_source_path.exists():
+        return
+    staging_source = staging_source_path.read_text(encoding="utf-8")
+    for name, _ in monitor_settings["prompt_fields"]:
+        if f"- {name}: " not in staging_source:
+            warn(
+                f"{MONITOR_YAML}: prompt_fields entry `{name}` has no "
+                f"'- {name}: ' line in setup/02_stage_training_data.py's "
+                "prompt template — its txn_ column will be 100% null on "
+                "prompts built by this repo's setup stage."
+            )
 
 
 def main() -> int:
@@ -253,13 +339,21 @@ def main() -> int:
     ):
         check_no_global_shadowing(path, config)
 
-    if global_config:
-        check_experiment_name_duplicate(global_config)
-        check_experiment_name_charset(global_config)
-        check_models_contract(setup_config, global_config)
+    if training_context and deploy_context:
+        check_stage_agreements(
+            setup_config, load_test_config, monitor_config, training_context, deploy_context
+        )
+    if training_context:
+        check_models_contract(setup_config, training_context)
+    check_experiment_name()
 
     check_environment_requirements()
     check_monitor_config(monitor_config)
+
+    if warnings:
+        print(f"Configuration warnings ({len(warnings)}):\n")
+        for index, message in enumerate(warnings, 1):
+            print(f"{index}. {message}\n")
 
     if errors:
         print(f"Configuration validation FAILED ({len(errors)} error(s)):\n")
