@@ -45,10 +45,16 @@ from training_utils import init_training_workspace, load_training_config
 
 # COMMAND ----------
 
-# load_training_config (defined in training_utils) parses train.yaml's training_config
+# Select the training implementation and its sibling config file:
+#   "train"      — Unsloth LoRA + DDP (default; the 4B worked example)
+#   "train_fsdp" — TRL + FSDP2 for models too large for one GPU
+#                  (gpt-oss-120b; see train_fsdp.yaml)
+TRAINING_MODULE = "train"
+
+# load_training_config parses the selected workload file's training_config
 # section, derives the UC names/paths, and returns one flat dict; binding it
-# into globals gives every later cell the same constants train.py uses.
-training_context = load_training_config()
+# into globals gives every later cell the same constants the module uses.
+training_context = load_training_config(f"{TRAINING_MODULE}.yaml")
 globals().update(training_context)
 
 print(f"Training config: {CONFIG_PATH}")
@@ -150,7 +156,7 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # MAGIC - Model registration and deployment are handled by `02_register_and_deploy.py` (next in this directory) after training completes.
 # MAGIC - GPU memory metrics are logged when CUDA is available, which helps compare the `gpus=1` and `gpus>1` runs.
 # MAGIC
-# MAGIC The training implementation lives in `train/train.py`, a plain Python module shared by two launchers: this notebook's `@distributed` cell and the AI Runtime CLI (`air run --file train.yaml`), which runs the same file standalone on serverless GPUs.
+# MAGIC The training implementation lives in `train/train.py`, a plain Python module shared by two launchers: this notebook's `@distributed` cell and the AI Runtime CLI (`air run --file train.yaml`), which runs the same file standalone on serverless GPUs. A sibling FSDP implementation (`train/train_fsdp.py` + `train_fsdp.yaml`, following the Databricks gpt-oss-120b tutorial) shards models too large for one GPU across the node — select it with `TRAINING_MODULE = "train_fsdp"` in the configuration cell below.
 
 # COMMAND ----------
 
@@ -189,7 +195,11 @@ def run_training_job():
     if NOTEBOOK_DIR not in sys.path:
         sys.path.insert(0, NOTEBOOK_DIR)
 
-    from train import run_rank_training
+    import importlib
+
+    # TRAINING_MODULE selects train (Unsloth DDP) or train_fsdp (TRL+FSDP2);
+    # both expose the same run_rank_training contract.
+    run_rank_training = importlib.import_module(TRAINING_MODULE).run_rank_training
 
     return run_rank_training(sample_fraction=TRAINING_SAMPLE_FRACTION)
 

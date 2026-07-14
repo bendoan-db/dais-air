@@ -1,0 +1,99 @@
+# AI Runtime CLI workload definition and configuration for the FSDP training
+# variant (train_fsdp.py) — TRL SFTTrainer + PyTorch FSDP2 for models too
+# large for single-GPU LoRA. The worked example targets openai/gpt-oss-120b
+# on 8xH100, following the Databricks tutorial:
+# https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-gpt-oss-120b-ddp-fsdp
+#
+# Submit from this directory with:
+#   air run --file train_fsdp.yaml --watch
+# Or run through the runner notebook by setting TRAINING_MODULE =
+# "train_fsdp" in 01_runner.py's configuration cell.
+#
+# Same schema and conventions as train.yaml: catalog/schema come from the
+# repo-root global.yaml; the training_config section here is this variant's
+# own stage config (scripts/validate_config.py exercises it through the same
+# loader). Registration/deployment reuse train.yaml's deploy_config — runs
+# land in the same experiment, so the deployment notebook's run selection
+# (or an explicit run_id) covers FSDP runs too. NOTE: registering a merged
+# 120B model requires correspondingly large registration/serving capacity —
+# the deploy stage's defaults are sized for the 4B example.
+
+# Same experiment as train.yaml so deploy-time best-run selection sees runs
+# from both variants. Must stay alphanumeric/-/_.
+experiment_name: air_hackathon
+environment:
+  version: '5'
+  # The consolidated requirements file also covers this variant: TRL, PEFT,
+  # accelerate, and transformers (Mxfp4Config needs >=4.55; the repo pins
+  # >=4.56,<5 for serving compatibility — the tutorial's transformers 5.x
+  # pin is NOT required for FSDP2).
+  dependencies:
+    - -r requirements.txt
+compute:
+  # gpt-oss-120b needs the full 8xH100 node: FSDP shards parameters,
+  # gradients, and optimizer states across all eight GPUs.
+  num_accelerators: 8
+  accelerator_type: 8xH100
+env_variables:
+  # Same databricks-connect placeholder workaround as train.yaml.
+  DATABRICKS_RUNTIME_VERSION: '15.4'
+code_source:
+  type: snapshot
+  snapshot:
+    # Repo root, so global.yaml travels with the code (same as train.yaml).
+    root_path: ..
+command: python $CODE_SOURCE_PATH/train/train_fsdp.py
+
+parameters:
+  training_config:
+    # Same staged SFT data as the DDP variant (must match setup.yaml;
+    # validated).
+    source_table: fraud_dataset
+    sft_table: fraud_sft_dataset
+    sft_volume: training_data
+    # Separate checkpoint tree and run naming from the 4B variant.
+    checkpoint_volume: gpt_oss_checkpoints
+    uc_model_name: gpt_oss_120b_finetuned
+
+    # ---- Base model ----
+    model_name: openai/gpt-oss-120b
+    # Strongly recommended for a 120B model: snapshot the weights to a UC
+    # volume once via setup/03 (add a models entry pairing
+    # openai/gpt-oss-120b with this path) instead of downloading ~240GB on
+    # every GPU worker. Empty = download from Hugging Face.
+    model_volume_path: ''
+
+    # ---- Training ----
+    max_seq_length: 2048
+    max_steps: 5
+    # Conservative for 120B (tutorial values): effective batch = 1 x 4 x 8
+    # GPUs = 32 sequences.
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 4
+    learning_rate: 1.5e-4
+    warmup_steps: 5
+    training_sample_fraction: 0.0001
+    # The FSDP module skips post-training generation evaluation (the final
+    # model is sharded across GPUs); keep this 0.
+    eval_sample_size: 0
+    seed: 3407
+
+    # LoRA adapter settings. ["all-linear"] is PEFT's shorthand for every
+    # linear layer; for gpt-oss models the module additionally adapts the
+    # MoE expert projections at rank 8 (rank_pattern/target_parameters).
+    lora_r: 32
+    lora_alpha: 32
+    lora_dropout: 0.0
+    lora_target_modules:
+      - all-linear
+
+    # Unused by train_fsdp.py (response-only masking is an Unsloth feature
+    # of the DDP path — this variant trains on the full rendered sequence);
+    # present because the shared loader requires them.
+    response_instruction_part: "<|im_start|>user\n"
+    response_part: "<|im_start|>assistant\n"
+
+    # GPUs for the runner notebook's @distributed cell when TRAINING_MODULE
+    # is "train_fsdp". A 120B model requires all eight H100s.
+    notebook_gpus: 8
+    notebook_gpu_type: H100

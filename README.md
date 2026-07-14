@@ -17,6 +17,8 @@ The repository ships with a complete worked example — classifying IBM TabForme
 | `train/02_register_and_deploy.py` | Databricks notebook that selects a training run (explicit `run_id` or best run by metric), merges its adapter, registers the model to Unity Catalog, and deploys the serving endpoint with inference logging. |
 | `train/train.py` | Standalone training module: imported by the notebook's `@distributed` cell and runnable directly via the AI Runtime CLI. |
 | `train/train.yaml` | AI Runtime CLI workload definition (`air run --file train.yaml`) plus the stage-specific configuration: training settings (`parameters.training_config`) and registration/serving settings (`parameters.deploy_config`). |
+| `train/train_fsdp.py` | FSDP training variant (TRL SFTTrainer + PyTorch FSDP2 + PEFT LoRA) for models too large for single-GPU LoRA — the worked example targets `openai/gpt-oss-120b` on 8xH100. Same run contract as `train.py`. |
+| `train/train_fsdp.yaml` | AI Runtime CLI workload definition for the FSDP variant (`air run --file train_fsdp.yaml`), sharing `deploy_config` and the experiment with `train.yaml`. |
 | `load_test/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
 | `load_test/serving_load_test.yaml` | Stage-specific load-test configuration: request rate, workers/concurrency, and the results table. |
 | `monitor/01_unpack_inference_table.py` | Databricks notebook that incrementally unpacks the endpoint's inference table (raw JSON payloads) into an analysis-ready Delta table for monitoring. |

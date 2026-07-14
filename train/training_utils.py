@@ -194,8 +194,14 @@ def stage_model_locally(source_dir: str) -> str:
     return str(destination)
 
 
-def load_training_config() -> dict:
+def load_training_config(config_filename: str = "train.yaml") -> dict:
     """Load the ``parameters.training_config`` section and derive shared names.
+
+    ``config_filename`` selects the workload file next to this module —
+    ``train.yaml`` (Unsloth LoRA DDP) by default, or ``train_fsdp.yaml`` for
+    the TRL+FSDP variant. Under an AIR CLI run, ``$HYPERPARAMETERS_PATH``
+    carries whichever workload file was submitted, so the filename only
+    matters for notebook and local execution.
 
     Each pipeline stage owns its full configuration so the modules run
     standalone; the values ``train.yaml`` shares with the setup and load-test
@@ -227,7 +233,7 @@ def load_training_config() -> dict:
         if "parameters" in loaded:
             workload_config = loaded
     else:
-        config_path, workload_config = load_yaml_config("train.yaml")
+        config_path, workload_config = load_yaml_config(config_filename)
         parameters = config_value(workload_config, "parameters")
     config = config_value(parameters, "training_config")
 

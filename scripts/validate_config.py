@@ -113,6 +113,50 @@ def check_training_config() -> dict:
         return {}
 
 
+def check_fsdp_training_context() -> dict:
+    """Exercise the loader against the FSDP variant's workload file."""
+    from training_utils import load_training_config
+
+    try:
+        return load_training_config("train_fsdp.yaml")
+    except Exception as exc:
+        fail(f"train/train_fsdp.yaml: load_training_config() failed: {exc}")
+        return {}
+
+
+def check_fsdp_agreements(fsdp_context: dict, setup_config: dict, training_context: dict) -> None:
+    """The FSDP variant trains the same staged data and must log to the same
+    experiment the deployment notebook searches."""
+    check_agreement(
+        "source_table (FSDP variant)",
+        [
+            (SETUP_YAML, str(setup_config.get("source_table") or "").strip() or None),
+            ("train/train_fsdp.yaml", fsdp_context.get("SOURCE_TABLE_NAME")),
+        ],
+    )
+    check_agreement(
+        "sft_table (FSDP variant)",
+        [
+            (SETUP_YAML, str(setup_config.get("sft_table") or "").strip() or None),
+            ("train/train_fsdp.yaml", fsdp_context.get("SFT_TABLE_NAME")),
+        ],
+    )
+    check_agreement(
+        "sft_volume (FSDP variant)",
+        [
+            (SETUP_YAML, str(setup_config.get("sft_volume") or "").strip() or None),
+            ("train/train_fsdp.yaml", fsdp_context.get("SFT_VOLUME")),
+        ],
+    )
+    check_agreement(
+        "experiment_name (deploy-time run selection covers both variants)",
+        [
+            (TRAIN_YAML, training_context.get("EXPERIMENT_NAME")),
+            ("train/train_fsdp.yaml", fsdp_context.get("EXPERIMENT_NAME")),
+        ],
+    )
+
+
 def check_deploy_context() -> dict:
     """Exercise the deploy loader; it validates types, presence, the metric
     goal, and serving_requirements_file resolution itself."""
@@ -265,9 +309,13 @@ def check_models_contract(setup_config: dict, training_context: dict) -> None:
 
 
 def check_environment_requirements() -> None:
-    """Every `-r <file>` entry in train.yaml's environment must resolve."""
-    train_yaml = load_yaml(REPO_ROOT / "train" / "train.yaml")
-    dependencies = (train_yaml.get("environment", {}) or {}).get("dependencies", []) or []
+    """Every `-r <file>` entry in the workload environments must resolve."""
+    dependencies = []
+    for workload_name in ("train.yaml", "train_fsdp.yaml"):
+        workload = load_yaml(REPO_ROOT / "train" / workload_name)
+        dependencies.extend(
+            (workload.get("environment", {}) or {}).get("dependencies", []) or []
+        )
     for dependency in dependencies:
         dependency = str(dependency).strip()
         if not dependency.startswith("-r"):
@@ -343,6 +391,9 @@ def main() -> int:
         check_stage_agreements(
             setup_config, load_test_config, monitor_config, training_context, deploy_context
         )
+    fsdp_context = check_fsdp_training_context()
+    if fsdp_context and training_context:
+        check_fsdp_agreements(fsdp_context, setup_config, training_context)
     if training_context:
         check_models_contract(setup_config, training_context)
     check_experiment_name()
