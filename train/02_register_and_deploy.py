@@ -352,6 +352,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
     from databricks.sdk.errors import NotFound, ResourceDoesNotExist
     from databricks.sdk.service.serving import (
         AiGatewayInferenceTableConfig,
+        AiGatewayUsageTrackingConfig,
         EndpointCoreConfigInput,
         Route,
         ServedEntityInput,
@@ -415,7 +416,10 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
     # monitoring stage depends on the captured requests, so the endpoint is
     # not considered deployed until its AI Gateway inference table is on.
     # put_ai_gateway is idempotent and covers both the create and update paths
-    # (update_config does not carry AI Gateway settings).
+    # (update_config does not carry AI Gateway settings). It REPLACES the whole
+    # AI Gateway config — any setting omitted here (or in a later put from the
+    # UI or SDK) is silently disabled, so usage tracking is pinned alongside
+    # inference logging.
     w.serving_endpoints.put_ai_gateway(
         name=ENDPOINT_NAME,
         inference_table_config=AiGatewayInferenceTableConfig(
@@ -424,6 +428,7 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
             table_name_prefix=INFERENCE_TABLE_PREFIX,
             enabled=True,
         ),
+        usage_tracking_config=AiGatewayUsageTrackingConfig(enabled=True),
     )
     inference_payload_table = f"{UC_CATALOG}.{UC_SCHEMA}.{INFERENCE_TABLE_PREFIX}_payload"
 

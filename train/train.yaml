@@ -163,7 +163,7 @@ parameters:
     # <catalog>.<schema>.<inference_table_prefix>_payload — monitor.yaml's
     # inference_table must equal that name (validated).
     endpoint_name: qwen3_4b_instruct_finetuned_v2
-    inference_table_prefix: qwen3_4b_instruct_finetuned
+    inference_table_prefix: qwen3_4b_instruct_finetuned_v2
     endpoint_description: 'Custom LLM endpoint serving the fine-tuned model from the AIR pipeline.'
     serving_workload_type: GPU_LARGE
     # Fixed provisioned capacity behind the endpoint (custom LLM serving
