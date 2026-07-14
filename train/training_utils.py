@@ -215,6 +215,7 @@ def load_training_config() -> dict:
     import os
 
     hyperparameters_path = os.environ.get("HYPERPARAMETERS_PATH")
+    workload_config: dict = {}
     if hyperparameters_path:
         config_path = Path(hyperparameters_path)
         with config_path.open("r", encoding="utf-8") as config_file:
@@ -223,27 +224,34 @@ def load_training_config() -> dict:
         # `parameters` dict, but v0.1.0b1 points it at the full workload
         # YAML — accept either shape.
         parameters = loaded.get("parameters", loaded)
+        if "parameters" in loaded:
+            workload_config = loaded
     else:
         config_path, workload_config = load_yaml_config("train.yaml")
         parameters = config_value(workload_config, "parameters")
     config = config_value(parameters, "training_config")
 
-    # Pipeline-wide identity comes from the repo-root global.yaml; the
-    # training_config section holds only training-stage keys.
+    # catalog/schema come from the repo-root global.yaml; every other key in
+    # this loader is stage-owned (training_config or the workload level).
     _, global_config = load_global_config()
     uc_catalog = config_str(global_config, "catalog")
     uc_schema = config_str(global_config, "schema")
-    source_table_name = config_str(global_config, "source_table")
-    sft_table_name = config_str(global_config, "sft_table")
-    sft_volume = config_str(global_config, "sft_volume")
-    uc_model_name = config_str(global_config, "uc_model_name")
-    model_name = config_str(global_config, "model_name")
+
+    source_table_name = config_str(config, "source_table")
+    sft_table_name = config_str(config, "sft_table")
+    sft_volume = config_str(config, "sft_volume")
+    uc_model_name = config_str(config, "uc_model_name")
+    model_name = config_str(config, "model_name")
     # Optional UC volume snapshot of the base weights; empty or missing means
     # download from Hugging Face by model_name.
-    model_volume_path = str(global_config.get("model_volume_path") or "").strip()
-    # The AIR CLI schema also requires experiment_name at train.yaml's top
-    # level; scripts/validate_config.py keeps the two copies equal.
-    experiment_name = config_str(global_config, "experiment_name")
+    model_volume_path = str(config.get("model_volume_path") or "").strip()
+    # The workspace experiment name comes from the workload-level
+    # experiment_name (the same value the AIR CLI uses); it is absent when
+    # HYPERPARAMETERS_PATH carries only the parameters dict, so fall back to
+    # a model-derived name.
+    experiment_name = str(
+        workload_config.get("experiment_name") or f"{uc_model_name}_finetuning"
+    ).strip()
 
     uc_volume = config_str(config, "checkpoint_volume")
     max_steps = config_int(config, "max_steps")
@@ -311,12 +319,11 @@ def load_deploy_config() -> dict:
     """Load ``parameters.deploy_config`` (registration/serving settings).
 
     The deployment notebook (``02_register_and_deploy.py``) shares
-    ``train.yaml`` with training. The pipeline-wide identity (catalog,
-    schema, experiment, uc_model_name, endpoint_name,
-    inference_table_prefix) comes from the repo-root ``global.yaml`` via
-    :func:`load_global_config`/:func:`load_training_config`;
-    ``deploy_config`` holds only the deployment-stage keys. Returns a flat
-    dict intended for ``globals().update(...)``, like the training loader.
+    ``train.yaml`` with training: catalog/schema come from the repo-root
+    ``global.yaml`` and the experiment from the workload level (both via
+    :func:`load_training_config`), while ``deploy_config`` holds the
+    deployment-stage keys. Returns a flat dict intended for
+    ``globals().update(...)``, like the training loader.
     """
     config_path, workload_config = load_yaml_config("train.yaml")
     parameters = config_value(workload_config, "parameters")
@@ -325,11 +332,10 @@ def load_deploy_config() -> dict:
     training_context = load_training_config()
     uc_catalog = training_context["UC_CATALOG"]
     uc_schema = training_context["UC_SCHEMA"]
-    uc_model_name = training_context["UC_MODEL_NAME"]
 
-    _, global_config = load_global_config()
-    endpoint_name = config_str(global_config, "endpoint_name")
-    inference_table_prefix = config_str(global_config, "inference_table_prefix")
+    uc_model_name = config_str(config, "uc_model_name")
+    endpoint_name = config_str(config, "endpoint_name")
+    inference_table_prefix = config_str(config, "inference_table_prefix")
 
     best_run_metric_goal = config_str(config, "best_run_metric_goal").lower()
     if best_run_metric_goal not in {"minimize", "maximize"}:

@@ -14,14 +14,19 @@
 # parameters.deploy_config holds the registration/serving settings read by
 # 02_register_and_deploy.py.
 #
-# Parameters shared across pipeline modules (catalog, schema, experiment,
-# table/volume/model/endpoint names) live in the repo-root global.yaml,
-# loaded through training_utils.load_global_config() — the sections below
-# hold only stage-specific keys. The code snapshot roots at the repository
-# (root_path: ..) so AIR CLI runs ship global.yaml alongside train/.
+# The Unity Catalog identity (catalog, schema) lives in the repo-root
+# global.yaml, loaded through training_utils.load_global_config(); the code
+# snapshot roots at the repository (root_path: ..) so AIR CLI runs ship
+# global.yaml alongside train/. Values shared with other stages must agree
+# across files and scripts/validate_config.py checks every agreement:
+# source_table/sft_table/sft_volume with setup/setup.yaml (sft_table also
+# with the load test and the monitor's baseline); endpoint_name
+# (deploy_config) with the load test; inference_table_prefix (deploy_config)
+# + '_payload' with monitor/monitor.yaml's inference_table.
 
-# The AIR CLI schema requires experiment_name here; keep it equal to
-# global.yaml's experiment_name (scripts/validate_config.py checks this).
+# The MLflow experiment for training runs and deploy-time best-run selection
+# (a bare name resolves to /Users/<current user>/<name>; the AIR CLI reads
+# this same key). Must stay alphanumeric/-/_.
 experiment_name: air_hackathon
 environment:
   version: '5'
@@ -56,9 +61,27 @@ command: python $CODE_SOURCE_PATH/train/train.py
 # Stage configuration, carried in the workload's `parameters` field.
 parameters:
   training_config:
-    # UC volume that receives adapters and checkpoints (training-stage only;
-    # the shared identity lives in global.yaml).
+    # Cleaned transaction table written by setup/01 and staged into the SFT
+    # table + parquet export by setup/02 (must match setup.yaml; validated).
+    source_table: fraud_dataset
+    sft_table: fraud_sft_dataset
+    # Volume holding the parquet shard export of the SFT table.
+    sft_volume: training_data
+    # UC volume that receives adapters and checkpoints.
     checkpoint_volume: qwen_checkpoints
+    # Names the training outputs (checkpoint directory and MLflow run names);
+    # deploy_config has its own uc_model_name for the registered model.
+    uc_model_name: qwen3_4b_instruct_finetuned
+
+    # ---- Base model ----
+    model_name: unsloth/Qwen3-4B-Instruct-2507
+    # Optional UC volume snapshot of the base model weights. When set
+    # (non-empty), training loads the model and tokenizer from this path
+    # instead of downloading from Hugging Face. Populate the volume by adding
+    # a matching entry (huggingface_path: model_name, volume_path: this path)
+    # to setup/setup.yaml's models list and running
+    # setup/03_download_base_model_weights.py.
+    model_volume_path: '/Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3-4b-instruct/'
 
     # ---- Training ----
     max_seq_length: 2048
@@ -98,8 +121,6 @@ parameters:
     notebook_gpu_type: H100
 
   # Registration and serving settings, read by 02_register_and_deploy.py.
-  # The registered-model name (uc_model_name), endpoint_name, and
-  # inference_table_prefix come from global.yaml.
   deploy_config:
     # ---- Run selection ----
     # MLflow run whose trained adapter should be registered. Leave empty to
@@ -113,6 +134,9 @@ parameters:
     best_run_metric_goal: minimize  # minimize | maximize
 
     # ---- Registration ----
+    # Registered-model name (training_config's uc_model_name above names the
+    # training outputs; they usually match).
+    uc_model_name: qwen3_4b_instruct_finetuned
     served_model_name: qwen3_4b_instruct_finetuned
     # Requirements file for the serving container — the consolidated
     # requirements.txt shared with training (transformers is pinned <5 there
@@ -126,6 +150,12 @@ parameters:
     vllm_gpu_memory_utilization: 0.9
 
     # ---- Serving endpoint ----
+    # Endpoint the load test targets (must match serving_load_test.yaml;
+    # validated). Inference logging always writes to
+    # <catalog>.<schema>.<inference_table_prefix>_payload — monitor.yaml's
+    # inference_table must equal that name (validated).
+    endpoint_name: qwen3_4b_instruct_finetuned
+    inference_table_prefix: qwen3_4b_instruct_finetuned
     endpoint_description: 'Custom LLM endpoint serving the fine-tuned model from the AIR pipeline.'
     serving_workload_type: GPU_MEDIUM
     # Fixed provisioned capacity behind the endpoint (custom LLM serving
