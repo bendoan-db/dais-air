@@ -30,7 +30,8 @@ environment:
   dependencies:
     - -r requirements.txt
 compute:
-  # gpt-oss-120b needs the full 8xH100 node: FSDP shards parameters,
+  # Sizes BOTH launch paths (AIR CLI and the runner notebook's @distributed
+  # cell). gpt-oss-120b needs the full 8xH100 node: FSDP shards parameters,
   # gradients, and optimizer states across all eight GPUs.
   num_accelerators: 8
   accelerator_type: 8xH100
@@ -93,7 +94,3 @@ parameters:
     response_instruction_part: "<|im_start|>user\n"
     response_part: "<|im_start|>assistant\n"
 
-    # GPUs for the runner notebook's @distributed cell when TRAINING_MODULE
-    # is "train_fsdp". A 120B model requires all eight H100s.
-    notebook_gpus: 8
-    notebook_gpu_type: H100

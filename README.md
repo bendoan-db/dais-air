@@ -50,7 +50,7 @@ Update before running:
   - `model_name` and `model_volume_path` (the base model and its optional volume snapshot)
   - training parameters: `max_steps`, batch size, learning rate, `training_sample_fraction`, and the LoRA settings (`lora_r`, `lora_alpha`, `lora_dropout`, `lora_target_modules`)
   - `response_instruction_part` / `response_part` — chat-template markers that must match the base model's template
-  - `notebook_gpus` / `notebook_gpu_type` — compute for the notebook training cell (the AIR CLI path uses the top-level `compute` block)
+  - the top-level `compute` block — sizes both the notebook training cell and AIR CLI runs (`num_accelerators`, `accelerator_type`)
   - deployment (`deploy_config` section): `run_id` (empty = auto-select) with `best_run_metric` / `best_run_metric_goal`, registration names (`uc_model_name`, `served_model_name`), vLLM settings, endpoint sizing (`serving_workload_type`, `serving_provisioned_concurrency`, `serving_scale_to_zero`), `serving_requirements_file` (the serving container's pinned environment), `inference_table_prefix` (inference logging is always enabled at deployment), and `endpoint_name`
 - `setup/setup.yaml` — `catalog`, `schema`, `table`, `sft_table`, and `sft_volume` (shared with `train.yaml`), plus stage-specific keys: dataset source URL and staging volume, SFT shard settings (`sft_shards`, `sft_shard_key_columns`), the Hugging Face `models` list to snapshot into volumes, and an optional secret reference for gated-model tokens
 - `load_test/serving_load_test.yaml` — `catalog`, `schema`, `sft_table` (shared), and `endpoint_name` (must match `train.yaml`'s `deploy_config`), plus load-generator settings: `target_qps`, `duration_seconds`, worker/concurrency settings, and the results table name

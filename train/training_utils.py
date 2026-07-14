@@ -194,6 +194,37 @@ def stage_model_locally(source_dir: str) -> str:
     return str(destination)
 
 
+def parse_compute_block(workload_config: dict) -> tuple[int, str]:
+    """Derive (gpus, gpu_type) for ``@distributed`` from the workload's
+    ``compute`` block, so the notebook and AIR CLI paths are sized by one
+    setting.
+
+    ``num_accelerators`` is authoritative for the count. ``accelerator_type``
+    accepts the AIR spellings (``GPU_8xH100``, ``8xH100``, ``GPU_1xA10``) or
+    a bare chip name (``H100``); when a count is embedded it must agree with
+    ``num_accelerators``.
+    """
+    import re
+
+    compute = workload_config.get("compute") or {}
+    gpus = int(compute.get("num_accelerators") or 1)
+    raw_accelerator_type = str(compute.get("accelerator_type") or "A10").strip()
+    chip = raw_accelerator_type
+    if chip.upper().startswith("GPU_"):
+        chip = chip[len("GPU_"):]
+    embedded_count_match = re.match(r"^(\d+)x(.+)$", chip, re.IGNORECASE)
+    if embedded_count_match:
+        embedded_count = int(embedded_count_match.group(1))
+        chip = embedded_count_match.group(2)
+        if embedded_count != gpus:
+            raise ValueError(
+                f"compute.accelerator_type {raw_accelerator_type!r} embeds "
+                f"{embedded_count} accelerators but num_accelerators is {gpus} "
+                "— make the two agree."
+            )
+    return gpus, chip
+
+
 def load_training_config(config_filename: str = "train.yaml") -> dict:
     """Load the ``parameters.training_config`` section and derive shared names.
 
@@ -261,6 +292,7 @@ def load_training_config(config_filename: str = "train.yaml") -> dict:
 
     uc_volume = config_str(config, "checkpoint_volume")
     max_steps = config_int(config, "max_steps")
+    notebook_gpus, notebook_gpu_type = parse_compute_block(workload_config)
     output_root = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume}/{uc_model_name}"
 
     lora_target_modules = config_value(config, "lora_target_modules")
@@ -299,10 +331,13 @@ def load_training_config(config_filename: str = "train.yaml") -> dict:
         "LORA_TARGET_MODULES": [str(module) for module in lora_target_modules],
         "RESPONSE_INSTRUCTION_PART": response_instruction_part,
         "RESPONSE_PART": response_part,
-        # GPUs for the runner notebook's @distributed cell; the AIR CLI path
-        # sizes compute from the workload-level `compute` block instead.
-        "NOTEBOOK_GPUS": config_int(config, "notebook_gpus"),
-        "NOTEBOOK_GPU_TYPE": config_str(config, "notebook_gpu_type"),
+        # The runner notebook's @distributed cell is sized from the same
+        # workload-level `compute` block the AIR CLI uses — one setting for
+        # both launch paths. (Defaults 1xA10 when HYPERPARAMETERS_PATH
+        # carries only the parameters dict; irrelevant there, since AIR
+        # already provisioned the compute.)
+        "NOTEBOOK_GPUS": notebook_gpus,
+        "NOTEBOOK_GPU_TYPE": notebook_gpu_type,
         "EXPERIMENT_NAME": experiment_name,
         "SEED": config_int(config, "seed"),
         "SFT_VOLUME": sft_volume,

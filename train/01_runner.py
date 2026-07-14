@@ -39,7 +39,7 @@ from training_utils import init_training_workspace, load_training_config
 # MAGIC - `model_volume_path` (optional) points at a Unity Catalog volume snapshot of the base model weights, populated by `setup/03_download_base_model_weights.py`; when set, the GPU workers load the model from the volume instead of downloading it from Hugging Face. Volume-hosted weights are first staged to node-local disk (once per node) because safetensors mmap reads through the volume FUSE mount are slow.
 # MAGIC - `max_steps`, batch size, learning rate, and the LoRA settings control the training cost and quality.
 # MAGIC - `training_sample_fraction` controls how much of the staged SFT data is used; the training cell reads it from the config and can override it inline for quick smoke runs.
-# MAGIC - `notebook_gpus` / `notebook_gpu_type` size the `@distributed` training cell. Start with 1 GPU to validate the workflow, then raise `notebook_gpus` to scale out — the training code is unchanged.
+# MAGIC - The workload-level `compute` block sizes the `@distributed` training cell and AIR CLI runs alike (`num_accelerators` → `gpus`, `accelerator_type`'s chip suffix → `gpu_type`). Start with 1 GPU to validate the workflow, then raise `num_accelerators` to scale out — the training code is unchanged.
 # MAGIC
 # MAGIC For a quick validation run, keep `max_steps` low. For a real fine-tune, increase `max_steps` (or train on the full data), and compare runs in MLflow.
 
@@ -164,7 +164,7 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # MAGIC ## Scale training by changing one config value
 # MAGIC
 # MAGIC This is the only training cell in the pipeline: a thin wrapper that imports `train.py` on each GPU worker and runs one rank of training.
-# MAGIC Run it first with `notebook_gpus: 1` to validate the workflow, then raise `notebook_gpus` in `train.yaml` (for example to `8`) and rerun the same cell to distribute training across multiple GPUs.
+# MAGIC Run it first with `compute.num_accelerators: 1` to validate the workflow, then raise it in the workload YAML (for example to `8`, with a matching `accelerator_type`) and rerun the same cell to distribute training across multiple GPUs.
 # MAGIC `TRAINING_SAMPLE_FRACTION` comes from `train.yaml`'s `training_sample_fraction`; override it inline below for a quick smoke run without editing the config.
 # MAGIC
 # MAGIC Each worker reads its rank-assigned `shard_id=N` parquet directories from the UC volume inside `run_rank_training`, so nothing large ships from the notebook driver to the GPU workers.
