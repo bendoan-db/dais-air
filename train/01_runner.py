@@ -82,7 +82,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC
 # MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime. 
 # MAGIC
-# MAGIC The workflow uses the IBM TabFormer credit-card dataset prepared by the setup notebooks: `setup/01_load_dataset.py` writes the cleaned transaction table, and `setup/02_stage_training_data.py` stages the raw records — split 90/10 into train/eval and hash-sharded — in a Unity Catalog volume. This notebook samples or shards the train-split rows, renders the prompt/response messages in the training loop with the model's own chat template, fine-tunes with Unsloth LoRA, and logs with MLflow; registration and serving are handled by the deployment notebook (`02_register_and_deploy.py`, next in this directory).
+# MAGIC The workflow uses the IBM TabFormer credit-card dataset prepared by the setup notebooks: `setup/01_load_dataset.py` writes the cleaned transaction table, and `setup/02_stage_training_data.py` stages the raw records — split 90/10 into train/eval and hash-sharded — in a Unity Catalog volume. `train/00_prep_sft.py` (previous in this directory) then renders those records into SFT prompt/response format in the SFT staging volume — **run it before this notebook**. This notebook samples or shards the train-split SFT rows, applies the model's own chat template in the training loop, fine-tunes with Unsloth LoRA, and logs with MLflow; registration and serving are handled by the deployment notebook (`02_register_and_deploy.py`, next in this directory).
 # MAGIC
 # MAGIC **Features demonstrated in this notebook**
 # MAGIC

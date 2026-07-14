@@ -242,17 +242,17 @@ def parse_compute_block(workload_config: dict) -> tuple[int, str]:
     return gpus, chip
 
 
-# ---- Fraud message formatting (shared by the training modules) --------------
-# Setup stages RAW transaction records (setup/02 writes no prompt text); the
-# training loop renders the chat messages so formatting follows the model
-# being trained — each training module applies its own tokenizer's chat
-# template to the messages built here. The prompt's "- key: value" block is a
+# ---- Fraud prompt/response rendering (single source of the SFT contract) ----
+# Setup stages RAW transaction records (setup/02 writes no prompt text).
+# train/00_prep_sft.py renders them into SFT prompt/response records with the
+# functions below (the load test renders live payloads with the same
+# functions), and the training loop applies the per-model step — the loaded
+# model's own chat template. The prompt's "- key: value" block is a
 # monitoring contract: monitor.yaml's prompt_fields are extracted by matching
 # these exact line prefixes (scripts/validate_config.py checks coverage
 # against this template).
 
-# The staged columns the renderers read (train.py selects exactly these into
-# its HF dataset before formatting).
+# The raw staged columns the renderers read.
 FRAUD_RECORD_COLUMNS = (
     "user_id_text",
     "card_id_text",
@@ -323,42 +323,32 @@ def render_fraud_response(record, suspicious_amount_threshold: float) -> str:
     )
 
 
-def build_fraud_messages(record, suspicious_amount_threshold: float) -> list[dict[str, str]]:
-    """One raw staged record → chat messages; the caller applies the model's
-    own chat template (Unsloth via apply_chat_template, TRL via its
-    conversational `messages` format)."""
-    return [
-        {"role": "user", "content": render_fraud_prompt(record)},
-        {
-            "role": "assistant",
-            "content": render_fraud_response(record, suspicious_amount_threshold),
-        },
-    ]
-
-
 # ---- Staged-export access (split=train|eval / shard_id=N parquet) -----------
 
 
-def split_shard_dirs(files_root: str, split: str) -> list[Path]:
-    """List the shard_id=N directories of one split of the staged export.
+def split_shard_dirs(files_root: str, split: str, hint: str | None = None) -> list[Path]:
+    """List the shard_id=N directories of one split of a staged export.
 
-    setup/02 writes the parquet export partitioned by split then shard
-    (``split=train/shard_id=N/``, ``split=eval/shard_id=N/``). Fails fast
-    with guidance — including when the export predates the train/eval split.
+    Both staged exports use this layout (``split=train/shard_id=N/``,
+    ``split=eval/shard_id=N/``): setup/02's raw-record export and
+    train/00_prep_sft.py's SFT staging. Fails fast with guidance — ``hint``
+    overrides the default (which assumes the training modules' SFT staging,
+    the only callers that reach this through the helpers below).
     """
+    hint = hint or (
+        "Run train/00_prep_sft.py first (after the setup notebooks) to render "
+        "and stage the SFT-format export."
+    )
     root = Path(files_root)
     shard_dirs = sorted((root / f"split={split}").glob("shard_id=*"))
     if not shard_dirs:
         if sorted(root.glob("shard_id=*")):
             raise FileNotFoundError(
                 f"{files_root} holds a pre-split export (shard_id=* directories "
-                "at the root). Rerun setup/02_stage_training_data.py to restage "
-                "the records with train/eval splits."
+                f"at the root) — it must be restaged with train/eval splits. {hint}"
             )
         raise FileNotFoundError(
-            f"No split={split} parquet shards found under {files_root}. Run "
-            "setup/02_stage_training_data.py first (after "
-            "setup/01_load_dataset.py) to stage and export the training records."
+            f"No split={split} parquet shards found under {files_root}. {hint}"
         )
     return shard_dirs
 
@@ -537,6 +527,7 @@ def load_training_config(config_filename: str = "train.yaml") -> dict:
     ).strip()
 
     uc_volume = config_str(config, "checkpoint_volume")
+    sft_staging_volume = config_str(config, "sft_staging_volume")
     max_steps = config_int(config, "max_steps")
     notebook_gpus, notebook_gpu_type = parse_compute_block(workload_config)
     output_root = f"/Volumes/{uc_catalog}/{uc_schema}/{uc_volume}/{uc_model_name}"
@@ -590,10 +581,15 @@ def load_training_config(config_filename: str = "train.yaml") -> dict:
         "EXPERIMENT_NAME": experiment_name,
         "SEED": config_int(config, "seed"),
         "SFT_VOLUME": sft_volume,
-        # Parquet export of the SFT table, written by setup per the AIR
-        # data-loading guidance; training reads these files instead of
-        # querying Delta through Spark on the GPU workers.
-        "SFT_FILES_DIR": f"/Volumes/{uc_catalog}/{uc_schema}/{sft_volume}/{sft_table_name}",
+        "SFT_STAGING_VOLUME": sft_staging_volume,
+        # Raw-record parquet export written by setup/02 (split=train|eval /
+        # shard_id=N) — the input train/00_prep_sft.py renders.
+        "RAW_SPLIT_FILES_DIR": f"/Volumes/{uc_catalog}/{uc_schema}/{sft_volume}/{sft_table_name}",
+        # SFT-format parquet staging written by train/00_prep_sft.py (rendered
+        # prompt/assistant_response records, same split/shard layout) — what
+        # the training loop reads instead of querying Delta through Spark on
+        # the GPU workers (per the AIR data-loading guidance).
+        "SFT_FILES_DIR": f"/Volumes/{uc_catalog}/{uc_schema}/{sft_staging_volume}/{sft_table_name}",
         "SOURCE_TABLE": f"{uc_catalog}.{uc_schema}.{source_table_name}",
         "SFT_TABLE": f"{uc_catalog}.{uc_schema}.{sft_table_name}",
         "OUTPUT_ROOT": output_root,
@@ -601,6 +597,7 @@ def load_training_config(config_filename: str = "train.yaml") -> dict:
         "TRAINING_RUN_NAME": f"{uc_model_name}-training-steps{max_steps}",
         "schema_q": full_name(uc_catalog, uc_schema),
         "volume_q": full_name(uc_catalog, uc_schema, uc_volume),
+        "sft_staging_volume_q": full_name(uc_catalog, uc_schema, sft_staging_volume),
         "source_table_q": full_name(uc_catalog, uc_schema, source_table_name),
         "sft_table_q": full_name(uc_catalog, uc_schema, sft_table_name),
     }

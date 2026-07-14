@@ -33,12 +33,9 @@ from pathlib import Path
 # environment's nvidia_cutlass_dsl package registers its own top-level `utils`
 # module once the torch/CUDA stack loads, which shadows any local utils.py.
 from training_utils import (
-    FRAUD_RECORD_COLUMNS,
     VOLUME_PATH_PREFIX,
-    build_fraud_messages,
     claim_rank_shard_files,
     load_training_config,
-    render_fraud_prompt,
     sample_eval_records,
     stage_model_locally,
 )
@@ -247,28 +244,30 @@ def train_qwen3_unsloth(
     save_artifacts = save_artifacts and is_main_process
 
     dataset = Dataset.from_pandas(
-        examples_pdf[list(FRAUD_RECORD_COLUMNS)],
+        examples_pdf[["prompt", "assistant_response"]],
         preserve_index=False,
     )
 
     model, tokenizer = load_unsloth_model(MODEL_LOAD_PATH, device_map=device_map)
 
-    # Message formatting happens here in the training loop, not in setup:
-    # build_fraud_messages renders the prompt/response text from the raw
-    # staged fields, and the loaded model's own chat template turns those
-    # messages into training text — so swapping the base model swaps the
-    # formatting with it.
+    # The SFT records are pre-rendered by train/00_prep_sft.py; the per-model
+    # formatting step — the loaded model's own chat template — is applied
+    # here in the training loop, so swapping the base model swaps the
+    # formatting without restaging the records.
     def formatting_prompts_func(examples):
-        column_names = list(examples.keys())
-        texts = []
-        for row_values in zip(*(examples[name] for name in column_names)):
-            record = dict(zip(column_names, row_values))
-            texts.append(
-                render_chat_messages(
-                    tokenizer,
-                    build_fraud_messages(record, SUSPICIOUS_AMOUNT_THRESHOLD),
-                )
+        texts = [
+            render_chat_messages(
+                tokenizer,
+                [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": assistant_response},
+                ],
             )
+            for prompt, assistant_response in zip(
+                examples["prompt"],
+                examples["assistant_response"],
+            )
+        ]
         return {"text": texts}
 
     dataset = dataset.map(
@@ -431,12 +430,6 @@ def train_qwen3_unsloth(
                 eval_pdf = sample_eval_records(
                     SFT_FILES_DIR, EVAL_SAMPLE_SIZE, SEED, stratify_column="is_fraud"
                 )
-                eval_pdf = eval_pdf.assign(
-                    prompt=[
-                        render_fraud_prompt(record)
-                        for record in eval_pdf.to_dict("records")
-                    ]
-                )
                 fraud_metrics = evaluate_fraud_classification(model, tokenizer, eval_pdf)
                 for metric_name, metric_value in fraud_metrics.items():
                     mlflow.log_metric(metric_name, float(metric_value))
@@ -501,9 +494,9 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     rank, world_size, local_rank = get_distributed_context()
     torch.cuda.set_device(local_rank)
 
-    # Read the staged records as parquet shard files from the UC volume
-    # instead of querying Delta through Spark on the GPU workers, per the AIR
-    # data-loading guidance for large Delta tables:
+    # Read the SFT records (rendered and staged by train/00_prep_sft.py) as
+    # parquet shard files from the UC volume instead of querying Delta
+    # through Spark on the GPU workers, per the AIR data-loading guidance:
     # https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
     # Training reads only the train split; the eval split feeds the
     # post-training fraud-classification evaluation on rank 0.

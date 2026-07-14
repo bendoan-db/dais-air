@@ -150,6 +150,13 @@ def check_fsdp_agreements(fsdp_context: dict, setup_config: dict, training_conte
         ],
     )
     check_agreement(
+        "sft_staging_volume (one 00_prep_sft.py staging serves both variants)",
+        [
+            (TRAIN_YAML, training_context.get("SFT_STAGING_VOLUME")),
+            ("train/train_fsdp.yaml", fsdp_context.get("SFT_STAGING_VOLUME")),
+        ],
+    )
+    check_agreement(
         "experiment_name (deploy-time run selection covers both variants)",
         [
             (TRAIN_YAML, training_context.get("EXPERIMENT_NAME")),

@@ -50,12 +50,27 @@ import pandas as pd
 
 from training_utils import (
     VOLUME_PATH_PREFIX,
-    build_fraud_messages,
     claim_rank_shard_files,
     load_training_config,
     sample_eval_records,
     stage_model_locally,
 )
+
+
+def conversational_records(records_pdf: "pd.DataFrame") -> list[dict]:
+    """SFT rows (pre-rendered by train/00_prep_sft.py) → TRL's conversational
+    format; SFTTrainer applies the model's own chat template to `messages`."""
+    return [
+        {
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": assistant_response},
+            ]
+        }
+        for prompt, assistant_response in zip(
+            records_pdf["prompt"], records_pdf["assistant_response"]
+        )
+    ]
 
 # Bind the shared configuration into module globals — the same names train.py
 # binds, sourced from train_fsdp.yaml instead of train.yaml.
@@ -217,31 +232,21 @@ def train_fsdp(
     mlflow.set_registry_uri("databricks-uc")
     is_main_process = rank == 0
 
-    # TRL's conversational format: SFTTrainer applies the model's own chat
-    # template to a `messages` column — the per-model formatting step,
-    # applied here in the training loop. The messages themselves are rendered
-    # from the raw staged fields (setup stages no prompt text). Full-sequence
-    # loss (response-only masking is an Unsloth feature of the DDP path).
-    dataset = Dataset.from_list(
-        [
-            {"messages": build_fraud_messages(record, SUSPICIOUS_AMOUNT_THRESHOLD)}
-            for record in examples_pdf.to_dict("records")
-        ]
-    )
+    # TRL's conversational format — the per-model formatting step (the
+    # model's own chat template) is applied by SFTTrainer inside the training
+    # loop; the prompt/response text itself is pre-rendered by
+    # train/00_prep_sft.py. Full-sequence loss (response-only masking is an
+    # Unsloth feature of the DDP path).
+    dataset = Dataset.from_list(conversational_records(examples_pdf))
 
-    # Eval-loss measurement on the staged eval split — forward passes on the
-    # sharded model are collective-safe, unlike generation. Every rank draws
-    # the identical seeded sample; the Trainer's distributed sampler then
-    # splits it across ranks.
+    # Eval-loss measurement on the SFT staging's eval split — forward passes
+    # on the sharded model are collective-safe, unlike generation. Every rank
+    # draws the identical seeded sample; the Trainer's distributed sampler
+    # then splits it across ranks.
     eval_dataset = None
     if EVAL_SAMPLE_SIZE > 0:
         eval_pdf = sample_eval_records(SFT_FILES_DIR, EVAL_SAMPLE_SIZE, SEED)
-        eval_dataset = Dataset.from_list(
-            [
-                {"messages": build_fraud_messages(record, SUSPICIOUS_AMOUNT_THRESHOLD)}
-                for record in eval_pdf.to_dict("records")
-            ]
-        )
+        eval_dataset = Dataset.from_list(conversational_records(eval_pdf))
 
     model, tokenizer = load_fsdp_model_and_tokenizer()
     model = get_peft_model(model, build_peft_config())
@@ -405,10 +410,10 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     rank, world_size, local_rank = get_distributed_context()
     torch.cuda.set_device(local_rank)
 
-    # Identical shard contract to train.py: claim the train split's
-    # shard_id=N parquet directories where N % world_size == rank, with
-    # two-level sampling; the eval split feeds the post-training eval-loss
-    # pass.
+    # Identical shard contract to train.py: claim the SFT staging's
+    # (train/00_prep_sft.py) split=train shard_id=N parquet directories where
+    # N % world_size == rank, with two-level sampling; the eval split feeds
+    # the post-training eval-loss pass.
     rank_files, within_shard_fraction = claim_rank_shard_files(
         SFT_FILES_DIR, "train", rank, world_size, sample_fraction, SEED
     )

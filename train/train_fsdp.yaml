@@ -53,6 +53,9 @@ parameters:
     source_table: fraud_dataset
     sft_table: fraud_sft_dataset
     sft_volume: training_data
+    # SFT-format staging written by train/00_prep_sft.py; must match
+    # train.yaml — one prep run serves both variants (validated).
+    sft_staging_volume: sft_staging
     # Separate checkpoint tree and run naming from the 4B variant.
     checkpoint_volume: gpt_oss_checkpoints
     uc_model_name: gpt_oss_120b_finetuned
