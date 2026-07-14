@@ -287,11 +287,47 @@ display(
 
 # COMMAND ----------
 
+example_input = """
+You are a fraud decision model for a credit-card transaction stream. Classify the transaction as legitimate, suspicious, or likely_fraud. Return only compact JSON with keys risk, action, and reason.
+
+Transaction:
+- user_id: 1683
+- card_id: 2
+- timestamp: 1991-08-03 02:27:00
+- amount_usd: 5.52
+- use_chip: Swipe Transaction
+- merchant_city: Irvington
+- merchant_state: NY
+- merchant_category_code: 5812
+- errors: none
+"""
+
+example_message = {
+        "messages": [
+            {
+                "role": "user",
+                "content": example_input,
+            }
+        ],
+        "max_tokens": 256,
+        "temperature": 0.0,
+        "enable_thinking":False
+    }
+
+print(example_message)
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Smoke test the deployed endpoint
 # MAGIC
 # MAGIC Send a small number of synchronous requests first.
 # MAGIC The full load test is skipped if the endpoint cannot successfully handle the basic chat payload.
+
+# COMMAND ----------
+
+test = build_chat_payload(example_input)
+test
 
 # COMMAND ----------
 

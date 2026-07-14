@@ -7,7 +7,7 @@
 
 # ---- 01_unpack_inference_table.py ----
 # Raw payload table written by the endpoint (AI Gateway inference table).
-inference_table: qwen3_4b_instruct_finetuned_payload
+inference_table: qwen3_4b_instruct_finetuned_v2_payload
 # Delta table receiving one unpacked row per request. Created on first run
 # with change data feed enabled (required for efficient incremental monitor
 # refreshes) and partitioned by request_date.

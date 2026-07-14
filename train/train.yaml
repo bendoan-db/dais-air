@@ -85,8 +85,8 @@ parameters:
     model_volume_path: '/Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3-4b-instruct/'
 
     # ---- Training ----
-    max_seq_length: 2048
-    max_steps: 5
+    max_seq_length: 8192
+    max_steps: 10
     per_device_train_batch_size: 48
     gradient_accumulation_steps: 4
     learning_rate: 2e-4
@@ -153,19 +153,19 @@ parameters:
     serving_requirements_file: requirements.txt
 
     # ---- vLLM entrypoint settings ----
-    vllm_dtype: float16
-    vllm_max_model_len: 2048
-    vllm_gpu_memory_utilization: 0.9
+    vllm_dtype: auto
+    vllm_max_model_len: 8192
+    vllm_gpu_memory_utilization: 0.8
 
     # ---- Serving endpoint ----
     # Endpoint the load test targets (must match serving_load_test.yaml;
     # validated). Inference logging always writes to
     # <catalog>.<schema>.<inference_table_prefix>_payload — monitor.yaml's
     # inference_table must equal that name (validated).
-    endpoint_name: qwen3_4b_instruct_finetuned
+    endpoint_name: qwen3_4b_instruct_finetuned_v2
     inference_table_prefix: qwen3_4b_instruct_finetuned
     endpoint_description: 'Custom LLM endpoint serving the fine-tuned model from the AIR pipeline.'
-    serving_workload_type: GPU_MEDIUM
+    serving_workload_type: GPU_LARGE
     # Fixed provisioned capacity behind the endpoint (custom LLM serving
     # does not autoscale during beta) — size for peak traffic before load
     # testing.

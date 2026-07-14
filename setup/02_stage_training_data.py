@@ -257,6 +257,10 @@ print(f"Overwrote SFT Delta table {full_sft_table_name}")
 
 # COMMAND ----------
 
+print(spark.table(full_sft_table_name))
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Export SFT records to a Unity Catalog volume as Parquet
 # MAGIC
