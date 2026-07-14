@@ -231,6 +231,10 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
         ],
         "max_tokens": 64,
         "temperature": 0.0,
+        # Keeps hybrid reasoning models (base Qwen3) from spending the
+        # max_tokens budget on a thinking block; no-op for templates
+        # without the flag. The load test sends the same kwargs.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     temp_dir = local_model_work_dir()

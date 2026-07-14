@@ -34,3 +34,9 @@ max_latency_samples_per_worker: 10000
 # tight cap raises endpoint throughput almost linearly and trims latency.
 max_tokens: 64
 temperature: 0.0
+# Send chat_template_kwargs.enable_thinking=false on every request. Hybrid
+# reasoning models (e.g. base Qwen3) default to thinking mode in vLLM's
+# serving-time chat template and emit a reasoning block before the JSON
+# answer, blowing the max_tokens budget and truncating the response. A
+# no-op for chat templates that don't read the flag.
+disable_thinking: true

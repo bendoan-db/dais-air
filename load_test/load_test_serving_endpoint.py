@@ -51,6 +51,7 @@ if TRAIN_MODULE_DIR not in sys.path:
     sys.path.insert(0, TRAIN_MODULE_DIR)
 
 from training_utils import (
+    config_bool,
     config_float,
     config_int,
     config_str,
@@ -102,6 +103,7 @@ MAX_LATENCY_SAMPLES_PER_WORKER = config_int(load_test_config, "max_latency_sampl
 
 MAX_TOKENS = config_int(load_test_config, "max_tokens")
 TEMPERATURE = config_float(load_test_config, "temperature")
+DISABLE_THINKING = config_bool(load_test_config, "disable_thinking")
 
 if TARGET_QPS <= 0:
     raise ValueError("target_qps must be greater than zero.")
@@ -233,6 +235,8 @@ if "READY" not in ready_state.upper():
 # MAGIC
 # MAGIC The load test uses prompts from the prepared SFT Delta table so the request shape matches the prompts used during fine-tuning.
 # MAGIC Each request sends a chat payload with one user message, plus deterministic generation settings.
+# MAGIC
+# MAGIC With `disable_thinking: true` (the default), every payload also carries `chat_template_kwargs: {"enable_thinking": false}` — vLLM forwards it into the model's chat template, keeping hybrid reasoning models (base Qwen3) from spending the entire `max_tokens` budget on a reasoning block before the JSON answer. This mirrors training, which renders its chat templates with `enable_thinking=False`.
 
 # COMMAND ----------
 
@@ -247,8 +251,8 @@ prompt_pdf = (
 if prompt_pdf.empty:
     raise ValueError(f"No prompt records were loaded from {UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}.")
 
-payload_templates = [
-    {
+def build_chat_payload(prompt: str) -> dict:
+    payload = {
         "messages": [
             {
                 "role": "user",
@@ -258,8 +262,17 @@ payload_templates = [
         "max_tokens": MAX_TOKENS,
         "temperature": TEMPERATURE,
     }
-    for prompt in prompt_pdf["prompt"].tolist()
-]
+    if DISABLE_THINKING:
+        # vLLM forwards chat_template_kwargs into the model's chat template.
+        # Qwen3 hybrid models read enable_thinking there and default it to
+        # True at serving time — a reasoning block then consumes the entire
+        # max_tokens budget before the JSON answer, truncating the response.
+        # Harmless for chat templates that don't use the variable.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
+    return payload
+
+
+payload_templates = [build_chat_payload(prompt) for prompt in prompt_pdf["prompt"].tolist()]
 
 display(
     pd.DataFrame(
