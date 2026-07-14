@@ -36,8 +36,9 @@ workspace time is spent:
    type validity, prediction_field membership in response_json_fields,
    slicing_fields resolving to extracted fields, granularity spellings,
    baseline settings). A prompt_fields entry missing from the prompt
-   template built by setup/02_stage_training_data.py warns (the txn_ column
-   would be 100% null) without failing — the template is example-specific.
+   template in train/training_utils.py's render_fraud_prompt warns (the
+   txn_ column would be 100% null) without failing — the template is
+   example-specific.
 """
 
 from __future__ import annotations
@@ -352,22 +353,23 @@ def check_monitor_config(monitor_config: dict) -> None:
 def check_prompt_template_coverage(monitor_settings: dict) -> None:
     """Warn when a prompt_fields entry is absent from the prompt template.
 
-    setup/02_stage_training_data.py builds the prompt with literal
-    "- <field>: " line prefixes; a prompt_fields name that never appears
-    there extracts a 100% null txn_ column. Warning, not error — the
+    train/training_utils.py's render_fraud_prompt (applied in the training
+    loop — setup stages raw records with no prompt text) builds the prompt
+    with literal "- <field>: " line prefixes; a prompt_fields name that never
+    appears there extracts a 100% null txn_ column. Warning, not error — the
     template is example-specific and a customer's own prompts may differ.
     """
-    staging_source_path = REPO_ROOT / "setup" / "02_stage_training_data.py"
-    if not staging_source_path.exists():
+    template_source_path = REPO_ROOT / "train" / "training_utils.py"
+    if not template_source_path.exists():
         return
-    staging_source = staging_source_path.read_text(encoding="utf-8")
+    template_source = template_source_path.read_text(encoding="utf-8")
     for name, _ in monitor_settings["prompt_fields"]:
-        if f"- {name}: " not in staging_source:
+        if f"- {name}: " not in template_source:
             warn(
                 f"{MONITOR_YAML}: prompt_fields entry `{name}` has no "
-                f"'- {name}: ' line in setup/02_stage_training_data.py's "
-                "prompt template — its txn_ column will be 100% null on "
-                "prompts built by this repo's setup stage."
+                f"'- {name}: ' line in train/training_utils.py's "
+                "render_fraud_prompt template — its txn_ column will be "
+                "100% null on prompts built by this repo's training stage."
             )
 
 

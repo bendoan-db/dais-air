@@ -15,8 +15,10 @@ Differences from ``train.py``:
   projections for gpt-oss models).
 - Full-sequence loss (response-only masking is an Unsloth feature of the DDP
   path).
-- No post-training generation evaluation: the final model is FSDP-sharded and
-  batched generation would require gathering it; set ``eval_sample_size: 0``.
+- Evaluation is eval-loss only: a single ``trainer.evaluate()`` pass over a
+  sample of the staged eval split after training. The generation-based
+  fraud-classification evaluation of the DDP path is unavailable — the final
+  model is FSDP-sharded and batched generation would require gathering it.
 
 Everything else preserves ``train.py``'s contract, so the runner and
 registration notebooks drive both implementations interchangeably: the same
@@ -46,7 +48,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from training_utils import VOLUME_PATH_PREFIX, load_training_config, stage_model_locally
+from training_utils import (
+    VOLUME_PATH_PREFIX,
+    build_fraud_messages,
+    claim_rank_shard_files,
+    load_training_config,
+    sample_eval_records,
+    stage_model_locally,
+)
 
 # Bind the shared configuration into module globals — the same names train.py
 # binds, sourced from train_fsdp.yaml instead of train.yaml.
@@ -208,29 +217,31 @@ def train_fsdp(
     mlflow.set_registry_uri("databricks-uc")
     is_main_process = rank == 0
 
-    if EVAL_SAMPLE_SIZE > 0 and is_main_process:
-        print(
-            "eval_sample_size > 0, but the FSDP module skips generation "
-            "evaluation (the final model is sharded across GPUs); set "
-            "eval_sample_size: 0 in train_fsdp.yaml to silence this note."
-        )
-
     # TRL's conversational format: SFTTrainer applies the model's own chat
-    # template to a `messages` column. Full-sequence loss (response-only
-    # masking is an Unsloth feature of the DDP path).
+    # template to a `messages` column — the per-model formatting step,
+    # applied here in the training loop. The messages themselves are rendered
+    # from the raw staged fields (setup stages no prompt text). Full-sequence
+    # loss (response-only masking is an Unsloth feature of the DDP path).
     dataset = Dataset.from_list(
         [
-            {
-                "messages": [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": assistant_response},
-                ]
-            }
-            for prompt, assistant_response in zip(
-                examples_pdf["prompt"], examples_pdf["assistant_response"]
-            )
+            {"messages": build_fraud_messages(record, SUSPICIOUS_AMOUNT_THRESHOLD)}
+            for record in examples_pdf.to_dict("records")
         ]
     )
+
+    # Eval-loss measurement on the staged eval split — forward passes on the
+    # sharded model are collective-safe, unlike generation. Every rank draws
+    # the identical seeded sample; the Trainer's distributed sampler then
+    # splits it across ranks.
+    eval_dataset = None
+    if EVAL_SAMPLE_SIZE > 0:
+        eval_pdf = sample_eval_records(SFT_FILES_DIR, EVAL_SAMPLE_SIZE, SEED)
+        eval_dataset = Dataset.from_list(
+            [
+                {"messages": build_fraud_messages(record, SUSPICIOUS_AMOUNT_THRESHOLD)}
+                for record in eval_pdf.to_dict("records")
+            ]
+        )
 
     model, tokenizer = load_fsdp_model_and_tokenizer()
     model = get_peft_model(model, build_peft_config())
@@ -270,6 +281,7 @@ def train_fsdp(
         ddp_find_unused_parameters=False,
         dataloader_pin_memory=True,
         max_length=MAX_SEQ_LENGTH,
+        per_device_eval_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
         # Activation checkpointing below replaces gradient checkpointing.
         gradient_checkpointing=False,
         # ---- FSDP2 ----
@@ -288,6 +300,7 @@ def train_fsdp(
         model=model,
         args=training_args,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
     )
 
@@ -322,6 +335,12 @@ def train_fsdp(
 
         train_output = trainer.train()
         metrics = getattr(train_output, "metrics", {}) or {}
+
+        # Held-out eval loss on the staged eval split. Collective under FSDP
+        # (the eval forward passes all-gather shards) — every rank must make
+        # this call, like save_model below.
+        if eval_dataset is not None:
+            metrics = {**metrics, **trainer.evaluate()}
 
         # Gathering the sharded parameters for the final adapter is a
         # collective operation — EVERY rank must call save_model (the
@@ -378,9 +397,6 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     shard-claiming here still governs which data each rank feeds it (FSDP is
     still data-parallel across ranks).
     """
-    import math
-    import random
-
     import torch
 
     if sample_fraction is None:
@@ -389,33 +405,13 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     rank, world_size, local_rank = get_distributed_context()
     torch.cuda.set_device(local_rank)
 
-    # Identical shard contract to train.py: claim the shard_id=N parquet
-    # directories where N % world_size == rank, with two-level sampling.
-    shard_dirs = sorted(Path(SFT_FILES_DIR).glob("shard_id=*"))
-    if not shard_dirs:
-        raise FileNotFoundError(
-            f"No SFT parquet shards found under {SFT_FILES_DIR}. "
-            "Run setup/02_stage_training_data.py first."
-        )
-
-    rank_shard_dirs = [
-        shard_dir
-        for shard_dir in shard_dirs
-        if int(shard_dir.name.split("=", 1)[1]) % world_size == rank
-    ]
-
-    within_shard_fraction = 1.0
-    if sample_fraction < 1.0 and rank_shard_dirs:
-        total_rank_dirs = len(rank_shard_dirs)
-        dirs_to_load = max(1, math.ceil(total_rank_dirs * sample_fraction))
-        rank_shard_dirs = sorted(random.Random(SEED).sample(rank_shard_dirs, dirs_to_load))
-        within_shard_fraction = min(1.0, sample_fraction * total_rank_dirs / dirs_to_load)
-
-    rank_files = [
-        str(parquet_file)
-        for shard_dir in rank_shard_dirs
-        for parquet_file in sorted(shard_dir.glob("*.parquet"))
-    ]
+    # Identical shard contract to train.py: claim the train split's
+    # shard_id=N parquet directories where N % world_size == rank, with
+    # two-level sampling; the eval split feeds the post-training eval-loss
+    # pass.
+    rank_files, within_shard_fraction = claim_rank_shard_files(
+        SFT_FILES_DIR, "train", rank, world_size, sample_fraction, SEED
+    )
 
     from datasets import load_dataset
 

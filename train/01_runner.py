@@ -34,7 +34,7 @@ from training_utils import init_training_workspace, load_training_config
 # MAGIC This keeps the notebook body stable while making the experiment easy to tune:
 # MAGIC
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
-# MAGIC - `sft_table` points to the prepared prompt/response Delta table.
+# MAGIC - `sft_table` points to the staged training-data Delta table (raw transaction fields with train/eval split and shard columns; prompt/response formatting happens in the training loop).
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
 # MAGIC - `model_volume_path` (optional) points at a Unity Catalog volume snapshot of the base model weights, populated by `setup/03_download_base_model_weights.py`; when set, the GPU workers load the model from the volume instead of downloading it from Hugging Face. Volume-hosted weights are first staged to node-local disk (once per node) because safetensors mmap reads through the volume FUSE mount are slow.
 # MAGIC - `max_steps`, batch size, learning rate, and the LoRA settings control the training cost and quality.
@@ -82,7 +82,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC
 # MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime. 
 # MAGIC
-# MAGIC The workflow uses the IBM TabFormer credit-card dataset prepared by the setup notebooks: `setup/01_load_dataset.py` writes the cleaned transaction table, and `setup/02_stage_training_data.py` builds the supervised fine-tuning table with prompt/response records and stages it in a Unity Catalog volume. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, and logs with MLflow; registration and serving are handled by the deployment notebook (`02_register_and_deploy.py`, next in this directory).
+# MAGIC The workflow uses the IBM TabFormer credit-card dataset prepared by the setup notebooks: `setup/01_load_dataset.py` writes the cleaned transaction table, and `setup/02_stage_training_data.py` stages the raw records — split 90/10 into train/eval and hash-sharded — in a Unity Catalog volume. This notebook samples or shards the train-split rows, renders the prompt/response messages in the training loop with the model's own chat template, fine-tunes with Unsloth LoRA, and logs with MLflow; registration and serving are handled by the deployment notebook (`02_register_and_deploy.py`, next in this directory).
 # MAGIC
 # MAGIC **Features demonstrated in this notebook**
 # MAGIC

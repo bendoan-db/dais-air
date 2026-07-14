@@ -24,6 +24,9 @@ load_generator_workers: 2
 worker_concurrency: 4
 request_timeout_seconds: 30
 
+# Request prompts are rendered live from raw records sampled from the staged
+# table's eval split (rows the model never trained on), using the same shared
+# prompt template as training (training_utils.render_fraud_prompt).
 prompt_sample_fraction: 0.001
 prompt_sample_size: 1000
 smoke_test_requests: 2

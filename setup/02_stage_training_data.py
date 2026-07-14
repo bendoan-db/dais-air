@@ -1,18 +1,18 @@
 # Databricks notebook source
-# DBTITLE 1,Stage the supervised fine-tuning data in a Unity Catalog volume
+# DBTITLE 1,Stage the training data in a Unity Catalog volume
 # MAGIC %md
-# MAGIC # Stage the supervised fine-tuning data in a Unity Catalog volume
+# MAGIC # Stage the training data in a Unity Catalog volume
 # MAGIC
-# MAGIC This setup notebook builds the supervised fine-tuning records from the cleaned transaction table written by `01_load_dataset.py` and stages them for AI Runtime training:
+# MAGIC This setup notebook stages the cleaned transaction records written by `01_load_dataset.py` for AI Runtime training:
 # MAGIC
-# MAGIC 1. Writes the SFT Delta table with `prompt`, `assistant_response`, and stable `shard_id` columns. Prompt text, assistant JSON, and shard IDs are generated with Spark expressions so the work runs in parallel instead of row by row in Python.
-# MAGIC 2. Exports the SFT records to a Unity Catalog volume as Parquet files partitioned by `shard_id`, per the AI Runtime data-loading guidance for large Delta tables:
+# MAGIC 1. Writes the training-data Delta table: the raw transaction fields plus stable `training_id`, `split` (train/eval, `eval_fraction` in setup.yaml), and `shard_id` columns, all generated with Spark expressions so the work runs in parallel instead of row by row in Python. **SFT prompt/response formatting is deliberately not applied here** — the training loop renders prompts and labels from the raw fields.
+# MAGIC 2. Exports the records to a Unity Catalog volume as Parquet files partitioned by `split` and `shard_id`, per the AI Runtime data-loading guidance for large Delta tables:
 # MAGIC    https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
 # MAGIC
-# MAGIC Reading the exported files directly during training avoids Spark overhead on the GPU workers: each worker claims the `shard_id=N` directories where `N % world_size == rank` and loads only its own files with Hugging Face `datasets`.
+# MAGIC Reading the exported files directly during training avoids Spark overhead on the GPU workers: each worker claims the `split=train/shard_id=N` directories where `N % world_size == rank` and loads only its own files with Hugging Face `datasets`; the `split=eval` shards are the held-out evaluation set.
 # MAGIC Parquet is used because the training code (Unsloth) consumes Hugging Face `datasets`, which loads Parquet natively as memory-mapped Arrow tables.
 # MAGIC
-# MAGIC **Both the SFT table and the volume export are overwritten on every run.**
+# MAGIC **Both the staged table and the volume export are overwritten on every run.**
 
 # COMMAND ----------
 
@@ -50,6 +50,15 @@ from training_utils import (
     quote_identifier,
 )
 
+# Databricks notebooks inject display(); local Databricks Connect runs need
+# a plain-text fallback so the verification cells work in both environments.
+try:
+    display
+except NameError:
+    def display(df):
+        print(df.toPandas().to_string(index=False) if hasattr(df, "toPandas") else df)
+
+
 config_path = script_dir / "setup.yaml"
 
 with config_path.open("r", encoding="utf-8") as config_file:
@@ -66,7 +75,9 @@ sft_table = config_str(config, "sft_table")
 sft_volume = config_str(config, "sft_volume")
 sft_files_path = f"/Volumes/{catalog}/{schema}/{sft_volume}/{sft_table}"
 
-suspicious_amount_threshold = config_float(config, "suspicious_amount_threshold")
+eval_fraction = config_float(config, "eval_fraction")
+if not 0.0 < eval_fraction < 1.0:
+    raise ValueError(f"eval_fraction must be between 0 and 1 (exclusive), got {eval_fraction}")
 sft_shards = config_int(config, "sft_shards")
 
 shard_key_columns = config.get("sft_shard_key_columns")
@@ -115,81 +126,22 @@ if missing_shard_key_columns:
 print(f"Stage config: {config_path}")
 print(f"Global config: {global_config_path}")
 print(f"Source table: {full_table_name} ({len(source_columns)} columns)")
-print(f"Target SFT table: {full_sft_table_name}")
-print(f"Target SFT parquet export: {sft_files_path}")
+print(f"Target training-data table: {full_sft_table_name}")
+print(f"Target parquet export: {sft_files_path}")
+print(f"Eval fraction: {eval_fraction}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Create supervised fine-tuning records
+# MAGIC ## Create the training records
 # MAGIC
-# MAGIC The training notebook reads this table directly instead of building prompts row by row in Python.
-# MAGIC Prompt text, assistant JSON, and `shard_id` are generated with Spark expressions so the work runs in parallel.
+# MAGIC The staged table carries the raw transaction fields; the training loop renders the SFT prompt/response text from them.
+# MAGIC `training_id`, `split`, and `shard_id` are generated with Spark expressions so the work runs in parallel.
 # MAGIC
 # MAGIC `shard_id` lets distributed training assign data slices by `rt.get_global_rank()` and `rt.get_world_size()` without loading the full table into every GPU worker.
+# MAGIC `split` holds the deterministic 90/10 train/eval assignment (`eval_fraction` in setup.yaml).
 
 # COMMAND ----------
-
-prompt_col = F.concat(
-    F.lit("You are a fraud decision model for a credit-card transaction stream. "),
-    F.lit("Classify the transaction as legitimate, suspicious, or likely_fraud. "),
-    F.lit("Return only compact JSON with keys risk, action, and reason.\n\n"),
-    F.lit("Transaction:\n"),
-    F.lit("- user_id: "),
-    F.col("user_id_text"),
-    F.lit("\n- card_id: "),
-    F.col("card_id_text"),
-    F.lit("\n- timestamp: "),
-    F.col("transaction_ts_text"),
-    F.lit("\n- amount_usd: "),
-    F.format_string("%.2f", F.col("amount_usd")),
-    F.lit("\n- use_chip: "),
-    F.col("use_chip_text"),
-    F.lit("\n- merchant_city: "),
-    F.col("merchant_city_text"),
-    F.lit("\n- merchant_state: "),
-    F.col("merchant_state_text"),
-    F.lit("\n- merchant_category_code: "),
-    F.col("mcc_text"),
-    F.lit("\n- errors: "),
-    F.col("errors_text"),
-)
-
-risk_col = (
-    F.when(F.col("is_fraud") == 1, F.lit("likely_fraud"))
-    .when(
-        F.col("has_error_signal") | (F.col("amount_usd") >= F.lit(suspicious_amount_threshold)),
-        F.lit("suspicious"),
-    )
-    .otherwise(F.lit("legitimate"))
-)
-action_col = (
-    F.when(F.col("is_fraud") == 1, F.lit("decline_and_escalate"))
-    .when(
-        F.col("has_error_signal") | (F.col("amount_usd") >= F.lit(suspicious_amount_threshold)),
-        F.lit("step_up_authentication"),
-    )
-    .otherwise(F.lit("approve"))
-)
-reason_col = (
-    F.when(
-        F.col("is_fraud") == 1,
-        F.lit("The historical label marks this transaction as fraud."),
-    )
-    .when(
-        F.col("has_error_signal") | (F.col("amount_usd") >= F.lit(suspicious_amount_threshold)),
-        F.lit("The transaction is not labeled fraud, but amount or error signals warrant review."),
-    )
-    .otherwise(F.lit("The historical label is non-fraud and no strong review signal is present."))
-)
-
-assistant_response_col = F.to_json(
-    F.struct(
-        risk_col.alias("risk"),
-        action_col.alias("action"),
-        reason_col.alias("reason"),
-    )
-)
 
 # Row identity and shard assignment both derive from the configured shard
 # key columns (sft_shard_key_columns in setup.yaml), so the export stays
@@ -205,32 +157,32 @@ training_id_col = F.sha2(
 shard_key_sql = ", ".join(quote_identifier(column_name) for column_name in shard_key_columns)
 shard_expr = f"pmod(xxhash64({shard_key_sql}), {sft_shards})"
 
-sft_df = (
+# The split hashes the same key columns but with a salt literal, so it is
+# deterministic across reruns yet independent of shard_id — reusing the
+# unsalted shard hash would correlate the split with shard parity (both
+# derive from the same low bits).
+split_denominator = 1_000_000
+eval_threshold = int(round(eval_fraction * split_denominator))
+split_expr = (
+    f"CASE WHEN pmod(xxhash64('eval_split', {shard_key_sql}), {split_denominator}) "
+    f"< {eval_threshold} THEN 'eval' ELSE 'train' END"
+)
+
+staged_df = (
     df.withColumn("training_id", training_id_col)
-    .withColumn("prompt", prompt_col)
-    .withColumn("assistant_response", assistant_response_col)
+    .withColumn("split", F.expr(split_expr))
     .withColumn("shard_id", F.expr(shard_expr).cast("int"))
-    .withColumn(
-        "messages_json",
-        F.to_json(
-            F.array(
-                F.struct(F.lit("user").alias("role"), F.col("prompt").alias("content")),
-                F.struct(F.lit("assistant").alias("role"), F.col("assistant_response").alias("content")),
-            )
-        ),
-    )
     .select(
         "training_id",
+        "split",
         "shard_id",
-        "prompt",
-        "assistant_response",
-        "messages_json",
         "fraud_label",
         "is_fraud",
         "amount_usd",
         "user_id_text",
         "card_id_text",
         "transaction_ts_text",
+        "use_chip_text",
         "merchant_city_text",
         "merchant_state_text",
         "mcc_text",
@@ -240,7 +192,7 @@ sft_df = (
 )
 
 (
-    sft_df.write.format("delta")
+    staged_df.write.format("delta")
     .mode("overwrite")
     .option("overwriteSchema", "true")
     .saveAsTable(full_sft_table_name)
@@ -249,11 +201,11 @@ sft_df = (
 spark.sql(
     f"""
     COMMENT ON TABLE {full_sft_table_name}
-    IS 'Prompt/response supervised fine-tuning records for the AIR fraud demo'
+    IS 'Raw transaction training records (train/eval split, hash-sharded) for the AIR fraud demo; SFT formatting happens in the training loop'
     """
 )
 
-print(f"Overwrote SFT Delta table {full_sft_table_name}")
+print(f"Overwrote training-data Delta table {full_sft_table_name}")
 
 # COMMAND ----------
 
@@ -262,12 +214,12 @@ print(spark.table(full_sft_table_name))
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Export SFT records to a Unity Catalog volume as Parquet
+# MAGIC ## Export the training records to a Unity Catalog volume as Parquet
 # MAGIC
 # MAGIC AI Runtime's data-loading guidance recommends exporting large Delta tables to a UC volume and reading the files directly during training, which avoids Spark overhead on the GPU workers:
 # MAGIC https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
 # MAGIC
-# MAGIC The export is partitioned by `shard_id`, so the existing rank-sharding contract carries over: each GPU worker claims the `shard_id=N` directories where `N % world_size == rank` and reads only its own files.
+# MAGIC The export is partitioned by `split` and then `shard_id` (`split=train/shard_id=N/`, `split=eval/shard_id=N/`), so the rank-sharding contract carries over per split: each GPU worker claims the `split=train/shard_id=N` directories where `N % world_size == rank`, and the eval shards are read the same way for held-out evaluation.
 
 # COMMAND ----------
 
@@ -275,52 +227,78 @@ print(spark.table(full_sft_table_name))
     spark.table(full_sft_table_name)
     .repartition(sft_shards, "shard_id")
     .write.mode("overwrite")
-    .partitionBy("shard_id")
+    .partitionBy("split", "shard_id")
     .parquet(sft_files_path)
 )
 
-print(f"Exported SFT parquet shards to {sft_files_path}")
+print(f"Exported train/eval parquet shards to {sft_files_path}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Verify the SFT table and the volume export
+# MAGIC ## Verify the staged table and the volume export
 # MAGIC
-# MAGIC Training fails fast when the parquet export is missing or incomplete, so this cell confirms the export holds every shard and every SFT row before any GPU time is spent.
+# MAGIC Training fails fast when the parquet export is missing or incomplete, so this cell confirms both splits hold every shard and every staged row before any GPU time is spent.
 # MAGIC The export is checked by reading it back through Spark (rather than listing the FUSE mount), so verification also works on local Databricks Connect runs.
 
 # COMMAND ----------
 
-sft_loaded_df = spark.table(full_sft_table_name)
+staged_loaded_df = spark.table(full_sft_table_name)
 
-sft_summary_expressions = [
+split_summary_expressions = [
     F.count("*").alias("row_count"),
     F.countDistinct("shard_id").alias("shard_count"),
     F.min("shard_id").alias("min_shard_id"),
     F.max("shard_id").alias("max_shard_id"),
 ]
-if "is_fraud" in sft_loaded_df.columns:
-    sft_summary_expressions.extend(
+if "is_fraud" in staged_loaded_df.columns:
+    split_summary_expressions.extend(
         [
             F.sum("is_fraud").alias("fraud_row_count"),
             F.avg("is_fraud").alias("fraud_rate"),
         ]
     )
 
-display(sft_loaded_df.agg(*sft_summary_expressions))
-display(sft_loaded_df.select("training_id", "shard_id", "prompt", "assistant_response").limit(10))
+display(staged_loaded_df.groupBy("split").agg(*split_summary_expressions))
+display(
+    staged_loaded_df.select(
+        "training_id", "split", "shard_id", "amount_usd", "fraud_label", "merchant_city_text"
+    ).limit(10)
+)
 
 export_df = spark.read.parquet(sft_files_path)
 export_row_count = export_df.count()
-export_shard_count = export_df.select("shard_id").distinct().count()
-table_row_count = sft_loaded_df.count()
+table_row_count = staged_loaded_df.count()
 
-print(f"SFT parquet export: {export_row_count} rows in {export_shard_count} shards at {sft_files_path}")
-
-if export_shard_count != sft_shards:
-    raise ValueError(
-        f"Expected {sft_shards} shard_id partitions in the parquet export, found {export_shard_count}."
+export_split_summary = {
+    row["split"]: row
+    for row in export_df.groupBy("split")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.countDistinct("shard_id").alias("shard_count"),
     )
+    .collect()
+}
+
+print(f"Parquet export: {export_row_count} rows at {sft_files_path}")
+for split_name in ("train", "eval"):
+    summary_row = export_split_summary.get(split_name)
+    if summary_row is None:
+        raise ValueError(
+            f"The parquet export has no split={split_name} partition. "
+            "Check eval_fraction in setup/setup.yaml and rerun this notebook."
+        )
+    print(
+        f"  split={split_name}: {summary_row['row_count']} rows "
+        f"({summary_row['row_count'] / export_row_count:.1%}) "
+        f"in {summary_row['shard_count']} shards"
+    )
+    if summary_row["shard_count"] != sft_shards:
+        raise ValueError(
+            f"Expected {sft_shards} shard_id partitions in the split={split_name} export, "
+            f"found {summary_row['shard_count']}. For small datasets, lower sft_shards "
+            "(or raise eval_fraction) in setup/setup.yaml so every shard has rows in both splits."
+        )
 if export_row_count != table_row_count:
     raise ValueError(
         f"Parquet export has {export_row_count} rows but {full_sft_table_name} has "

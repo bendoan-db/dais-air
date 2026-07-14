@@ -51,6 +51,7 @@ if TRAIN_MODULE_DIR not in sys.path:
     sys.path.insert(0, TRAIN_MODULE_DIR)
 
 from training_utils import (
+    FRAUD_RECORD_COLUMNS,
     config_bool,
     config_float,
     config_int,
@@ -60,6 +61,7 @@ from training_utils import (
     get_spark_session,
     load_global_config,
     load_yaml_config,
+    render_fraud_prompt,
 )
 
 # COMMAND ----------
@@ -231,25 +233,31 @@ if "READY" not in ready_state.upper():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Build request payloads from SFT prompts
+# MAGIC ## Build request payloads from staged transaction records
 # MAGIC
-# MAGIC The load test uses prompts from the prepared SFT Delta table so the request shape matches the prompts used during fine-tuning.
+# MAGIC The staged table holds raw transaction records (prompt text is rendered at training time, not stored), so the load test samples eval-split rows and renders each prompt with the same shared template training uses (`training_utils.render_fraud_prompt`) — the request shape matches fine-tuning exactly, while the traffic itself is data the model never trained on.
 # MAGIC Each request sends a chat payload with one user message, plus deterministic generation settings.
 # MAGIC
 # MAGIC With `disable_thinking: true` (the default), every payload also carries `chat_template_kwargs: {"enable_thinking": false}` — vLLM forwards it into the model's chat template, keeping hybrid reasoning models (base Qwen3) from spending the entire `max_tokens` budget on a reasoning block before the JSON answer. This mirrors training, which renders its chat templates with `enable_thinking=False`.
 
 # COMMAND ----------
 
-prompt_pdf = (
+record_pdf = (
     spark.table(sft_table_q)
-    .select("prompt")
+    .where(F.col("split") == "eval")
+    .select(*FRAUD_RECORD_COLUMNS)
     .sample(withReplacement=False, fraction=PROMPT_SAMPLE_FRACTION, seed=3407)
     .limit(PROMPT_SAMPLE_SIZE)
     .toPandas()
 )
 
-if prompt_pdf.empty:
-    raise ValueError(f"No prompt records were loaded from {UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}.")
+if record_pdf.empty:
+    raise ValueError(
+        f"No eval-split records were loaded from {UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}. "
+        "Run setup/02_stage_training_data.py to (re)stage the table with train/eval splits."
+    )
+
+prompts = [render_fraud_prompt(record) for record in record_pdf.to_dict("records")]
 
 def build_chat_payload(prompt: str) -> dict:
     payload = {
@@ -272,7 +280,7 @@ def build_chat_payload(prompt: str) -> dict:
     return payload
 
 
-payload_templates = [build_chat_payload(prompt) for prompt in prompt_pdf["prompt"].tolist()]
+payload_templates = [build_chat_payload(prompt) for prompt in prompts]
 
 display(
     pd.DataFrame(

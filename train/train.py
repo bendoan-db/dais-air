@@ -32,7 +32,16 @@ from pathlib import Path
 # The helpers module is deliberately NOT named `utils`: the Databricks AI base
 # environment's nvidia_cutlass_dsl package registers its own top-level `utils`
 # module once the torch/CUDA stack loads, which shadows any local utils.py.
-from training_utils import VOLUME_PATH_PREFIX, load_training_config, stage_model_locally
+from training_utils import (
+    FRAUD_RECORD_COLUMNS,
+    VOLUME_PATH_PREFIX,
+    build_fraud_messages,
+    claim_rank_shard_files,
+    load_training_config,
+    render_fraud_prompt,
+    sample_eval_records,
+    stage_model_locally,
+)
 
 # Bind the shared configuration into module globals: typed training_config
 # values (MODEL_NAME, MAX_SEQ_LENGTH, hyperparameters, SEED, ...), derived
@@ -160,7 +169,7 @@ def binary_classification_metrics(
 
 
 def evaluate_fraud_classification(model, tokenizer, eval_pdf, batch_size: int = 16) -> dict:
-    """Score the fine-tuned model as a binary fraud classifier on held-out rows.
+    """Score the fine-tuned model as a binary fraud classifier on eval-split rows.
 
     Generates a completion for each held-out prompt, parses the ``risk``
     field, and treats ``likely_fraud`` as the positive prediction against the
@@ -237,57 +246,29 @@ def train_qwen3_unsloth(
     is_main_process = rank == 0
     save_artifacts = save_artifacts and is_main_process
 
-    # Hold out rows on rank 0 for post-training fraud-classification metrics
-    # (accuracy/precision/recall/F1 against is_fraud). Stratified: at the
-    # natural ~1% fraud rate a small random sample would carry almost no
-    # positives, leaving recall/precision meaningless. Held-out rows are
-    # dropped from this rank's training data, so the metrics are honest.
-    eval_pdf = None
-    if EVAL_SAMPLE_SIZE > 0 and is_main_process:
-        if "is_fraud" not in examples_pdf.columns:
-            print(
-                "eval_sample_size is set but the SFT records carry no is_fraud "
-                "column — skipping fraud-classification evaluation."
-            )
-        elif len(examples_pdf) > EVAL_SAMPLE_SIZE:
-            fraud_pdf = examples_pdf[examples_pdf["is_fraud"] == 1]
-            non_fraud_pdf = examples_pdf[examples_pdf["is_fraud"] != 1]
-            fraud_count = min(EVAL_SAMPLE_SIZE // 2, len(fraud_pdf))
-            non_fraud_count = min(EVAL_SAMPLE_SIZE - fraud_count, len(non_fraud_pdf))
-            eval_pdf = pd.concat(
-                [
-                    fraud_pdf.sample(n=fraud_count, random_state=SEED),
-                    non_fraud_pdf.sample(n=non_fraud_count, random_state=SEED),
-                ]
-            )
-            examples_pdf = examples_pdf.drop(eval_pdf.index)
-        else:
-            print(
-                f"Rank slice has only {len(examples_pdf)} rows — not holding out "
-                f"{EVAL_SAMPLE_SIZE} for evaluation; skipping."
-            )
-
     dataset = Dataset.from_pandas(
-        examples_pdf[["prompt", "assistant_response"]],
+        examples_pdf[list(FRAUD_RECORD_COLUMNS)],
         preserve_index=False,
     )
 
     model, tokenizer = load_unsloth_model(MODEL_LOAD_PATH, device_map=device_map)
 
+    # Message formatting happens here in the training loop, not in setup:
+    # build_fraud_messages renders the prompt/response text from the raw
+    # staged fields, and the loaded model's own chat template turns those
+    # messages into training text — so swapping the base model swaps the
+    # formatting with it.
     def formatting_prompts_func(examples):
-        texts = [
-            render_chat_messages(
-                tokenizer,
-                [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": assistant_response},
-                ],
+        column_names = list(examples.keys())
+        texts = []
+        for row_values in zip(*(examples[name] for name in column_names)):
+            record = dict(zip(column_names, row_values))
+            texts.append(
+                render_chat_messages(
+                    tokenizer,
+                    build_fraud_messages(record, SUSPICIOUS_AMOUNT_THRESHOLD),
+                )
             )
-            for prompt, assistant_response in zip(
-                examples["prompt"],
-                examples["assistant_response"],
-            )
-        ]
         return {"text": texts}
 
     dataset = dataset.map(
@@ -438,11 +419,24 @@ def train_qwen3_unsloth(
                     shutil.copy2(artifact_file, volume_dir / artifact_file.name)
             mlflow.log_param("adapter_output_dir", output_dir)
 
-        # Held-out fraud-classification quality of the fine-tuned model. A
-        # failed evaluation logs eval_error but keeps the run FINISHED — a
-        # completed training (and its adapter) should stay deployable.
-        if eval_pdf is not None:
+        # Fraud-classification quality of the fine-tuned model on the staged
+        # eval split (split=eval, never trained on by any rank). Stratified
+        # half fraud / half non-fraud: at the natural ~1% fraud rate a small
+        # random sample would carry almost no positives, leaving
+        # recall/precision meaningless. A failed evaluation logs eval_error
+        # but keeps the run FINISHED — a completed training (and its adapter)
+        # should stay deployable.
+        if EVAL_SAMPLE_SIZE > 0:
             try:
+                eval_pdf = sample_eval_records(
+                    SFT_FILES_DIR, EVAL_SAMPLE_SIZE, SEED, stratify_column="is_fraud"
+                )
+                eval_pdf = eval_pdf.assign(
+                    prompt=[
+                        render_fraud_prompt(record)
+                        for record in eval_pdf.to_dict("records")
+                    ]
+                )
                 fraud_metrics = evaluate_fraud_classification(model, tokenizer, eval_pdf)
                 for metric_name, metric_value in fraud_metrics.items():
                     mlflow.log_metric(metric_name, float(metric_value))
@@ -489,7 +483,7 @@ def get_distributed_context() -> tuple[int, int, int]:
 
 
 def run_rank_training(sample_fraction: float | None = None) -> str | None:
-    """Train this rank's shard slice of the exported SFT parquet files.
+    """Train this rank's shard slice of the staged train split.
 
     ``sample_fraction`` overrides the ``training_sample_fraction`` value from
     the config — the runner notebook passes it from its training cell so the
@@ -507,48 +501,15 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     rank, world_size, local_rank = get_distributed_context()
     torch.cuda.set_device(local_rank)
 
-    import math
-    import random
-
-    # Read the SFT records as parquet shard files from the UC volume instead
-    # of querying Delta through Spark on the GPU workers, per the AIR
+    # Read the staged records as parquet shard files from the UC volume
+    # instead of querying Delta through Spark on the GPU workers, per the AIR
     # data-loading guidance for large Delta tables:
     # https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
-    # Ingestion writes one shard_id=N directory per stable hash shard; each
-    # rank claims the shards where N % world_size == rank, preserving the
-    # original Delta rank-sharding contract.
-    shard_dirs = sorted(Path(SFT_FILES_DIR).glob("shard_id=*"))
-    if not shard_dirs:
-        raise FileNotFoundError(
-            f"No SFT parquet shards found under {SFT_FILES_DIR}. "
-            "Run setup/02_stage_training_data.py first (after "
-            "setup/01_load_dataset.py) to build and export the SFT records."
-        )
-
-    rank_shard_dirs = [
-        shard_dir
-        for shard_dir in shard_dirs
-        if int(shard_dir.name.split("=", 1)[1]) % world_size == rank
-    ]
-
-    # Two-level sampling. shard_id is a uniform hash, so loading a subset of
-    # shard directories is statistically equivalent to row sampling — and it
-    # keeps the HF datasets Arrow conversion ("Generating train split")
-    # proportional to sample_fraction instead of always materializing the
-    # rank's full slice. Row-level sampling within the loaded shards then
-    # lands on the exact requested fraction.
-    within_shard_fraction = 1.0
-    if sample_fraction < 1.0 and rank_shard_dirs:
-        total_rank_dirs = len(rank_shard_dirs)
-        dirs_to_load = max(1, math.ceil(total_rank_dirs * sample_fraction))
-        rank_shard_dirs = sorted(random.Random(SEED).sample(rank_shard_dirs, dirs_to_load))
-        within_shard_fraction = min(1.0, sample_fraction * total_rank_dirs / dirs_to_load)
-
-    rank_files = [
-        str(parquet_file)
-        for shard_dir in rank_shard_dirs
-        for parquet_file in sorted(shard_dir.glob("*.parquet"))
-    ]
+    # Training reads only the train split; the eval split feeds the
+    # post-training fraud-classification evaluation on rank 0.
+    rank_files, within_shard_fraction = claim_rank_shard_files(
+        SFT_FILES_DIR, "train", rank, world_size, sample_fraction, SEED
+    )
 
     dataset = load_dataset("parquet", data_files=rank_files, split="train")
     examples_pdf = dataset.to_pandas()

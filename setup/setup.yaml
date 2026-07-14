@@ -7,7 +7,9 @@
 
 # Cleaned transaction table written by 01 and read by 02.
 source_table: fraud_dataset
-# SFT table and export volume written by 02 and read by training.
+# Staged training-data table and export volume written by 02 and read by
+# training. The table holds raw transaction fields plus split/shard columns;
+# SFT prompt/response formatting happens in the training loop, not here.
 sft_table: fraud_sft_dataset
 sft_volume: training_data
 
@@ -18,9 +20,12 @@ source_url: https://github.com/IBM/TabFormer/raw/main/data/credit_card/transacti
 archive_filename: transactions.tgz
 force_download: false
 
-# ---- 02_stage_training_data.py (SFT records + volume staging) ----
-# Example-specific labeling heuristic for the fraud prompt contract.
-suspicious_amount_threshold: 500.0
+# ---- 02_stage_training_data.py (train/eval split + volume staging) ----
+# Fraction of rows assigned to the evaluation split; the rest are the
+# training split. Assignment is a salted hash of sft_shard_key_columns, so
+# it is deterministic across reruns and independent of shard_id. Both splits
+# are exported partitioned by shard_id.
+eval_fraction: 0.1
 # Number of hash shards in the parquet export. Must divide evenly by every
 # GPU count you plan to train with (128 covers 1/2/4/8/16).
 sft_shards: 128

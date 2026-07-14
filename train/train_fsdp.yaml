@@ -47,8 +47,9 @@ command: python $CODE_SOURCE_PATH/train/train_fsdp.py
 
 parameters:
   training_config:
-    # Same staged SFT data as the DDP variant (must match setup.yaml;
-    # validated).
+    # Same staged training data as the DDP variant (must match setup.yaml;
+    # validated): raw transaction fields with train/eval split and shard
+    # columns — prompt/response formatting happens in the training loop.
     source_table: fraud_dataset
     sft_table: fraud_sft_dataset
     sft_volume: training_data
@@ -74,9 +75,16 @@ parameters:
     learning_rate: 1.5e-4
     warmup_steps: 5
     training_sample_fraction: 0.0001
-    # The FSDP module skips post-training generation evaluation (the final
-    # model is sharded across GPUs); keep this 0.
-    eval_sample_size: 0
+    # Labeling heuristic for the assistant responses rendered in the training
+    # loop (moved from setup with the prompt formatting): transactions with
+    # error signals or at/above this amount are labeled suspicious unless the
+    # historical label already marks them fraud.
+    suspicious_amount_threshold: 500.0
+    # Rows sampled from the staged eval split for one post-training
+    # eval-loss pass (trainer.evaluate). Generation-based classification
+    # evaluation is unavailable under FSDP — the final model is sharded
+    # across GPUs. 0 disables the eval pass.
+    eval_sample_size: 256
     seed: 3407
 
     # LoRA adapter settings. ["all-linear"] is PEFT's shorthand for every

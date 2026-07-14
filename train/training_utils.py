@@ -101,10 +101,27 @@ def full_name(*parts: str) -> str:
 
 def get_spark_session():
     """Return the active Spark session, attaching a serverless Databricks
-    Connect session when none exists yet (local scripts, GPU workers)."""
+    Connect session when none exists yet (local scripts, GPU workers).
+
+    Workspace notebooks and jobs already have a session — reuse it instead of
+    building one (serverless job environments bundle a databricks-connect
+    whose builder has no ``serverless()`` attribute, so building would fail
+    there anyway)."""
+    try:
+        from pyspark.sql import SparkSession
+
+        active_session = SparkSession.getActiveSession()
+        if active_session is not None:
+            return active_session
+    except Exception:
+        pass
+
     from databricks.connect import DatabricksSession
 
-    return DatabricksSession.builder.serverless().getOrCreate()
+    builder = DatabricksSession.builder
+    if hasattr(builder, "serverless"):
+        return builder.serverless().getOrCreate()
+    return builder.getOrCreate()
 
 
 VOLUME_PATH_PREFIX = "/Volumes/"
@@ -225,6 +242,235 @@ def parse_compute_block(workload_config: dict) -> tuple[int, str]:
     return gpus, chip
 
 
+# ---- Fraud message formatting (shared by the training modules) --------------
+# Setup stages RAW transaction records (setup/02 writes no prompt text); the
+# training loop renders the chat messages so formatting follows the model
+# being trained — each training module applies its own tokenizer's chat
+# template to the messages built here. The prompt's "- key: value" block is a
+# monitoring contract: monitor.yaml's prompt_fields are extracted by matching
+# these exact line prefixes (scripts/validate_config.py checks coverage
+# against this template).
+
+# The staged columns the renderers read (train.py selects exactly these into
+# its HF dataset before formatting).
+FRAUD_RECORD_COLUMNS = (
+    "user_id_text",
+    "card_id_text",
+    "transaction_ts_text",
+    "amount_usd",
+    "use_chip_text",
+    "merchant_city_text",
+    "merchant_state_text",
+    "mcc_text",
+    "errors_text",
+    "is_fraud",
+    "has_error_signal",
+)
+
+
+def render_fraud_prompt(record) -> str:
+    """Render the user prompt from one raw transaction record.
+
+    Reproduces byte-for-byte the prompt shape the pipeline has always trained
+    and served with (previously built with Spark expressions in setup/02): a
+    fixed instruction header plus the "- key: value" transaction block the
+    monitoring stage parses prompt_fields from.
+    """
+    return (
+        "You are a fraud decision model for a credit-card transaction stream. "
+        "Classify the transaction as legitimate, suspicious, or likely_fraud. "
+        "Return only compact JSON with keys risk, action, and reason.\n\n"
+        "Transaction:\n"
+        f"- user_id: {record['user_id_text']}\n"
+        f"- card_id: {record['card_id_text']}\n"
+        f"- timestamp: {record['transaction_ts_text']}\n"
+        f"- amount_usd: {float(record['amount_usd']):.2f}\n"
+        f"- use_chip: {record['use_chip_text']}\n"
+        f"- merchant_city: {record['merchant_city_text']}\n"
+        f"- merchant_state: {record['merchant_state_text']}\n"
+        f"- merchant_category_code: {record['mcc_text']}\n"
+        f"- errors: {record['errors_text']}"
+    )
+
+
+def render_fraud_response(record, suspicious_amount_threshold: float) -> str:
+    """Render the assistant target: compact JSON with keys risk/action/reason.
+
+    The labeling heuristic (the historical fraud label wins; error signals or
+    a large amount mean review) moved here from setup/02 together with the
+    prompt template; ``suspicious_amount_threshold`` comes from the training
+    config.
+    """
+    import json
+
+    needs_review = bool(record["has_error_signal"]) or (
+        float(record["amount_usd"]) >= suspicious_amount_threshold
+    )
+    if int(record["is_fraud"] or 0) == 1:
+        risk, action = "likely_fraud", "decline_and_escalate"
+        reason = "The historical label marks this transaction as fraud."
+    elif needs_review:
+        risk, action = "suspicious", "step_up_authentication"
+        reason = (
+            "The transaction is not labeled fraud, but amount or error signals "
+            "warrant review."
+        )
+    else:
+        risk, action = "legitimate", "approve"
+        reason = "The historical label is non-fraud and no strong review signal is present."
+    return json.dumps(
+        {"risk": risk, "action": action, "reason": reason}, separators=(",", ":")
+    )
+
+
+def build_fraud_messages(record, suspicious_amount_threshold: float) -> list[dict[str, str]]:
+    """One raw staged record → chat messages; the caller applies the model's
+    own chat template (Unsloth via apply_chat_template, TRL via its
+    conversational `messages` format)."""
+    return [
+        {"role": "user", "content": render_fraud_prompt(record)},
+        {
+            "role": "assistant",
+            "content": render_fraud_response(record, suspicious_amount_threshold),
+        },
+    ]
+
+
+# ---- Staged-export access (split=train|eval / shard_id=N parquet) -----------
+
+
+def split_shard_dirs(files_root: str, split: str) -> list[Path]:
+    """List the shard_id=N directories of one split of the staged export.
+
+    setup/02 writes the parquet export partitioned by split then shard
+    (``split=train/shard_id=N/``, ``split=eval/shard_id=N/``). Fails fast
+    with guidance — including when the export predates the train/eval split.
+    """
+    root = Path(files_root)
+    shard_dirs = sorted((root / f"split={split}").glob("shard_id=*"))
+    if not shard_dirs:
+        if sorted(root.glob("shard_id=*")):
+            raise FileNotFoundError(
+                f"{files_root} holds a pre-split export (shard_id=* directories "
+                "at the root). Rerun setup/02_stage_training_data.py to restage "
+                "the records with train/eval splits."
+            )
+        raise FileNotFoundError(
+            f"No split={split} parquet shards found under {files_root}. Run "
+            "setup/02_stage_training_data.py first (after "
+            "setup/01_load_dataset.py) to stage and export the training records."
+        )
+    return shard_dirs
+
+
+def claim_rank_shard_files(
+    files_root: str,
+    split: str,
+    rank: int,
+    world_size: int,
+    sample_fraction: float,
+    seed: int,
+) -> tuple[list[str], float]:
+    """Claim this rank's parquet files for one split of the staged export.
+
+    Each rank takes the ``shard_id=N`` directories where
+    ``N % world_size == rank`` (the AIR rank-sharding contract). Two-level
+    sampling: for ``sample_fraction < 1`` only a seeded subset of the rank's
+    shard directories is loaded (hash shards are uniform, so this is
+    statistically equivalent to row sampling) and the returned within-shard
+    fraction lands the caller's row-level sample on the exact requested
+    fraction — keeping the HF ``datasets`` Arrow conversion proportional to
+    the fraction instead of always materializing the rank's full slice.
+
+    Returns ``(parquet file paths, within-shard row fraction)``.
+    """
+    import math
+    import random
+
+    rank_shard_dirs = [
+        shard_dir
+        for shard_dir in split_shard_dirs(files_root, split)
+        if int(shard_dir.name.split("=", 1)[1]) % world_size == rank
+    ]
+
+    within_shard_fraction = 1.0
+    if sample_fraction < 1.0 and rank_shard_dirs:
+        total_rank_dirs = len(rank_shard_dirs)
+        dirs_to_load = max(1, math.ceil(total_rank_dirs * sample_fraction))
+        rank_shard_dirs = sorted(random.Random(seed).sample(rank_shard_dirs, dirs_to_load))
+        within_shard_fraction = min(1.0, sample_fraction * total_rank_dirs / dirs_to_load)
+
+    parquet_files = [
+        str(parquet_file)
+        for shard_dir in rank_shard_dirs
+        for parquet_file in sorted(shard_dir.glob("*.parquet"))
+    ]
+    return parquet_files, within_shard_fraction
+
+
+def sample_eval_records(
+    files_root: str,
+    sample_size: int,
+    seed: int,
+    stratify_column: str | None = None,
+):
+    """Draw a deterministic sample of records from the staged eval split.
+
+    Shard directories are read in seeded order and reading stops as soon as
+    the accumulated rows can satisfy the request, so a small sample never
+    materializes the whole eval split. With ``stratify_column`` the draw is
+    half positive (column == 1) / half rest — at the ~1% natural fraud rate
+    an unstratified sample would carry almost no positives, leaving
+    precision/recall meaningless.
+
+    Returns a pandas DataFrame (fewer than ``sample_size`` rows when the
+    eval split itself is smaller than the request).
+    """
+    import random
+
+    import pandas as pd
+
+    shard_dirs = list(split_shard_dirs(files_root, "eval"))
+    random.Random(seed).shuffle(shard_dirs)
+
+    positive_needed = sample_size // 2 if stratify_column else 0
+    rest_needed = sample_size - positive_needed
+    frames = []
+    positive_count = total_count = 0
+    for shard_dir in shard_dirs:
+        frame = pd.read_parquet(shard_dir)
+        if frame.empty:
+            continue
+        frames.append(frame)
+        total_count += len(frame)
+        if stratify_column:
+            positive_count += int((frame[stratify_column] == 1).sum())
+            if positive_count >= positive_needed and (total_count - positive_count) >= rest_needed:
+                break
+        elif total_count >= sample_size:
+            break
+
+    if not frames:
+        raise ValueError(f"The eval split under {files_root} holds no rows.")
+    records_pdf = pd.concat(frames, ignore_index=True)
+
+    if not stratify_column:
+        if len(records_pdf) <= sample_size:
+            return records_pdf
+        return records_pdf.sample(n=sample_size, random_state=seed)
+
+    positive_pdf = records_pdf[records_pdf[stratify_column] == 1]
+    rest_pdf = records_pdf[records_pdf[stratify_column] != 1]
+    positive_n = min(sample_size // 2, len(positive_pdf))
+    rest_n = min(sample_size - positive_n, len(rest_pdf))
+    return pd.concat(
+        [
+            positive_pdf.sample(n=positive_n, random_state=seed),
+            rest_pdf.sample(n=rest_n, random_state=seed),
+        ]
+    )
+
+
 def load_training_config(config_filename: str = "train.yaml") -> dict:
     """Load the ``parameters.training_config`` section and derive shared names.
 
@@ -325,6 +571,9 @@ def load_training_config(config_filename: str = "train.yaml") -> dict:
         "WARMUP_STEPS": config_int(config, "warmup_steps"),
         "TRAINING_SAMPLE_FRACTION": config_float(config, "training_sample_fraction"),
         "EVAL_SAMPLE_SIZE": config_int(config, "eval_sample_size"),
+        # Labeling heuristic for the assistant responses rendered in the
+        # training loop (render_fraud_response above).
+        "SUSPICIOUS_AMOUNT_THRESHOLD": config_float(config, "suspicious_amount_threshold"),
         "LORA_R": config_int(config, "lora_r"),
         "LORA_ALPHA": config_int(config, "lora_alpha"),
         "LORA_DROPOUT": config_float(config, "lora_dropout"),

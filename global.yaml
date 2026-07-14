@@ -5,4 +5,4 @@
 # agreements are checked by scripts/validate_config.py (which also fails if
 # a stage YAML re-introduces a key defined here).
 catalog: catalog_sandbox_5nwjwb
-schema: air_hackathon
+schema: air_hackathon_v2

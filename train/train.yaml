@@ -62,8 +62,11 @@ command: python $CODE_SOURCE_PATH/train/train.py
 # Stage configuration, carried in the workload's `parameters` field.
 parameters:
   training_config:
-    # Cleaned transaction table written by setup/01 and staged into the SFT
-    # table + parquet export by setup/02 (must match setup.yaml; validated).
+    # Cleaned transaction table written by setup/01 and staged into the
+    # training-data table + parquet export by setup/02 (must match
+    # setup.yaml; validated). The staged records are raw transaction fields
+    # with train/eval split and shard columns — prompt/response formatting
+    # happens in the training loop.
     source_table: fraud_dataset
     sft_table: fraud_sft_dataset
     # Volume holding the parquet shard export of the SFT table.
@@ -95,13 +98,19 @@ parameters:
     # value too and can override it inline in the training cell.
     training_sample_fraction: 0.0001
     seed: 3407
-    # Rows held out of rank 0's training slice to score the fine-tuned model
-    # as a binary fraud classifier after training (generated `risk` field vs
-    # the records' is_fraud label). Logged to MLflow as eval_fraud_accuracy /
-    # _precision / _recall / _f1 (fraud = positive class), plus the confusion
-    # counts and the unparseable-completion rate. The sample is stratified
-    # half fraud / half non-fraud so the metrics are measurable at low
-    # natural fraud rates. 0 disables evaluation.
+    # Labeling heuristic for the assistant responses rendered in the training
+    # loop (moved from setup with the prompt formatting): transactions with
+    # error signals or at/above this amount are labeled suspicious unless the
+    # historical label already marks them fraud.
+    suspicious_amount_threshold: 500.0
+    # Rows sampled from the staged eval split (split=eval, never trained on)
+    # to score the fine-tuned model as a binary fraud classifier after
+    # training (generated `risk` field vs the records' is_fraud label).
+    # Logged to MLflow as eval_fraud_accuracy / _precision / _recall / _f1
+    # (fraud = positive class), plus the confusion counts and the
+    # unparseable-completion rate. The sample is stratified half fraud / half
+    # non-fraud so the metrics are measurable at low natural fraud rates.
+    # 0 disables evaluation.
     eval_sample_size: 200
 
     # LoRA adapter settings.
