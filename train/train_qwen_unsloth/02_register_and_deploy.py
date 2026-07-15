@@ -309,7 +309,7 @@ display(pd.DataFrame([registration_result]))
 # MAGIC The endpoint configuration is controlled by this project's `train.yaml` `deploy_config`:
 # MAGIC
 # MAGIC - `endpoint_name` is the serving endpoint name used by the load-test notebook.
-# MAGIC - `serving_workload_type` selects a documented custom LLM GPU class: `GPU_SMALL` (T4), `GPU_MEDIUM` (A10), or `GPU_XLARGE` (H100).
+# MAGIC - `serving_workload_type` selects a documented custom LLM GPU class such as `GPU_SMALL`, `GPU_MEDIUM`, `GPU_LARGE`, or `GPU_XLARGE`.
 # MAGIC - `serving_workload_size` (`Small`, `Medium`, or `Large`) controls the fixed replica capacity; custom LLM serving does not autoscale between non-zero replica counts during beta.
 # MAGIC - `serving_scale_to_zero` is useful for development, but should be disabled for latency-sensitive production traffic.
 # MAGIC

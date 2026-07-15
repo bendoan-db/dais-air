@@ -79,9 +79,7 @@ parameters:
     # <catalog>.<schema>.<inference_table_prefix>_payload.
     inference_table_prefix: gpt_oss_120b_finetuned
     endpoint_description: 'Custom LLM endpoint serving the GPT-OSS FSDP fine-tune.'
-    # GPT-OSS 120B is served on the documented 1xH100 custom LLM tier. During
-    # beta GPU_XLARGE is limited to us-west-2, requires enrollment, and cannot
-    # scale to zero.
-    serving_workload_type: GPU_XLARGE
+    # Use the GPU_LARGE custom LLM serving tier with fixed non-zero capacity.
+    serving_workload_type: GPU_LARGE
     serving_workload_size: Small
     serving_scale_to_zero: false
