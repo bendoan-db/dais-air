@@ -38,7 +38,7 @@ parameters:
     # shard_id=N directories by N % world_size.
     ignore_partitions: false
     suspicious_amount_threshold: 500.0
-    output_dir: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/phi_4_checkpoints/phi_4_finetuned/training_demo
+    output_dir: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/checkpoints/phi_4_finetuned/
 
     max_seq_length: 4096
     max_steps: 10
