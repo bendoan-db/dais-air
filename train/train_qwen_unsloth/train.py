@@ -381,6 +381,9 @@ def train_qwen3_unsloth(
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         warmup_steps=WARMUP_STEPS,
         max_steps=MAX_STEPS,
+        # TRL's chunked_nll path omits logits and returns scalar counters,
+        # which makes decoded classification metrics impossible.
+        loss_type="nll",
         learning_rate=LEARNING_RATE,
         fp16=not is_bfloat16_supported(),
         bf16=is_bfloat16_supported(),

@@ -337,6 +337,9 @@ def train_fsdp(
         learning_rate=LEARNING_RATE,
         warmup_steps=WARMUP_STEPS,
         max_steps=MAX_STEPS,
+        # TRL's chunked_nll path omits logits and returns scalar counters,
+        # which makes decoded classification metrics impossible.
+        loss_type="nll",
         lr_scheduler_type="cosine",
         bf16=True,
         logging_steps=LOGGING_STEPS,

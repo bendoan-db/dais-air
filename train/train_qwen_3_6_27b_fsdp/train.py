@@ -247,6 +247,9 @@ def train_full_weight_fsdp(
         learning_rate=LEARNING_RATE,
         warmup_steps=WARMUP_STEPS,
         max_steps=MAX_STEPS,
+        # TRL's chunked_nll path omits logits and returns scalar counters,
+        # which makes decoded classification metrics impossible.
+        loss_type="nll",
         lr_scheduler_type="cosine",
         optim="adamw_torch_fused",
         weight_decay=0.1,
