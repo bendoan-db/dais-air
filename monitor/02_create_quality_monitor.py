@@ -399,6 +399,7 @@ print(f"{w.config.host}/explore/data/{UC_CATALOG}/{UC_SCHEMA}/{UNPACKED_TABLE_NA
 # MAGIC %md
 # MAGIC ## Next steps
 # MAGIC
-# MAGIC - **Schedule**: one job with two sequential tasks — `01_unpack_inference_table.py`, then `quality_monitors.run_refresh` — daily by default (matching the `1 day` granularity). Rerun **this** notebook only after a retrain (baseline rebuild) or a `monitor.yaml` change.
-# MAGIC - **Alerts**: SQL alerts over the drift and profile metrics tables — prediction/feature drift vs. the `training_baseline` model id (`drift_type = 'BASELINE'`), the custom contract metrics (`column_name = ':table'`), and volume collapse. `monitor/monitoring.md` §11 has the suggested queries; exclude the current in-progress window (inference logs arrive with up to ~1 hour of lag).
+# MAGIC - **SQL alert setup**: set `drift_alert_warehouse_id`, then run `03_create_drift_sql_alert.py`. It idempotently creates or updates the scheduled baseline-drift alert.
+# MAGIC - **Schedule**: run `01_unpack_inference_table.py`, refresh this monitor, then run `04_trigger_retraining.py`. The last step checks the refreshed drift metrics and starts `retraining_job_id` only when thresholds are breached and cooldown checks pass.
+# MAGIC - **Profile alerts**: contract-integrity metrics and volume collapse live in the profile metrics table and remain separate alert candidates. `monitor/monitoring.md` §11 has suggested queries.
 # MAGIC - **Phase 2 (ground truth)**: when late-arriving fraud labels exist, MERGE them into the unpacked table keyed by `client_request_id` (callers must send the header) and set `label_field` in `monitor.yaml` — the monitor then computes precision/recall/confusion per window and slice.

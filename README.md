@@ -29,7 +29,10 @@ parameters. No trainer reads `setup.yaml` or another training project.
 | `train/train_phi_4_unsloth/` | Standalone Phi-4 training and deployment project. |
 | `train/train_gpt_oss_fsdp/` | Standalone GPT-OSS FSDP training and deployment project. |
 | `load_test/` | Paced asynchronous serving load test with stage-local `utils.py`. |
-| `monitor/` | Inference-table monitoring with stage-local `utils.py` and parsing helpers. |
+| `monitor/01_unpack_inference_table.py` | Incrementally unpack AI Gateway inference payloads. |
+| `monitor/02_create_quality_monitor.py` | Build the training baseline and data quality monitor. |
+| `monitor/03_create_drift_sql_alert.py` | Provision the scheduled baseline-drift SQL alert. |
+| `monitor/04_trigger_retraining.py` | Trigger a configured retraining job after drift breaches. |
 
 ## Prerequisites
 
@@ -88,8 +91,8 @@ python -m compileall -q setup train load_test monitor
    submit that directory's workload through the AIR CLI.
 6. Run the selected project's `02_register_and_deploy.py` to merge its
    adapter, register it, and update its serving endpoint.
-7. Run `load_test/load_test_serving_endpoint.py` and then the notebooks under
-   `monitor/`.
+7. Run `load_test/load_test_serving_endpoint.py`, then monitoring notebooks
+   01-03. Schedule notebook 04 after each quality-monitor refresh.
 
 The setup stages overwrite their data and exports. Load-test results append.
 Inference unpacking is incremental through its Structured Streaming checkpoint.

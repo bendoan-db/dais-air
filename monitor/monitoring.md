@@ -10,8 +10,9 @@ produces.
 > `monitor/monitoring_utils.py` (shared plain module) and is wired into
 > module 01; the baseline build and monitor creation are
 > `monitor/02_create_quality_monitor.py`; the config keys are in
-> `monitor/monitor.yaml` and parsed by the monitoring notebooks.
-> Phase 2 (§9) and the SQL alerts (§11) remain to be set up per workspace. The model is treated as a **classifier**: every request/response pair
+> `monitor/monitor.yaml` and parsed by the monitoring notebooks. SQL alert
+> provisioning and the retraining gate are modules 03 and 04. Phase 2 (§9)
+> remains future work. The model is treated as a **classifier**: every request/response pair
 follows the shape in `monitor/example_inputs.py` — a single user message whose
 prompt always ends with a fixed transaction block:
 
@@ -76,7 +77,8 @@ qwen3_4b_instruct_finetuned_requests_profile_metrics             (generated)
 qwen3_4b_instruct_finetuned_requests_drift_metrics               (generated)
         │
         ├── auto-generated AI/BI monitoring dashboard
-        └── SQL alerts on the metrics tables
+        ├── module 03: scheduled SQL alert on baseline drift
+        └── module 04: threshold gate → configured retraining Lakeflow Job
 ```
 
 Module 01 already satisfies every precondition the monitor has: change data feed
@@ -278,7 +280,7 @@ stats plus drift tests already flag verbosity creep.
 
 ## 8. Refresh orchestration & scheduling
 
-A single scheduled Lakeflow job (serverless) with two sequential tasks, so
+A single scheduled Lakeflow job (serverless) with three sequential tasks, so
 metrics are computed immediately after new payload rows are unpacked:
 
 1. **Unpack** — run `monitor/01_unpack_inference_table.py` (drains new payload
@@ -286,11 +288,16 @@ metrics are computed immediately after new payload rows are unpacked:
 2. **Refresh monitor** — `quality_monitors.run_refresh(table_name=...)`. The
    refresh reads the unpacked table's CDF, so it processes only changed
    partitions/rows.
+3. **Retraining gate** — run `monitor/04_trigger_retraining.py`. It queries the
+   refreshed drift table and starts `retraining_job_id` only when the shared
+   threshold predicate is breached and no active/recent run blocks it.
 
 Cadence: daily by default (matches the `1 day` granularity); hourly for
 high-traffic endpoints, with the `1 hour` granularity enabled to match.
 Rebuilding the baseline (module 02) is **not** part of this job — it reruns only
 after a retrain changes the prepared SFT data.
+Run module 03 once after monitor creation, and rerun it only when its SQL
+warehouse, schedule, subscribers, or drift thresholds change.
 
 ## 9. Phase 2 — late-arriving ground truth
 
@@ -334,9 +341,20 @@ end-to-end labeled demo.
 
 ## 11. Alerting
 
-SQL alerts (Databricks SQL, scheduled after the monitoring job) over the
-generated tables. Thresholds start conservative and are tuned against the first
-weeks of profile history. Suggested set:
+`monitor/03_create_drift_sql_alert.py` idempotently creates an Alerts V2 object
+over the generated drift table. Its query counts completed baseline windows
+where any configured `drift_columns` value exceeds `drift_js_threshold` or
+falls below `drift_p_value_threshold`; the alert condition is
+`breach_count > 0`. Only aggregate rows (`slice_key IS NULL`) can trigger the
+automation. Configure a Pro or Serverless warehouse, schedule, and optional
+email/notification-destination subscribers in `monitor.yaml`.
+
+`monitor/04_trigger_retraining.py` executes the identical query through Spark.
+On a breach it verifies the configured job exists, skips active or cooldown
+runs, then calls `jobs.run_now` with an idempotency token derived from the
+latest breached window. This makes repeated evaluations of one drift window
+safe. The following queries remain useful for investigation and additional
+profile-metric alerts:
 
 ```sql
 -- 1. Input feature drift vs. training baseline (covariate shift)
@@ -429,6 +447,30 @@ baseline_sample_fraction: 0.05
 monitor_output_schema: ""
 # Phase 2: ground-truth column joined into the unpacked table; empty = unset.
 label_field: ""
+
+# ---- 03_create_drift_sql_alert.py and 04_trigger_retraining.py ----
+drift_columns: [txn_amount_usd, txn_use_chip, txn_merchant_state,
+                txn_merchant_category_code, txn_errors, response_risk]
+drift_lookback_days: 2
+drift_settling_hours: 1
+drift_js_threshold: 0.15
+drift_p_value_threshold: 0.01
+drift_breach_details_limit: 100
+
+# ---- 03_create_drift_sql_alert.py ----
+drift_alert_warehouse_id: ""
+drift_alert_display_name: qwen3_4b_instruct_finetuned_v2 baseline drift
+drift_alert_quartz_cron: "0 0 6 * * ?"
+drift_alert_timezone: UTC
+drift_alert_notify_on_ok: true
+drift_alert_retrigger_seconds: 86400
+drift_alert_user_emails: []
+drift_alert_destination_ids: []
+
+# ---- 04_trigger_retraining.py ----
+retraining_job_id: ""
+retraining_cooldown_hours: 24
+retraining_job_parameters: {}
 ```
 
 ### Files (implemented)
@@ -447,7 +489,12 @@ label_field: ""
   creates-or-updates the monitor idempotently (keeping the existing dashboard
   on update), waits for `ACTIVE`, triggers a refresh, and prints the metrics
   table names and dashboard pointer.
-- *(Phase 2, future)* `monitor/03_join_ground_truth.py` — label MERGE task.
+- `monitor/03_create_drift_sql_alert.py` — Databricks notebook: creates or
+  updates the scheduled Alerts V2 baseline-drift query by display name.
+- `monitor/04_trigger_retraining.py` — Databricks notebook: checks refreshed
+  drift metrics and starts the configured retraining job with duplicate-run
+  protection.
+- *(Phase 2, future)* `monitor/05_join_ground_truth.py` — label MERGE task.
 
 ### Runtime Configuration Checks
 
@@ -464,6 +511,9 @@ or updating the monitor. It rejects invalid settings for these rules:
   or `prompt_fields` entry); `granularities` must use supported window
   spellings; `baseline_sample_fraction` must be in `(0, 1]`;
   `baseline_table` is required.
+- Modules 03 and 04 call `parse_drift_detection_config`; drift columns must be
+  unique identifiers, lookback/detail limits must be positive, settling time
+  cannot be negative, and the p-value threshold must be in `(0, 1)`.
 
 Catalog/schema and the `sft_data_path` are owned by `monitor.yaml`. The payload
 table name must remain aligned with SFT preparation, training, and deployment
@@ -472,5 +522,8 @@ configuration.
 ### Permissions
 
 The identity creating the monitor needs `USE CATALOG`/`USE SCHEMA`, `SELECT` on
-the unpacked and baseline tables, and `CREATE TABLE` on the output schema.
-Refreshes run on Databricks-managed serverless compute.
+the unpacked and baseline tables, and `CREATE TABLE` on the output schema. Alert
+setup additionally needs `CAN USE` on its SQL warehouse and access to any
+notification destinations. The scheduled retraining gate needs `SELECT` on the
+drift table and `CAN MANAGE RUN` on `retraining_job_id`. Refreshes run on
+Databricks-managed serverless compute.

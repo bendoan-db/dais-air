@@ -92,6 +92,15 @@ Workspace notebooks normally use their folder as `Path.cwd()`. Setup notebooks
 also support local Databricks Connect and resolve their directory through
 `__file__` with a `dbutils` context fallback.
 
+## Monitoring Automation
+
+`monitor/03_create_drift_sql_alert.py` owns the idempotent Alerts V2 setup;
+it requires `drift_alert_warehouse_id` and uses the schedule/subscribers in
+`monitor.yaml`. `monitor/04_trigger_retraining.py` evaluates the same shared
+predicate after a quality-monitor refresh and calls `jobs.run_now` for
+`retraining_job_id`. Keep active-run suppression, cooldown checks, and the
+per-window idempotency token in place to prevent repeated expensive retrains.
+
 ## Deployment Constraints
 
 Each training project owns `02_register_and_deploy.py` and the corresponding
