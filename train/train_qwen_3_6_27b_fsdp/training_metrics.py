@@ -9,11 +9,47 @@ RISK_PATTERN = re.compile(
 )
 
 
-def preprocess_logits_for_metrics(logits, _labels):
-    """Reduce vocabulary logits to token IDs before Trainer gathers them."""
-    if isinstance(logits, tuple):
-        logits = logits[0]
-    return logits.argmax(dim=-1)
+def preprocess_logits_for_metrics(logits, labels):
+    """Select vocabulary logits and reduce them before Trainer gathers them."""
+    candidates = []
+
+    def collect_tensors(value):
+        if isinstance(value, (tuple, list)):
+            for item in value:
+                collect_tensors(item)
+        elif hasattr(value, "ndim") and hasattr(value, "shape"):
+            candidates.append(value)
+
+    collect_tensors(logits)
+    label_shape = tuple(getattr(labels, "shape", ()))
+    vocabulary_logits = [
+        candidate
+        for candidate in candidates
+        if candidate.ndim == 3
+        and (len(label_shape) < 2 or tuple(candidate.shape[:2]) == label_shape[:2])
+    ]
+    if vocabulary_logits:
+        # Router/auxiliary tensors may also be 3-D. Vocabulary logits have the
+        # largest final dimension by a wide margin.
+        vocabulary_logits = max(
+            vocabulary_logits, key=lambda candidate: candidate.shape[-1]
+        )
+        return vocabulary_logits.argmax(dim=-1)
+
+    token_ids = [
+        candidate
+        for candidate in candidates
+        if candidate.ndim == 2
+        and (not label_shape or tuple(candidate.shape) == label_shape)
+    ]
+    if token_ids:
+        return token_ids[0]
+
+    candidate_shapes = [tuple(candidate.shape) for candidate in candidates]
+    raise ValueError(
+        "Could not find vocabulary logits or token IDs matching labels "
+        f"{label_shape}; model output shapes: {candidate_shapes}"
+    )
 
 
 def _as_token_id_matrix(values, name: str):
