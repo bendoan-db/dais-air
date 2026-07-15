@@ -3,16 +3,16 @@
 # MAGIC %md
 # MAGIC # Register the fine-tuned model and deploy it to Model Serving
 # MAGIC
-# MAGIC This is the deployment step of this stage: it takes a training run produced by `01_runner.py` (or the AIR CLI), merges the run's LoRA adapter into the base model, registers the merged model to Unity Catalog as a custom LLM, and creates or updates a Mosaic AI Model Serving endpoint for it.
+# MAGIC This project-local deployment step takes a training run produced by `01_runner.py` (or the AIR CLI), merges the run's LoRA adapter into the base model, registers the merged model to Unity Catalog as a custom LLM, and creates or updates a Mosaic AI Model Serving endpoint for it.
 # MAGIC
-# MAGIC Run selection is driven by the `deploy_config` section of `train.yaml` (this directory's shared config file):
+# MAGIC Run selection is driven by this directory's `train.yaml` `deploy_config` section:
 # MAGIC
 # MAGIC - `run_id` set — register exactly that MLflow run's adapter.
-# MAGIC - `run_id` empty — search the global experiment (`experiment_name` in the repo-root `global.yaml`, the same experiment training logs to) for FINISHED runs and pick the best one by `best_run_metric` / `best_run_metric_goal`.
+# MAGIC - `run_id` empty — search this project's `experiment_name` for FINISHED runs and pick the best one by `best_run_metric` / `best_run_metric_goal`.
 # MAGIC
 # MAGIC Either way, the adapter location is read from the run's `adapter_output_dir` parameter (logged by training), so this notebook needs no knowledge of checkpoint-volume layout.
 # MAGIC
-# MAGIC **Compute**: attach to **Serverless GPU** (one A10 is enough) with the **AI v5** base environment — merging the adapter loads the base model with Unsloth.
+# MAGIC **Compute**: attach to **Serverless GPU** with the **AI v5** base environment and enough memory/local disk to load, merge, and save this project's model.
 
 # COMMAND ----------
 
@@ -21,9 +21,7 @@
 
 # COMMAND ----------
 
-# training_utils and train.py are plain Python modules in this directory
-# (not notebooks), shared across the pipeline; put the notebook directory on
-# sys.path and import them.
+# project_config.py and train.py are plain modules in this directory.
 import json
 import sys
 from pathlib import Path
@@ -34,11 +32,9 @@ NOTEBOOK_DIR = str(Path.cwd())
 if NOTEBOOK_DIR not in sys.path:
     sys.path.insert(0, NOTEBOOK_DIR)
 
-from training_utils import load_deploy_config
+from project_config import load_deploy_config
 
-# Registration/serving settings come from the deploy_config section of
-# train.yaml — training and deployment share this directory's one config
-# file, so catalog/schema and the experiment are identical by construction.
+# Registration/serving settings come from this project's deploy_config.
 # Values shared with other stages (endpoint_name with the load test,
 # inference_table_prefix with the monitor) are checked by
 # scripts/validate_config.py.
@@ -77,7 +73,7 @@ experiment = mlflow.get_experiment_by_name(experiment_path)
 if experiment is None:
     raise ValueError(
         f"MLflow experiment not found: {experiment_path}. Run training "
-        "(01_runner.py or the AIR CLI) first, or fix experiment_name in global.yaml."
+        "(01_runner.py or the AIR CLI) first, or fix experiment_name in train.yaml."
     )
 
 if RUN_ID:
@@ -155,13 +151,13 @@ display(
 # MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
 # MAGIC - The entrypoint launches from the MLflow model's `artifacts/` folder, so the `--model` path is the bare artifact name relative to that folder.
 # MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
-# MAGIC - The serving container installs its packages from the consolidated `requirements.txt` (referenced by `deploy_config`'s `serving_requirements_file`), which pins `transformers<5` so the same file satisfies both the training environment and this vLLM serving stack. The pinned `vllm==0.11.0` + `transformers<5` + `opencv-python-headless==4.12.0.88` combination is what runs on Model Serving's FIPS-enabled pods, and the base model's architecture must be in that vLLM's supported model list (a preflight check below prints the architecture to verify).
+# MAGIC - The serving container installs packages from this project's `requirements.txt` (referenced by `deploy_config`'s `serving_requirements_file`). The pinned `vllm==0.11.0` + `transformers<5` + `opencv-python-headless==4.12.0.88` combination runs on Model Serving's FIPS-enabled pods, and the base model's architecture must be in that vLLM's supported model list.
 # MAGIC
 # MAGIC Registration is separate from training so a failed registration or deployment can be rerun without re-training.
 
 # COMMAND ----------
 
-from train import load_unsloth_model
+from train import load_model_for_merge
 
 CUSTOM_LLM_TASK = "llm/v1/chat"
 # Bare directory name for the merged weights inside the MLflow model's
@@ -185,11 +181,11 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
 
     mlflow.set_registry_uri("databricks-uc")
 
-    # Defined inline (not in train.py/training_utils.py) on purpose: cloudpickle
+    # Defined inline (not in a project module) on purpose: cloudpickle
     # serializes notebook-local classes BY VALUE, so the serving container can
     # unpickle the model without any repo code and no code_paths are needed in
     # log_model. If this class ever moves into a module or imports repo helpers,
-    # registration must add code_paths=["train.py", "training_utils.py"].
+    # registration must add the relevant project files as code_paths.
     class CustomLlmEntrypointPlaceholder(mlflow.pyfunc.PythonModel):
         def predict(self, context, model_input, params=None):
             return {
@@ -231,17 +227,13 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
         ],
         "max_tokens": 64,
         "temperature": 0.0,
-        # Keeps hybrid reasoning models (base Qwen3) from spending the
-        # max_tokens budget on a thinking block; no-op for templates
-        # without the flag. The load test sends the same kwargs.
-        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     temp_dir = local_model_work_dir()
     try:
         merged_model_dir = temp_dir / CUSTOM_LLM_MODEL_ARTIFACT_NAME
 
-        model, tokenizer = load_unsloth_model(adapter_output_dir)
+        model, tokenizer = load_model_for_merge(adapter_output_dir)
 
         merged_model = model.merge_and_unload()
         merged_model.save_pretrained(merged_model_dir, safe_serialization=True)
@@ -280,10 +272,8 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
                 artifacts={CUSTOM_LLM_MODEL_ARTIFACT_NAME: str(merged_model_dir)},
                 input_example=input_example,
                 # The serving container's packages come from the
-                # consolidated requirements.txt (deploy_config's
-                # serving_requirements_file) — including the FIPS-safe vLLM
-                # pins; see the comments there before changing pins or base
-                # model.
+                # Project-local requirements, including the FIPS-safe vLLM
+                # pins configured for the serving container.
                 pip_requirements=SERVING_PIP_REQUIREMENTS,
                 metadata=metadata,
             )
@@ -321,9 +311,9 @@ display(pd.DataFrame([registration_result]))
 # MAGIC
 # MAGIC This cell creates or updates a Mosaic AI Model Serving endpoint for the registered custom LLM, routing 100% of traffic to the version registered above.
 # MAGIC
-# MAGIC The endpoint configuration is controlled by `train.yaml`'s `deploy_config`:
+# MAGIC The endpoint configuration is controlled by this project's `train.yaml` `deploy_config`:
 # MAGIC
-# MAGIC - `endpoint_name` (from the repo-root `global.yaml`) is the serving endpoint name used by the load-test notebook.
+# MAGIC - `endpoint_name` is the serving endpoint name used by the load-test notebook.
 # MAGIC - `serving_workload_type` selects the GPU class, such as `GPU_MEDIUM` for A10 or `GPU_XLARGE` for H100.
 # MAGIC - `serving_provisioned_concurrency` sets the fixed provisioned capacity behind the endpoint (custom LLM serving does not autoscale during beta — size for peak traffic).
 # MAGIC - `serving_scale_to_zero` is useful for development, but should be disabled for latency-sensitive production traffic.

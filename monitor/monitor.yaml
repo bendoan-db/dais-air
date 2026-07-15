@@ -1,7 +1,7 @@
 # Stage-specific configuration for the monitoring stage. catalog/schema
 # come from the repo-root global.yaml
-# (training_utils.load_global_config()). inference_table must equal
-# train/train.yaml deploy_config's inference_table_prefix + '_payload' (the
+# (monitor/utils.py load_global_config()). inference_table must equal
+# train/train_qwen_unsloth/train.yaml deploy_config's inference_table_prefix + '_payload' (the
 # table the endpoint's AI Gateway inference logging writes), and sft_table
 # must match setup/train; scripts/validate_config.py checks both.
 

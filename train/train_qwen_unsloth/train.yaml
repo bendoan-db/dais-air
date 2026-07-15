@@ -1,0 +1,95 @@
+# Self-contained Qwen3 + Unsloth DDP training project.
+# Run from this directory: COPYFILE_DISABLE=1 air run --file train.yaml --watch
+experiment_name: air_hackathon_qwen
+
+environment:
+  version: '5'
+  dependencies:
+    - -r requirements.txt
+
+compute:
+  num_accelerators: 8
+  accelerator_type: GPU_8xH100
+
+env_variables:
+  DATABRICKS_RUNTIME_VERSION: '15.4'
+
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: .
+
+command: python $CODE_SOURCE_PATH/train.py
+
+parameters:
+  training_config:
+    # Project identity. These values are local to this workload; the trainer
+    # does not read global.yaml or another stage's YAML.
+    project_name: qwen3_4b_instruct_finetuned
+    catalog: catalog_sandbox_5nwjwb
+    schema: air_hackathon_v2
+
+    # Base weights and input records. Train/eval paths point directly at split
+    # directories containing shard_id=N parquet directories.
+    model_name: unsloth/Qwen3-4B-Instruct-2507
+    model_weights_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3-4b-instruct
+    train_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=train
+    eval_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=eval
+    # false: input rows already contain prompt + assistant_response.
+    # true: input rows are raw fraud records and are converted once per rank
+    # before trainer construction. Point the paths above at setup/02's
+    # training_data export when enabling this mode.
+    convert_sft: false
+    # true recursively loads every parquet file under each split path on every
+    # rank. false assigns shard_id=N directories by N % world_size.
+    ignore_partitions: false
+    suspicious_amount_threshold: 500.0
+    output_dir: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/qwen_checkpoints/qwen3_4b_instruct_finetuned/training_demo
+
+    max_seq_length: 8192
+    max_steps: 10
+    per_device_train_batch_size: 48
+    gradient_accumulation_steps: 4
+    learning_rate: 2e-4
+    warmup_steps: 5
+    training_sample_fraction: 0.0001
+    eval_sample_size: 200
+    seed: 3407
+
+    lora_r: 16
+    lora_alpha: 16
+    lora_dropout: 0.0
+    lora_target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+
+    # Qwen3 chat-template markers used for response-only loss masking.
+    response_instruction_part: "<|im_start|>user\n"
+    response_part: "<|im_start|>assistant\n"
+
+  # Registration and serving settings for this project's deploy notebook.
+  deploy_config:
+    run_id: ''
+    best_run_metric: trainer_train_loss
+    best_run_metric_goal: minimize
+
+    uc_model_name: qwen3_4b_instruct_finetuned
+    served_model_name: qwen3_4b_instruct_finetuned
+    serving_requirements_file: requirements.txt
+
+    vllm_dtype: auto
+    vllm_max_model_len: 8192
+    vllm_gpu_memory_utilization: 0.8
+
+    endpoint_name: qwen3_4b_instruct_finetuned_v2
+    inference_table_prefix: qwen3_4b_instruct_finetuned_v2
+    endpoint_description: 'Custom LLM endpoint serving the fine-tuned model from the AIR pipeline.'
+    serving_workload_type: GPU_LARGE
+    serving_provisioned_concurrency: 4
+    serving_workload_size: ''
+    serving_scale_to_zero: false

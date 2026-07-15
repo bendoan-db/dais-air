@@ -37,17 +37,15 @@ except NameError:
     notebook_path = notebook_context.notebookPath().get()
     script_dir = Path("/Workspace") / notebook_path.lstrip("/").rsplit("/", 1)[0]
 
-# training_utils is a plain Python module in train/ shared across the demo;
-# the same import works for workspace-notebook and local-script runs. (It is
-# not named `utils` because GPU base environments ship packages that register
-# a top-level `utils` module, shadowing any local one.)
+# utils.py is a plain setup-stage module, not a notebook. Add this notebook's
+# directory explicitly so the import works in the workspace and local scripts.
 import sys
 
-train_module_dir = str((script_dir.parent / "train").resolve())
-if train_module_dir not in sys.path:
-    sys.path.insert(0, train_module_dir)
+setup_module_dir = str(script_dir.resolve())
+if setup_module_dir not in sys.path:
+    sys.path.insert(0, setup_module_dir)
 
-from training_utils import (
+from utils import (
     config_bool,
     config_str,
     ensure_uc_object,

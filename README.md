@@ -1,283 +1,193 @@
 # AI Runtime End to End
 
-A deployable Databricks AI Runtime (AIR) pipeline for fine-tuning an open-source language model, registering it to Unity Catalog as a custom LLM, deploying it to Mosaic AI Model Serving (vLLM), and load testing the deployed endpoint.
+A Databricks AI Runtime pipeline for preparing supervised fine-tuning data,
+training open-source LLMs, registering a merged model in Unity Catalog,
+deploying it with vLLM, load testing, and monitoring serving traffic.
 
-The repository ships with a complete worked example — classifying IBM TabFormer credit-card transactions for fraud with a fine-tuned Qwen3-4B — that exercises every stage end to end. To adapt it, point the configuration at your workspace and swap in your own dataset and base model (see [Bring Your Own Data and Model](#bring-your-own-data-and-model)).
+The worked example classifies IBM TabFormer credit-card transactions with a
+fine-tuned Qwen3 model. Training is split into three independent projects:
+
+- `train/train_qwen_unsloth/`: Qwen3-4B with Unsloth LoRA and DDP.
+- `train/train_phi_4_unsloth/`: Microsoft Phi-4 with Unsloth LoRA and DDP.
+- `train/train_gpt_oss_fsdp/`: GPT-OSS 120B with TRL, PEFT, and FSDP2.
+
+Each project owns its runner notebook, trainer, requirements, workload YAML,
+and config loader. Its YAML contains the catalog, schema, model-weight path,
+prepared train/eval paths, output path, compute, experiment, and trainer
+parameters. Neither trainer reads `global.yaml`, `setup.yaml`, or the other
+training project.
 
 ## Project Layout
 
 | Path | Purpose |
 | --- | --- |
-| `global.yaml` | **Global configuration** — the Unity Catalog identity (`catalog`, `schema`) shared by every module. |
-| `setup/01_load_dataset.py` | Databricks notebook that downloads TabFormer, cleans transaction data, and overwrites the transaction Delta table. |
-| `setup/02_stage_training_data.py` | Databricks notebook that builds the prompt/response SFT Delta table and stages it in a Unity Catalog volume as Parquet shards for AIR training. |
-| `setup/03_download_base_model_weights.py` | Databricks notebook that snapshots the Hugging Face models listed in `setup/setup.yaml` into Unity Catalog volumes. |
-| `setup/setup.yaml` | Stage-specific setup configuration: table/volume names, dataset source URL, staging volume, SFT shard settings, and the Hugging Face models to mirror into volumes. |
-| `train/01_runner.py` | Databricks notebook for AIR fine-tuning with MLflow experiment logging. `TRAINING_MODULE` selects the implementation: `train` (Unsloth LoRA DDP) or `train_fsdp` (TRL + FSDP2). |
-| `train/02_register_and_deploy.py` | Databricks notebook that selects a training run (explicit `run_id` or best run by metric), merges its adapter, registers the model to Unity Catalog, and deploys the serving endpoint with inference logging. |
-| `train/train.py` | Standalone training module: imported by the notebook's `@distributed` cell and runnable directly via the AI Runtime CLI. |
-| `train/train.yaml` | AI Runtime CLI workload definition (`air run --file train.yaml`) plus the stage-specific configuration: training settings (`parameters.training_config`) and registration/serving settings (`parameters.deploy_config`). |
-| `train/train_fsdp.py` | FSDP training variant (TRL SFTTrainer + PyTorch FSDP2 + PEFT LoRA) for models too large for single-GPU LoRA — the worked example targets `openai/gpt-oss-120b` on 8xH100. Same run contract as `train.py`. |
-| `train/train_fsdp.yaml` | AI Runtime CLI workload definition for the FSDP variant (`air run --file train_fsdp.yaml`), sharing `deploy_config` and the experiment with `train.yaml`. |
-| `load_test/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
-| `load_test/serving_load_test.yaml` | Stage-specific load-test configuration: request rate, workers/concurrency, and the results table. |
-| `monitor/01_unpack_inference_table.py` | Databricks notebook that incrementally unpacks the endpoint's inference table (raw JSON payloads) into an analysis-ready Delta table for monitoring. |
-| `monitor/02_create_quality_monitor.py` | Databricks notebook that builds the training-set baseline table and creates (or updates) the data-quality monitor over the unpacked requests table. |
-| `monitor/monitoring_utils.py` | Shared monitoring helpers: field extraction (prompt/response parsing) and quality-monitor config parsing, used by both monitor notebooks and the validator. |
-| `monitor/monitoring.md` | Design notes for the monitoring stage: what is monitored, metric/baseline rationale, scheduling, and permissions. |
-| `monitor/monitor.yaml` | Stage-specific monitoring configuration: table names, checkpoint volume, prompt/response field extraction, and the quality-monitor settings (prediction field, slices, granularities, baseline). |
-| `train/training_utils.py` | Shared utilities: YAML/config loading, Unity Catalog name handling, and model staging. |
-| `train/requirements.txt` | Consolidated dependencies for the stage: installed by the notebooks, referenced by `train.yaml`'s environment (`-r requirements.txt`), and reused as the serving container's environment (`deploy_config`'s `serving_requirements_file`). `transformers` is pinned `<5` so the one file satisfies both training and the FIPS-safe vLLM serving stack. |
-| `scripts/validate_config.py` | Offline validator for the cross-file configuration contracts (also run by CI). |
-| `databricks.yml` | Databricks bundle definition, including a serverless job that runs the setup notebooks. |
-| `extras/` | Experimental, unsupported training variants (Ray Train, custom launch configs) kept for reference. |
+| `global.yaml` | Catalog/schema shared by setup, load test, and monitoring. |
+| `setup/01_load_dataset.py` | Download and clean TabFormer transactions. |
+| `setup/02_stage_training_data.py` | Create deterministic train/eval splits and raw Parquet shards. |
+| `setup/03_prepare_sft.py` | Render model-agnostic prompt/response records into SFT Parquet shards. |
+| `setup/04_download_base_model_weights.py` | Snapshot configured Hugging Face models into UC volumes. |
+| `setup/utils.py` | Setup config, catalog, Spark, and canonical SFT rendering helpers. |
+| `train/train_qwen_unsloth/` | Standalone Qwen training and deployment project. |
+| `train/train_phi_4_unsloth/` | Standalone Phi-4 training and deployment project. |
+| `train/train_gpt_oss_fsdp/` | Standalone GPT-OSS FSDP training and deployment project. |
+| `load_test/` | Paced asynchronous serving load test with stage-local `utils.py`. |
+| `monitor/` | Inference-table monitoring with stage-local `utils.py` and parsing helpers. |
+| `scripts/validate_config.py` | Offline workload and cross-stage config validation. |
 
 ## Prerequisites
 
-- Databricks workspace with Unity Catalog enabled.
-- A Unity Catalog catalog that already exists.
-- Unity Catalog privileges on that catalog: `USE CATALOG` plus `CREATE SCHEMA`, `CREATE VOLUME`, `CREATE TABLE`, and `CREATE MODEL` (or pre-created objects to point the config at), and permission to create serving endpoints.
-- Databricks serverless compute for ingestion and load testing.
-- Databricks Serverless GPU with AI Runtime enabled for training. Check accelerator availability in your region — a single A10 suffices for the 4B example; H100s are needed only for scaled multi-GPU runs.
-- Model Serving with GPU workloads enabled for custom LLM serving (beta — confirm your workspace is enrolled).
-- Local Databricks CLI authentication if running notebooks or scripts from this repository with Databricks Connect.
+- A Databricks workspace with Unity Catalog, serverless compute, and Serverless
+  GPU AI Runtime enabled.
+- Catalog privileges to create schemas, volumes, tables, and models.
+- GPU Model Serving enabled for custom LLM serving.
+- Databricks CLI authentication for bundle, Connect, or AIR CLI commands.
 
 ## Configuration
 
-The repo-root **`global.yaml`** holds the Unity Catalog identity every module shares — `catalog` and `schema` — loaded by every notebook through `training_utils.load_global_config()`, so the one thing that must never diverge is configured exactly once (`scripts/validate_config.py` fails if a stage YAML re-introduces either key). Everything else is stage-owned in each module's YAML; the values shared between stages (table/volume names, `endpoint_name`, the inference-table name) are duplicated by design and every agreement is machine-checked by `scripts/validate_config.py`.
+Edit the selected project's `train.yaml` before training. The important paths
+under `parameters.training_config` are:
 
-Update before running:
+- `model_weights_path`: a populated `/Volumes/...` model snapshot.
+- `train_data_path`: the training split's Parquet root.
+- `eval_data_path`: the separate held-out split's Parquet root.
+- `convert_sft`: `false` for rows that already contain `prompt` and
+  `assistant_response`; `true` to render those fields from raw fraud records
+  once per rank inside the trainer.
+- `ignore_partitions`: `false` assigns `shard_id=N` directories by rank;
+  `true` recursively loads every Parquet file under the split path on every
+  rank. Any `training_sample_fraction` is applied only after those files load.
+- `suspicious_amount_threshold`: labeling threshold used only by inline fraud
+  conversion.
+- `output_dir`: the UC volume directory that receives adapters.
 
-- `train/train.yaml` (`parameters.training_config` + `parameters.deploy_config`; the top-level fields configure the AI Runtime CLI workload)
-  - `source_table`, `sft_table`, and `sft_volume` (shared with the other stages), plus `checkpoint_volume` and `uc_model_name` (`catalog`/`schema` come from `global.yaml`)
-  - `model_name` and `model_volume_path` (the base model and its optional volume snapshot)
-  - training parameters: `max_steps`, batch size, learning rate, `training_sample_fraction`, `eval_sample_size` (held-out fraud-classification scoring), and the LoRA settings (`lora_r`, `lora_alpha`, `lora_dropout`, `lora_target_modules`)
-  - `response_instruction_part` / `response_part` — chat-template markers that must match the base model's template
-  - the top-level `compute` block — sizes both the notebook training cell and AIR CLI runs (`num_accelerators`, `accelerator_type`)
-  - deployment (`deploy_config` section): `run_id` (empty = auto-select) with `best_run_metric` / `best_run_metric_goal`, registration names (`uc_model_name`, `served_model_name`), vLLM settings, endpoint sizing (`serving_workload_type`, `serving_provisioned_concurrency`, `serving_scale_to_zero`), `serving_requirements_file` (the serving container's pinned environment), `inference_table_prefix` (inference logging is always enabled at deployment), and `endpoint_name`
-- `setup/setup.yaml` — `source_table`, `sft_table`, and `sft_volume` (must match `train.yaml`'s `training_config`), plus stage-specific keys: dataset source URL and staging volume, SFT shard settings (`sft_shards`, `sft_shard_key_columns`), the Hugging Face `models` list to snapshot into volumes, and an optional secret reference for gated-model tokens
-- `train/train_fsdp.yaml` — the FSDP variant's workload file (same schema and loader): its own `compute` block, base model (`openai/gpt-oss-120b` by default), and training settings; it shares the experiment and `deploy_config` with `train.yaml`
-- `load_test/serving_load_test.yaml` — `sft_table` and `endpoint_name` (must match `train.yaml`), plus load-generator settings: `target_qps`, `duration_seconds`, worker/concurrency settings, `max_tokens`/`temperature`/`disable_thinking` payload settings, and the results table name
-- `monitor/monitor.yaml` — `inference_table` (must equal `deploy_config`'s `inference_table_prefix` + `_payload`) and `sft_table` (baseline source, must match setup/train), plus `unpacked_table`, `checkpoint_volume`, field extraction (`response_json_fields`, `prompt_fields`), and the quality-monitor settings (`prediction_field`, `expected_prediction_values`, `slicing_fields`, `granularities`, `baseline_table`/`baseline_sample_fraction`)
+The workload-level `compute` block sizes both the notebook's `@distributed`
+call and the AIR CLI run. `experiment_name` controls the MLflow experiment.
+Each project YAML also owns `deploy_config` for its local
+`02_register_and_deploy.py` notebook.
 
-After editing, validate the cross-file contracts locally (no workspace connection needed):
+`setup/setup.yaml` separately controls the worked-example data pipeline and
+optional model downloads. The GPT-OSS model path is not downloaded by default
+because the snapshot is very large; populate that configured path separately.
+
+Validate all local contracts without a workspace connection:
 
 ```bash
 python scripts/validate_config.py
+python -m compileall -q setup train load_test monitor scripts
 ```
 
 ## End-to-End Workflow
 
-1. Ingest the dataset.
+1. Run `setup/01_load_dataset.py` on Databricks serverless compute.
+2. Run `setup/02_stage_training_data.py` to create raw train/eval shards.
+3. With `convert_sft: false`, run `setup/03_prepare_sft.py` to write `prompt`,
+   `assistant_response`, and `is_fraud` records. With `convert_sft: true`, skip
+   this step and point the project paths at setup/02's raw split directories.
+4. Run `setup/04_download_base_model_weights.py` when the selected model is
+   listed in `setup.yaml`, or populate the project's `model_weights_path`
+   through another controlled process.
+5. Run one training project's `01_runner.py` on Serverless GPU with AI v5, or
+   submit that directory's workload through the AIR CLI.
+6. Run the selected project's `02_register_and_deploy.py` to merge its
+   adapter, register it, and update its serving endpoint.
+7. Run `load_test/load_test_serving_endpoint.py` and then the notebooks under
+   `monitor/`.
 
-   Run `setup/01_load_dataset.py` on Databricks serverless compute. The notebook:
+The setup stages overwrite their data and exports. Load-test results append.
+Inference unpacking is incremental through its Structured Streaming checkpoint.
 
-   - Creates the configured schema and staging volume if they do not exist.
-   - Downloads and extracts the IBM TabFormer transactions archive.
-   - Standardizes transaction columns and data types.
-   - Adds prompt-ready transaction fields and fraud labels.
-   - Overwrites the cleaned transaction Delta table on each run.
+## Running Training
 
-2. Stage the training data.
+Notebook entrypoints:
 
-   Run `setup/02_stage_training_data.py` on Databricks serverless compute. The notebook:
+- `train/train_qwen_unsloth/01_runner.py`
+- `train/train_phi_4_unsloth/01_runner.py`
+- `train/train_gpt_oss_fsdp/01_runner.py`
 
-   - Builds prompt/response SFT records with stable `shard_id` columns from the transaction table, using Spark expressions (see [How the Data Sharding Works](#how-the-data-sharding-works)).
-   - Overwrites the SFT Delta table on each run.
-   - Exports the SFT records to a Unity Catalog volume as Parquet files partitioned by `shard_id`, per the [AI Runtime data-loading guidance](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes).
-   - Verifies the export by reading it back: shard count and row count must match the SFT table.
+AIR CLI entrypoints:
 
-3. Download the base model weights (optional but recommended).
+```bash
+cd train/train_qwen_unsloth
+COPYFILE_DISABLE=1 air run --file train.yaml --watch
 
-   Run `setup/03_download_base_model_weights.py` as a Databricks workspace notebook. It snapshots each Hugging Face model listed under `models:` in `setup/setup.yaml` into its configured Unity Catalog volume path, so training loads workspace-local weights instead of downloading from Hugging Face on every GPU worker. Point `train/train.yaml`'s `model_volume_path` at the snapshot the fine-tune should load (leave it empty to download from Hugging Face at training time).
+cd ../train_phi_4_unsloth
+COPYFILE_DISABLE=1 air run --file train.yaml --watch
 
-4. Fine-tune with AI Runtime.
-
-   Run `train/01_runner.py` on Databricks Serverless GPU with AI Runtime. The notebook:
-
-   - Installs `train/requirements.txt`.
-   - Reads the rank-sharded SFT Parquet files from the Unity Catalog volume with Hugging Face `datasets` (no Spark on the GPU workers).
-   - Fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with Unsloth LoRA.
-   - Uses the `@distributed` decorator, sized from the workload YAML's `compute` block — the same training cell runs on one GPU or many by changing `num_accelerators`.
-   - Saves rank-0 adapter artifacts to a Unity Catalog volume.
-   - Logs training metrics to MLflow, including the adapter location (`adapter_output_dir`) the deployment stage resolves.
-   - Scores the fine-tuned model as a binary fraud classifier on a stratified holdout (excluded from training) and logs `eval_fraud_accuracy`, `eval_fraud_precision`, `eval_fraud_recall`, and `eval_fraud_f1` — set `best_run_metric: eval_fraud_f1` (maximize) in `deploy_config` to deploy the best classifier instead of the lowest loss.
-
-   The training implementation lives in `train/train.py` and can also run without the notebook through the AI Runtime CLI — see [Training via the AI Runtime CLI](#training-via-the-ai-runtime-cli).
-
-   For models too large for single-GPU LoRA (the worked example is `openai/gpt-oss-120b`), set `TRAINING_MODULE = "train_fsdp"` in the runner's configuration cell: the same cell then loads `train_fsdp.yaml` and runs `train/train_fsdp.py`, which shards the model across the node with PyTorch FSDP2 (TRL SFTTrainer + PEFT LoRA, no Unsloth) while keeping the identical data and MLflow contracts.
-
-5. Register and deploy the model.
-
-   Run `train/02_register_and_deploy.py` on Databricks Serverless GPU with AI Runtime. The notebook:
-
-   - Selects the training run to deploy: the `run_id` from `train.yaml`'s `deploy_config`, or — when `run_id` is empty — the best FINISHED run in the configured experiment by `best_run_metric` / `best_run_metric_goal`.
-   - Resolves the adapter location from the run's `adapter_output_dir` parameter and merges the adapter into the base model.
-   - Packages the merged weights with a vLLM OpenAI-compatible server entrypoint (`llm/v1/chat`) and registers the model to Unity Catalog using the Databricks Model Serving environment pack.
-   - Creates or updates the configured Model Serving endpoint and routes 100% of traffic to the new version.
-   - Always enables AI Gateway inference logging as part of the deployment, so every request/response lands in the payload table the monitoring stage consumes.
-
-6. Load test the endpoint.
-
-   Run `load_test/load_test_serving_endpoint.py` after the endpoint is ready. The notebook:
-
-   - Samples prompts from the SFT Delta table.
-   - Sends `chat_template_kwargs: {enable_thinking: false}` on every request (`disable_thinking` in the config), so hybrid reasoning models cannot burn the `max_tokens` budget on a thinking block.
-   - Runs a smoke test against the endpoint.
-   - Generates asynchronous HTTP traffic from Spark tasks.
-   - Records achieved throughput, status counts, latency samples, and summary metrics to a Delta table. (This traffic also lands in the endpoint's inference table and flows into the monitoring stage.)
-
-7. Monitor the endpoint.
-
-   Two notebooks, run on Databricks serverless compute (see `monitor/monitoring.md` for the design):
-
-   - `monitor/01_unpack_inference_table.py` — on demand or scheduled — incrementally unpacks the endpoint's inference table (raw JSON request/response payloads captured by AI Gateway inference logging) into an analysis-ready Delta table with prompts, completions, token usage, latency, and the configured extracted fields (`response_json_fields`, `prompt_fields`), created with change data feed enabled. Logs reach the payload table within about an hour of endpoint traffic.
-   - `monitor/02_create_quality_monitor.py` — builds the training-set baseline table (the SFT records parsed through the same field extraction as serving traffic) and creates or updates the data-quality monitor over the unpacked table: prediction-value distributions and drift vs the training baseline, sliced and windowed per `monitor.yaml`. Rerun it after a retrain or a `monitor.yaml` change; schedule the unpack + a metrics refresh as a recurring job.
-
-## Bring Your Own Data and Model
-
-The TabFormer ingestion (`setup/01`) and the fraud prompt construction in `setup/02` are the example half of the pipeline. Everything downstream depends only on two contracts:
-
-**The SFT table contract.** Training consumes a Delta table with two string columns — `prompt` and `assistant_response` — plus the `shard_id` column added at staging. To train on your own data:
-
-1. Produce a Delta table with `prompt`/`assistant_response` columns in the configured catalog and schema: either replace `setup/01` and the record-building cells of `setup/02` with your own logic, or point `sft_table` (in `setup/setup.yaml`, `train/train.yaml`, `load_test/serving_load_test.yaml`, and `monitor/monitor.yaml` — plus `train/train_fsdp.yaml` if you use the FSDP variant) at a table you already maintain and keep only `setup/02`'s generic half (shard assignment, Parquet export, verification).
-2. Set `sft_shard_key_columns` in `setup/setup.yaml` to columns that identify your rows — they drive the deterministic shard hash (see [How the Data Sharding Works](#how-the-data-sharding-works)).
-3. Keep the response shape you fine-tune on identical to what clients will request at serving time; the serving smoke-test payload and the load test both sample prompts directly from the SFT table.
-
-**The model contract.** To fine-tune a different open-source model:
-
-1. Change `model_name` in `train/train.yaml`'s `training_config`, add a matching entry to `setup/setup.yaml`'s `models` list, point `model_volume_path` at its `volume_path`, and rerun `setup/03` (set the HF token secret keys in `setup.yaml` for gated models such as Llama).
-2. Update `response_instruction_part` / `response_part` in `train/train.yaml` to the new model's chat-template markers — response-only loss masking silently degrades if these don't match the template.
-3. Confirm the model's architecture is supported by the vLLM version pinned in `train/requirements.txt` (the registration notebook prints the architecture as a preflight), and prefer a non-reasoning variant — see `CLAUDE.md`'s serving constraints for why.
-
-## How the Data Sharding Works
-
-`setup/02_stage_training_data.py` exports the SFT Delta table to a Unity Catalog volume as Parquet files partitioned into 128 `shard_id=N/` directories (`sft_shards` in `setup/setup.yaml`), where each row's shard is a stable hash of its key columns (`sft_shard_key_columns`; the example uses the transaction fields):
-
-```sql
-shard_id = pmod(xxhash64(user_id_text, card_id_text, transaction_ts_text, amount_usd,
-                         merchant_city_text, merchant_state_text, mcc_text), 128)
+cd ../train_gpt_oss_fsdp
+COPYFILE_DISABLE=1 air run --file train.yaml --watch
 ```
 
-This layout is the contract between setup and training: setup promises 128 uniform, stable, directory-addressable slices of the dataset, and `run_rank_training()` — in `train/train.py` and, with the identical logic, `train/train_fsdp.py` — turns `(rank, world_size)` into a file list against that promise.
+Use `--override parameters.training_config.max_steps=50` for per-run changes.
+`COPYFILE_DISABLE=1` prevents macOS AppleDouble files from corrupting the AIR
+snapshot's resolved code path.
 
-### The problem it solves
+Both launch paths call the same project-local `run_rank_training()` function.
+By default, each rank claims `shard_id=N` directories where
+`N % world_size == rank`. With `ignore_partitions: true`, every rank loads the
+complete file set and the Trainer's distributed sampler handles batches. This
+mode supports unpartitioned inputs but multiplies CPU memory and I/O by the
+world size. GPU workers require no Spark session in either mode.
 
-Training runs as DDP (data parallel): every GPU holds a full model replica, trains on different rows, and the gradients are averaged each step. That only speeds anything up if the ranks read **disjoint** data — two GPUs training on the same examples burn compute on duplicates. Normally a `DistributedSampler` handles the split, but that assumes every worker can see and index the whole dataset. On AI Runtime the GPU workers have no Spark session, and pulling the full multi-GB export into every worker just to keep 1/Nth of it would be wasted I/O.
+## Data Contract
 
-The shard layout replaces the coordinator. Each rank independently claims the directories where `N % world_size == rank`:
+With `ignore_partitions: false`, each configured path must contain this layout:
 
-```python
-rank_shard_dirs = [
-    shard_dir for shard_dir in shard_dirs
-    if int(shard_dir.name.split("=", 1)[1]) % world_size == rank
-]
+```text
+<split-path>/
+  shard_id=0/*.parquet
+  shard_id=1/*.parquet
+  ...
 ```
 
-With 8 GPUs, rank 3 reads `shard_id ∈ {3, 11, 19, ..., 123}` — 16 directories. Every shard maps to exactly one rank, so the slices are disjoint and complete by construction: no communication between workers, no shared sampler state, and no scan over rows a rank won't train on. Because `partitionBy("shard_id")` encodes shard membership in the directory structure, claiming a slice is a filesystem glob rather than a filtered read of the data.
+With `ignore_partitions: true`, files may use any nested layout; all
+`*.parquet` files below each configured split path are loaded recursively.
 
-### Why 128 shards instead of one per GPU
+With `convert_sft: false`, Parquet records must include string columns `prompt`
+and `assistant_response`. Qwen evaluation also expects `is_fraud`.
 
-The export is written once, at setup time, before anyone knows how many GPUs training will use. 128 divides evenly by 1, 2, 4, 8, and 16, so the same export serves the single-GPU validation run and the multi-GPU demo run — scaling is just `compute.num_accelerators` in the workload YAML, with no data re-prep. Exporting exactly `world_size` pieces instead would force a re-export on every change in GPU count.
+With `convert_sft: true`, records must instead contain the raw fraud fields:
+`user_id_text`, `card_id_text`, `transaction_ts_text`, `amount_usd`,
+`use_chip_text`, `merchant_city_text`, `merchant_state_text`, `mcc_text`,
+`errors_text`, `is_fraud`, and `has_error_signal`. Point the paths at the raw
+export from `setup/02_stage_training_data.py`; each rank converts its loaded
+sample once before constructing the Hugging Face/TRL dataset.
 
-### Why hash-based assignment
+The setup pipeline creates 128 deterministic hash shards by default; keep the
+shard count divisible by every intended GPU count.
 
-- **Uniform and label-agnostic.** Hashing transaction fields is effectively random with respect to fraud labels, merchants, and amounts, so every shard is an unbiased ~1/128 sample of the full dataset. Each rank gets the same class balance and the same amount of work, keeping the synchronized DDP steps free of stragglers.
-- **Deterministic.** A row's shard is a pure function of its values — not of Spark partitioning, task order, or a random seed at write time — so rerunning ingestion reproduces the same assignment and training runs stay comparable across data refreshes.
+For custom data, use pre-converted SFT rows or replace the project-local
+`sft_conversion.py` with a renderer for the raw schema. The projects do not
+require the worked-example setup notebooks.
 
-### The sampling bonus
+## Registration and Serving
 
-Because each shard is statistically interchangeable with any other, loading a random subset of shard directories is equivalent to row-level sampling. Training exploits this with two-level sampling: for `training_sample_fraction < 1`, each rank loads only a seeded-random subset of its shard directories, then row-samples within them to land on the exact fraction. Hugging Face `datasets`' Arrow conversion cost scales with the bytes loaded, so a 0.1% demo run pays roughly 0.1% of the load cost instead of materializing the rank's full slice and discarding the rest.
+Training rank zero logs `adapter_output_dir`; each project's deployment
+notebook selects an explicit `run_id` or the best finished run in that
+project's experiment. Qwen and Phi-4 merge through Unsloth. GPT-OSS loads the saved PEFT
+adapter with `AutoPeftModelForCausalLM` before merging; its 120B packaging step
+requires correspondingly large GPU, host-memory, and local-disk capacity.
+Both register a custom `llm/v1/chat` model, deploy the vLLM entrypoint, and
+enable AI Gateway inference logging.
 
-### When you would not need this
-
-Sharding earns its keep past two independent thresholds: **multiple GPUs** (someone must divide the data) and **data too large to fully materialize per worker** (the [AI Runtime data-loading guidance](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes) threshold for exporting large Delta tables to volumes). A single-GPU run on a small Hub-hosted dataset needs neither — one process already owns all the data, and loading it costs seconds — which is why simpler examples skip partitioning entirely. This demo sits past both thresholds at once (a ~24M-row SFT table with fat prompt strings, trained with multi-GPU DDP), which is why the export/shard contract exists.
-
-## Training via the AI Runtime CLI
-
-The same training code that the notebook's `@distributed` cell runs can be submitted from a laptop with the [AI Runtime CLI](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/cli/), without opening a notebook. `train/train.yaml` is the single configuration file for both paths: its top-level fields define the CLI workload (experiment, environment, compute, code snapshot, command) and its `parameters` sections hold the stage's own training and deployment settings. The FSDP variant works the same way through `train/train_fsdp.yaml`.
-
-1. Install the CLI (requires Python 3.10+ and [uv](https://docs.astral.sh/uv/)):
-
-   ```bash
-   uv tool install --force databricks-air --python 3.12
-   air --version
-   ```
-
-2. Authenticate. The CLI reuses Databricks CLI profiles from `~/.databrickscfg`:
-
-   ```bash
-   databricks auth login --host https://<your-workspace>.cloud.databricks.com
-   ```
-
-3. Submit the training workload (run the setup notebooks first — training reads the Parquet shard export `setup/02_stage_training_data.py` produces):
-
-   ```bash
-   cd train && COPYFILE_DISABLE=1 air run --file train.yaml --watch -p <profile>
-   ```
-
-   For the FSDP variant, submit `--file train_fsdp.yaml` instead.
-
-   `--watch` streams the job state and node logs until the run finishes. Validate the file without submitting using `--dry-run`, and override config values per run without editing the file, for example:
-
-   ```bash
-   COPYFILE_DISABLE=1 air run --file train.yaml \
-     --override parameters.training_config.max_steps=50 --watch
-   ```
-
-   `COPYFILE_DISABLE=1` is required on macOS: without it, bsdtar embeds AppleDouble (`._*`) metadata entries in the code-snapshot tarball, the remote launcher resolves the code directory from the archive's first entry, and the job fails before user code with `can't open file '/databricks/code_source/._<snapshot-dir>/train/train.py'` (the snapshot roots at the repo so `global.yaml` ships with the code). Two related CLI workarounds are already baked into this repo: `$HYPERPARAMETERS_PATH` shape handling in `training_utils.py`, and the `DATABRICKS_RUNTIME_VERSION` entry under `env_variables` in `train.yaml`.
-
-4. Monitor and manage runs:
-
-   ```bash
-   air list runs --limit 10        # recent runs (--active for running only)
-   air get run <run-id>            # status and configuration for one run
-   air logs <run-id>               # stream logs (defaults to node 0)
-   air cancel <run-id>             # stop a run (do this on failures — max_retries
-                                   # otherwise reruns the same broken workload)
-   ```
-
-Runs land in the same MLflow experiment as notebook runs (AIR resolves `experiment_name` to `/Users/<you>/<experiment_name>`), with two markers distinguishing the launch path: the run name carries an `-air-cli` suffix and the run is tagged `submitted_via: air-cli` (notebook runs are tagged `submitted_via: notebook`). Filter with `tags.submitted_via = 'air-cli'` in the MLflow UI.
-
-To scale up, edit `compute` in the workload YAML (for example `num_accelerators: 8` with `accelerator_type: GPU_8xH100`) — the same block sizes the notebook's `@distributed` cell, and each rank loads only its own `shard_id` directories from the Parquet export. The CLI path runs training only; model registration and endpoint deployment live in `train/02_register_and_deploy.py`, which resolves the adapter from the MLflow run — CLI runs land in the same experiment, so best-run auto-selection covers them too.
+Each project's serving environment is its local `requirements.txt`. The
+`transformers<5`, `vllm==0.11.0`, and
+`opencv-python-headless==4.12.0.88` pins are required for the current
+FIPS-enabled serving environment. Do not replace them without revalidating
+the target model architecture and serving image.
 
 ## Local Development
 
-Create and activate a virtual environment if needed:
+Setup notebooks 01-03 can run through Databricks Connect after installing
+their lightweight local dependencies:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-```
-
-Install local dependencies:
-
-```bash
-.venv/bin/python -m pip install -r train/requirements.txt
-```
-
-The ingestion and training-data staging notebooks can run with Databricks Connect when authentication is configured:
-
-```bash
-databricks auth profiles
+pip install "databricks-connect>=17.0.0" "pyyaml>=6.0.2" "pandas>=2.2.0"
 .venv/bin/python setup/01_load_dataset.py
 .venv/bin/python setup/02_stage_training_data.py
+.venv/bin/python setup/03_prepare_sft.py
 ```
 
-Validate the configuration contracts at any time without a workspace connection:
-
-```bash
-python scripts/validate_config.py
-```
-
-The training notebook is intended to run on Databricks Serverless GPU because it depends on AI Runtime, GPU hardware, and the `serverless_gpu` distributed runtime.
-
-## References
-
-- Databricks AI Runtime: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/
-- AI Runtime data loading: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading
-- gpt-oss-120b DDP/FSDP tutorial (basis for `train_fsdp.py`): https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-gpt-oss-120b-ddp-fsdp
-- Databricks custom LLM serving: https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms
-- AI Gateway inference tables: https://docs.databricks.com/aws/en/ai-gateway/inference-tables
-- Data quality monitoring: https://docs.databricks.com/aws/en/data-governance/unity-catalog/data-quality-monitoring/
-- IBM TabFormer dataset: https://github.com/IBM/TabFormer
+The training runners require Databricks Serverless GPU and cannot run locally.
+The model-download notebook requires the workspace `/Volumes` FUSE mount.

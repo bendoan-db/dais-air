@@ -1,9 +1,8 @@
 # Stage-specific configuration for the setup notebooks. catalog/schema come
-# from the repo-root global.yaml (training_utils.load_global_config()).
-# Values shared with other stages must agree across files and
-# scripts/validate_config.py checks every agreement: source_table, sft_table,
-# and sft_volume with train/train.yaml's training_config, and the models
-# list below must cover its model_volume_path.
+# from the repo-root global.yaml (setup/utils.py load_global_config()).
+# Values shared with other stages are checked by scripts/validate_config.py.
+# The standalone training projects use explicit volume paths rather than
+# loading this file.
 
 # Cleaned transaction table written by 01 and read by 02.
 source_table: fraud_dataset
@@ -12,6 +11,9 @@ source_table: fraud_dataset
 # SFT prompt/response formatting happens in the training loop, not here.
 sft_table: fraud_sft_dataset
 sft_volume: training_data
+# Model-agnostic prompt/response export written by 03_prepare_sft.py.
+sft_staging_volume: sft_staging
+suspicious_amount_threshold: 500.0
 
 # ---- 01_load_dataset.py (example dataset ingestion) ----
 staging_volume: setup_assets
@@ -41,17 +43,16 @@ sft_shard_key_columns:
   - merchant_state_text
   - mcc_text
 
-# ---- 03_download_base_model_weights.py (model snapshots) ----
+# ---- 04_download_base_model_weights.py (model snapshots) ----
 # Optional Databricks secret holding a Hugging Face token, required for gated
 # models (e.g. meta-llama). Leave both empty for public models.
 hf_token_secret_scope: ''
 hf_token_secret_key: ''
-# Hugging Face models that 03_download_base_model_weights.py snapshots into
+# Hugging Face models that 04_download_base_model_weights.py snapshots into
 # UC volumes. Each entry pairs a Hugging Face repo id with the
 # /Volumes/<catalog>/<schema>/<volume>/... directory that receives the
-# weights. train/train.yaml's model_volume_path (training_config) must equal
-# the volume_path of the entry the fine-tune loads (with huggingface_path
-# matching its model_name).
+# weights. A training project's model_weights_path may point at one of these
+# snapshots or at another pre-populated model volume.
 models:
   - huggingface_path: unsloth/Qwen3-4B-Instruct-2507
     volume_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3-4b-instruct

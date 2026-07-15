@@ -6,10 +6,10 @@
 # MAGIC This notebook turns the raw-record train/eval export staged by `setup/02_stage_training_data.py` into supervised fine-tuning records and stages them in their own Unity Catalog volume:
 # MAGIC
 # MAGIC 1. Reads the raw parquet export (`split=train|eval / shard_id=N`) from the setup stage's volume.
-# MAGIC 2. Renders each record's `prompt` and `assistant_response` with the shared template and labeling heuristic in `train/training_utils.py` (`render_fraud_prompt` / `render_fraud_response` — the same functions the load test renders live payloads with, so every stage sees byte-identical prompts).
-# MAGIC 3. Writes the SFT records to `sft_staging_volume` (train.yaml's `training_config`) as parquet with the **same `split`/`shard_id` partitioning** — the files the training loop (`train.py` / `train_fsdp.py`) reads: each GPU rank claims the `split=train/shard_id=N` directories where `N % world_size == rank`, and evaluation samples `split=eval`.
+# MAGIC 2. Renders each record's `prompt` and `assistant_response` with the shared template and labeling heuristic in `setup/utils.py` (`render_fraud_prompt` / `render_fraud_response` — the load-test and trainer copies are checked against these canonical functions, so every stage sees byte-identical prompts).
+# MAGIC 3. Writes the SFT records to `sft_staging_volume` from `setup.yaml` with the same `split`/`shard_id` partitioning consumed by both standalone training projects.
 # MAGIC
-# MAGIC The staged records stay **model-agnostic**: each model's own chat template is applied inside the training loop, not here, so one prep run serves both training variants. Rerun this notebook after re-running setup/02, or after changing the prompt template (`training_utils.py`) or `suspicious_amount_threshold` (`train.yaml`).
+# MAGIC The staged records stay **model-agnostic**: each model's own chat template is applied inside its training loop. Rerun this notebook after setup/02 or after changing the prompt template or `suspicious_amount_threshold` in `setup.yaml`.
 # MAGIC
 # MAGIC **The SFT staging export is overwritten on every run.** Runs on serverless compute; running locally via Databricks Connect additionally requires the local Python minor version to match the serverless runtime's — the render step is a Python UDF, and Connect rejects UDFs across mismatched Python versions.
 
@@ -18,6 +18,8 @@
 import sys
 from pathlib import Path
 
+import yaml
+
 try:
     script_dir = Path(__file__).resolve().parent
 except NameError:
@@ -25,12 +27,18 @@ except NameError:
     notebook_path = notebook_context.notebookPath().get()
     script_dir = Path("/Workspace") / notebook_path.lstrip("/").rsplit("/", 1)[0]
 
-# This notebook lives in train/, next to training_utils.py (a plain Python
-# module — imported, never %run).
-if str(script_dir) not in sys.path:
-    sys.path.insert(0, str(script_dir))
+setup_module_dir = script_dir.resolve()
+if str(setup_module_dir) not in sys.path:
+    sys.path.insert(0, str(setup_module_dir))
 
-from training_utils import ensure_uc_object, get_spark_session, load_training_config
+from utils import (
+    config_float,
+    config_str,
+    ensure_uc_object,
+    full_name,
+    get_spark_session,
+    load_global_config,
+)
 
 # Databricks notebooks inject display(); local Databricks Connect runs need
 # a plain-text fallback.
@@ -42,11 +50,22 @@ except NameError:
 
 # COMMAND ----------
 
-# Bind the training configuration (train.yaml's parameters.training_config
-# plus derived paths). The SFT staging is model-agnostic, so the default
-# train.yaml serves the FSDP variant too — sft_staging_volume must match
-# across the two workload files (validated by scripts/validate_config.py).
-globals().update(load_training_config())
+config_path = script_dir / "setup.yaml"
+with config_path.open("r", encoding="utf-8") as config_file:
+    config = yaml.safe_load(config_file)
+
+_, global_config = load_global_config()
+catalog = config_str(global_config, "catalog")
+schema = config_str(global_config, "schema")
+sft_table = config_str(config, "sft_table")
+sft_volume = config_str(config, "sft_volume")
+sft_staging_volume = config_str(config, "sft_staging_volume")
+SUSPICIOUS_AMOUNT_THRESHOLD = config_float(config, "suspicious_amount_threshold")
+
+RAW_SPLIT_FILES_DIR = f"/Volumes/{catalog}/{schema}/{sft_volume}/{sft_table}"
+SFT_FILES_DIR = f"/Volumes/{catalog}/{schema}/{sft_staging_volume}/{sft_table}"
+schema_q = full_name(catalog, schema)
+sft_staging_volume_q = full_name(catalog, schema, sft_staging_volume)
 
 print(f"Raw split export (input): {RAW_SPLIT_FILES_DIR}")
 print(f"SFT staging export (output): {SFT_FILES_DIR}")
@@ -83,23 +102,23 @@ if "split" not in raw_df.columns or "shard_id" not in raw_df.columns:
 # MAGIC %md
 # MAGIC ## Render the SFT records
 # MAGIC
-# MAGIC The prompt/response text comes from the shared renderers in `training_utils.py` — the single source of the prompt contract (the monitor's `prompt_fields` extraction and the load test's payloads depend on this exact shape).
+# MAGIC The prompt/response text comes from the canonical renderers in `setup/utils.py` — the single source of the prompt contract (the monitor's `prompt_fields` extraction and the load test's payloads depend on this exact shape).
 # MAGIC They run row-wise inside `mapInPandas`, so the rendering parallelizes across the cluster; the module file is shipped to the executors as a session artifact because they do not share this interpreter's `sys.path`.
 
 # COMMAND ----------
 
-TRAINING_UTILS_PATH = str(script_dir / "training_utils.py")
+SETUP_UTILS_PATH = str(setup_module_dir / "utils.py")
 
 try:
-    spark.addArtifact(TRAINING_UTILS_PATH, pyfile=True)
+    spark.addArtifact(SETUP_UTILS_PATH, pyfile=True)
 except Exception as artifact_exc:
     # Rerunning in a session that already holds a different version of the
     # artifact raises; classic (non-Connect) clusters take the addPyFile path.
     try:
-        spark.sparkContext.addPyFile(TRAINING_UTILS_PATH)
+        spark.sparkContext.addPyFile(SETUP_UTILS_PATH)
     except Exception:
         print(
-            f"Note: could not distribute training_utils.py ({artifact_exc}); "
+            f"Note: could not distribute setup/utils.py ({artifact_exc}); "
             "relying on the runtime's workspace-file sync. If the render step "
             "fails with ModuleNotFoundError, restart the session and rerun."
         )
@@ -114,7 +133,7 @@ suspicious_amount_threshold = float(SUSPICIOUS_AMOUNT_THRESHOLD)
 
 def render_sft_batches(batches):
     import pandas as pd
-    from training_utils import render_fraud_prompt, render_fraud_response
+    from utils import render_fraud_prompt, render_fraud_response
 
     for raw_pdf in batches:
         records = raw_pdf.to_dict("records")
@@ -210,6 +229,6 @@ display(
 )
 
 print(
-    "SFT records staged. Next: train/01_runner.py "
-    "(or `air run --file train.yaml` from train/)."
+    "SFT records staged. Next: run a project notebook under train/, or run "
+    "`air run --file train.yaml` from that project directory."
 )

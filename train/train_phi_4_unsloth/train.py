@@ -1,4 +1,4 @@
-"""Standalone training entrypoint for the AIR fine-tuning pipeline.
+"""Standalone Phi-4 Unsloth training entrypoint.
 
 This module owns the Unsloth LoRA training implementation and runs two ways:
 
@@ -7,10 +7,8 @@ This module owns the Unsloth LoRA training implementation and runs two ways:
 - Executed directly as ``python train.py`` by the AI Runtime CLI
   (``air run --file train.yaml``), where each GPU worker runs this file.
 
-Configuration comes from the ``parameters.training_config`` section of
-``train.yaml`` (the same file that defines the AI Runtime CLI workload;
-under an AIR run it arrives via ``$HYPERPARAMETERS_PATH``) and shared
-helpers from ``training_utils.py``, both in the same directory as this file.
+Configuration and helper code live beside this file. Under an AIR run the
+submitted configuration arrives through ``$HYPERPARAMETERS_PATH``.
 """
 
 import os
@@ -29,23 +27,34 @@ from trl import SFTTrainer, SFTConfig
 
 from pathlib import Path
 
-# The helpers module is deliberately NOT named `utils`: the Databricks AI base
-# environment's nvidia_cutlass_dsl package registers its own top-level `utils`
-# module once the torch/CUDA stack loads, which shadows any local utils.py.
-from training_utils import (
-    VOLUME_PATH_PREFIX,
-    claim_rank_shard_files,
-    load_training_config,
-    sample_eval_records,
-    stage_model_locally,
-)
+try:
+    from .project_config import (
+        VOLUME_PATH_PREFIX,
+        claim_rank_shard_files,
+        load_project_config,
+        sample_eval_records,
+        stage_model_locally,
+    )
+except ImportError:
+    from project_config import (
+        VOLUME_PATH_PREFIX,
+        claim_rank_shard_files,
+        load_project_config,
+        sample_eval_records,
+        stage_model_locally,
+    )
 
-# Bind the shared configuration into module globals: typed training_config
-# values (MODEL_NAME, MAX_SEQ_LENGTH, hyperparameters, SEED, ...), derived
-# names (SOURCE_TABLE, SFT_TABLE, TRAINING_OUTPUT_DIR, TRAINING_RUN_NAME), and
-# quoted SQL identifiers (sft_table_q) — the same names the runner notebook
-# binds into its session.
-globals().update(load_training_config())
+try:
+    from .sft_conversion import prepare_sft_records
+except ImportError:
+    from sft_conversion import prepare_sft_records
+
+globals().update(load_project_config())
+if RESPONSE_INSTRUCTION_PART is None or RESPONSE_PART is None:
+    raise ValueError(
+        "train.yaml must define response_instruction_part and response_part "
+        "for response-only loss masking"
+    )
 
 # The AI Runtime CLI launch wrapper exports these before running the script;
 # neither is present under the notebook's @distributed path. Used to label
@@ -59,15 +68,15 @@ LAUNCHER = "air-cli" if LAUNCHED_VIA_AIR_CLI else "notebook"
 
 def load_unsloth_model(model_name: str, device_map=None):
     # model_name is either a Hugging Face repo id or a local directory — the
-    # UC volume snapshot of the base weights (model_volume_path in train.yaml)
+    # UC volume snapshot configured by model_weights_path in train.yaml.
     # or a trained adapter dir. Fail fast on a missing local path so the error
     # isn't unsloth/transformers treating it as a repo id and dying with an
     # HF 401/404.
     if model_name.startswith("/") and not Path(model_name).exists():
         raise FileNotFoundError(
             f"Local model path does not exist: {model_name}. If this is "
-            "model_volume_path from train.yaml, populate the volume first by "
-            "running setup/03_download_base_model_weights.py (or `hf download "
+            "model_weights_path from train.yaml; populate the volume first by "
+            "running setup/04_download_base_model_weights.py (or `hf download "
             f"{MODEL_NAME} --local-dir {model_name}`)."
         )
     if model_name.startswith(VOLUME_PATH_PREFIX):
@@ -86,6 +95,11 @@ def load_unsloth_model(model_name: str, device_map=None):
     if device_map is not None:
         load_kwargs["device_map"] = device_map
     return FastLanguageModel.from_pretrained(**load_kwargs)
+
+
+def load_model_for_merge(adapter_output_dir: str):
+    """Load this project's adapter for the deployment merge notebook."""
+    return load_unsloth_model(adapter_output_dir)
 
 
 def _restore_saved_adapter_base_path(output_dir: str) -> None:
@@ -113,7 +127,6 @@ def render_chat_messages(tokenizer, messages: list[dict[str, str]]) -> str:
         messages,
         tokenize=False,
         add_generation_prompt=False,
-        enable_thinking=False,
     )
 
 
@@ -194,7 +207,6 @@ def evaluate_fraud_classification(model, tokenizer, eval_pdf, batch_size: int = 
                 [{"role": "user", "content": prompt}],
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=False,
             )
             for prompt in batch_prompts
         ]
@@ -223,7 +235,7 @@ def evaluate_fraud_classification(model, tokenizer, eval_pdf, batch_size: int = 
     return metrics
 
 
-def train_qwen3_unsloth(
+def train_phi4_unsloth(
     *,
     examples_pdf: pd.DataFrame,
     output_dir: str,
@@ -243,6 +255,11 @@ def train_qwen3_unsloth(
     is_main_process = rank == 0
     save_artifacts = save_artifacts and is_main_process
 
+    examples_pdf = prepare_sft_records(
+        examples_pdf,
+        convert_sft=CONVERT_SFT,
+        suspicious_amount_threshold=SUSPICIOUS_AMOUNT_THRESHOLD,
+    )
     dataset = Dataset.from_pandas(
         examples_pdf[["prompt", "assistant_response"]],
         preserve_index=False,
@@ -250,10 +267,9 @@ def train_qwen3_unsloth(
 
     model, tokenizer = load_unsloth_model(MODEL_LOAD_PATH, device_map=device_map)
 
-    # The SFT records are pre-rendered by train/00_prep_sft.py; the per-model
-    # formatting step — the loaded model's own chat template — is applied
-    # here in the training loop, so swapping the base model swaps the
-    # formatting without restaging the records.
+    # Raw records are converted above when configured; pre-converted records
+    # pass through unchanged. The loaded model's own chat template is always
+    # applied here so model-specific formatting remains local to the trainer.
     def formatting_prompts_func(examples):
         texts = [
             render_chat_messages(
@@ -386,8 +402,11 @@ def train_qwen3_unsloth(
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "max_steps": MAX_STEPS,
                     "rank_0_training_record_count": len(examples_pdf),
-                    "source_table": SOURCE_TABLE,
-                    "sft_table": SFT_TABLE,
+                    "train_data_path": TRAIN_DATA_PATH,
+                    "eval_data_path": EVAL_DATA_PATH,
+                    "convert_sft": CONVERT_SFT,
+                    "ignore_partitions": IGNORE_PARTITIONS,
+                    "suspicious_amount_threshold": SUSPICIOUS_AMOUNT_THRESHOLD,
                     "lora_r": LORA_R,
                     "lora_alpha": LORA_ALPHA,
                     "lora_dropout": LORA_DROPOUT,
@@ -428,7 +447,16 @@ def train_qwen3_unsloth(
         if EVAL_SAMPLE_SIZE > 0:
             try:
                 eval_pdf = sample_eval_records(
-                    SFT_FILES_DIR, EVAL_SAMPLE_SIZE, SEED, stratify_column="is_fraud"
+                    EVAL_DATA_PATH,
+                    EVAL_SAMPLE_SIZE,
+                    SEED,
+                    stratify_column="is_fraud",
+                    ignore_partitions=IGNORE_PARTITIONS,
+                )
+                eval_pdf = prepare_sft_records(
+                    eval_pdf,
+                    convert_sft=CONVERT_SFT,
+                    suspicious_amount_threshold=SUSPICIOUS_AMOUNT_THRESHOLD,
                 )
                 fraud_metrics = evaluate_fraud_classification(model, tokenizer, eval_pdf)
                 for metric_name, metric_value in fraud_metrics.items():
@@ -494,14 +522,19 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     rank, world_size, local_rank = get_distributed_context()
     torch.cuda.set_device(local_rank)
 
-    # Read the SFT records (rendered and staged by train/00_prep_sft.py) as
-    # parquet shard files from the UC volume instead of querying Delta
+    # Read raw or pre-converted records as parquet shard files from the UC
+    # volume instead of querying Delta
     # through Spark on the GPU workers, per the AIR data-loading guidance:
     # https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
     # Training reads only the train split; the eval split feeds the
     # post-training fraud-classification evaluation on rank 0.
     rank_files, within_shard_fraction = claim_rank_shard_files(
-        SFT_FILES_DIR, "train", rank, world_size, sample_fraction, SEED
+        TRAIN_DATA_PATH,
+        rank,
+        world_size,
+        sample_fraction,
+        SEED,
+        ignore_partitions=IGNORE_PARTITIONS,
     )
 
     dataset = load_dataset("parquet", data_files=rank_files, split="train")
@@ -510,13 +543,14 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
         examples_pdf = examples_pdf.sample(frac=within_shard_fraction, random_state=SEED)
 
     run_suffix = "-air-cli" if LAUNCHED_VIA_AIR_CLI else ""
+    data_mode = "full_dataset" if IGNORE_PARTITIONS else "rank_sharded"
 
     try:
-        return train_qwen3_unsloth(
+        return train_phi4_unsloth(
             examples_pdf=examples_pdf,
             output_dir=f"{TRAINING_OUTPUT_DIR}/{world_size}gpu",
             run_name=f"{TRAINING_RUN_NAME}-{world_size}gpu{run_suffix}",
-            training_mode=f"{world_size}_gpu_rank_sharded_sample",
+            training_mode=f"{world_size}_gpu_{data_mode}_sample",
             num_gpus=world_size,
             device_map={"": local_rank},
             save_artifacts=rank == 0,

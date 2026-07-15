@@ -1,6 +1,6 @@
 # Stage-specific configuration for the load-test notebook. catalog/schema
 # come from the repo-root global.yaml. sft_table must match setup/train and
-# endpoint_name must match train/train.yaml's deploy_config;
+# endpoint_name must match train/train_qwen_unsloth/train.yaml's deploy_config;
 # scripts/validate_config.py checks both agreements.
 sft_table: fraud_sft_dataset
 endpoint_name: qwen3_4b_instruct_finetuned_v2
@@ -25,8 +25,8 @@ worker_concurrency: 4
 request_timeout_seconds: 30
 
 # Request prompts are rendered live from raw records sampled from the staged
-# table's eval split (rows the model never trained on), using the same shared
-# prompt template as training (training_utils.render_fraud_prompt).
+# table's eval split (rows the model never trained on), using the stage-local
+# prompt renderer checked against setup and every trainer by the validator.
 prompt_sample_fraction: 0.001
 prompt_sample_size: 1000
 smoke_test_requests: 2

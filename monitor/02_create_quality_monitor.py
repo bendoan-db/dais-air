@@ -22,16 +22,14 @@
 
 # COMMAND ----------
 
-# training_utils (train/) and monitoring_utils (this folder) are plain
-# Python modules, not notebooks; insert their directories into sys.path.
+# utils.py and monitoring_utils.py are plain monitoring-stage modules, not
+# notebooks; insert this notebook's directory into sys.path.
 import sys
 from pathlib import Path
 
-TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
 MONITOR_MODULE_DIR = str(Path.cwd().resolve())
-for module_dir in (TRAIN_MODULE_DIR, MONITOR_MODULE_DIR):
-    if module_dir not in sys.path:
-        sys.path.insert(0, module_dir)
+if MONITOR_MODULE_DIR not in sys.path:
+    sys.path.insert(0, MONITOR_MODULE_DIR)
 
 from monitoring_utils import (
     PROMPT_COLUMN_PREFIX,
@@ -39,7 +37,7 @@ from monitoring_utils import (
     with_prompt_fields,
     with_response_fields,
 )
-from training_utils import (
+from utils import (
     config_str,
     full_name,
     get_spark_session,

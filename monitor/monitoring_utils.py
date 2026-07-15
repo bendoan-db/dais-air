@@ -1,7 +1,7 @@
 """Shared helpers for the monitoring stage.
 
 This is a plain Python module (NOT a Databricks notebook), like
-``train/training_utils.py``: the monitor notebooks insert this directory into
+``monitor/utils.py``: the monitor notebooks insert this directory into
 ``sys.path`` and import it — never ``%run`` it, and never add the notebook
 header (notebook-formatted files cannot be imported in the workspace).
 

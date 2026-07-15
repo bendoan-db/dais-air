@@ -3,7 +3,7 @@
 # MAGIC %md
 # MAGIC # Unpack the serving endpoint's inference table
 # MAGIC
-# MAGIC This is the first module of the monitoring stage: it converts the raw payload table that the serving endpoint writes (AI Gateway inference logging, enabled by `train/02_register_and_deploy.py`) into an analysis-ready Delta table with one row per request — the table the data-quality monitor is created over in the next module.
+# MAGIC This is the first module of the monitoring stage: it converts the raw payload table that the serving endpoint writes (AI Gateway inference logging, enabled by the selected project's `02_register_and_deploy.py`) into an analysis-ready Delta table with one row per request — the table the data-quality monitor is created over in the next module.
 # MAGIC
 # MAGIC The payload table stores each request/response pair as raw JSON strings alongside delivery metadata. This notebook:
 # MAGIC
@@ -22,16 +22,14 @@
 
 # COMMAND ----------
 
-# training_utils (train/) and monitoring_utils (this folder) are plain
-# Python modules, not notebooks; insert their directories into sys.path.
+# utils.py and monitoring_utils.py are plain monitoring-stage modules, not
+# notebooks; insert this notebook's directory into sys.path.
 import sys
 from pathlib import Path
 
-TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
 MONITOR_MODULE_DIR = str(Path.cwd().resolve())
-for module_dir in (TRAIN_MODULE_DIR, MONITOR_MODULE_DIR):
-    if module_dir not in sys.path:
-        sys.path.insert(0, module_dir)
+if MONITOR_MODULE_DIR not in sys.path:
+    sys.path.insert(0, MONITOR_MODULE_DIR)
 
 from monitoring_utils import (
     PROMPT_COLUMN_PREFIX,
@@ -41,7 +39,7 @@ from monitoring_utils import (
     with_prompt_fields,
     with_response_fields,
 )
-from training_utils import (
+from utils import (
     config_bool,
     config_str,
     ensure_uc_object,
@@ -97,7 +95,7 @@ try:
 except Exception as exc:
     raise RuntimeError(
         f"Payload table {payload_table_q} is not readable. Deploy the endpoint "
-        "first (train/02_register_and_deploy.py enables inference logging "
+        "first (the project-local 02_register_and_deploy.py enables inference logging "
         "automatically) and send it some traffic — logs are delivered within "
         "~1 hour of a request."
     ) from exc

@@ -166,7 +166,7 @@ code as a number would produce meaningless numeric drift.
 
 The extraction-expression builder lives in a new **plain Python module**
 `monitor/monitoring_utils.py` (no `# Databricks notebook source` header — same
-precedent as `train/train.py`), imported by both module 01 (serving traffic) and
+precedent as the project-local training modules), imported by both module 01 (serving traffic) and
 module 02 (baseline build, §6) so the two tables are guaranteed to parse
 identically. CLAUDE.md's notebook-format rule gains this file as a documented
 exception.
@@ -435,7 +435,7 @@ label_field: ""
 ### Files (implemented)
 
 - `monitor/monitoring_utils.py` — **plain Python module** (no notebook header;
-  same precedent as `train/train.py`): the `txn_*`/`response_*` extraction
+  same precedent as the project-local training modules): the `txn_*`/`response_*` extraction
   helpers plus `parse_quality_monitor_config()`, shared by modules 01 and 02 so
   serving and baseline tables parse identically. pyspark imports stay inside
   the DataFrame helpers so `scripts/validate_config.py` can import the parsers
