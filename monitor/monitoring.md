@@ -10,7 +10,7 @@ produces.
 > `monitor/monitoring_utils.py` (shared plain module) and is wired into
 > module 01; the baseline build and monitor creation are
 > `monitor/02_create_quality_monitor.py`; the config keys are in
-> `monitor/monitor.yaml` and validated by `scripts/validate_config.py`.
+> `monitor/monitor.yaml` and parsed by the monitoring notebooks.
 > Phase 2 (§9) and the SQL alerts (§11) remain to be set up per workspace. The model is treated as a **classifier**: every request/response pair
 follows the shape in `monitor/example_inputs.py` — a single user message whose
 prompt always ends with a fixed transaction block:
@@ -325,8 +325,8 @@ end-to-end labeled demo.
   transactions that reach the endpoint (a selection effect if upstream routing
   changes). A plain time-series monitor on the upstream transaction table covers
   the full population if that distinction matters.
-- **Failed-request visibility** — 4xx/5xx (including 429s beyond provisioned
-  concurrency) may never reach the inference table; error-rate alerting stays
+- **Failed-request visibility** — overload-related 4xx/5xx responses may never
+  reach the inference table; error-rate alerting stays
   client-side.
 - **Delivery lag** — inference logging is best-effort within ~1 hour; the most
   recent window is always partially filled. Alerts should exclude the current
@@ -420,9 +420,8 @@ slicing_fields: [action]
 # Monitor windows; each granularity adds refresh cost.
 granularities: ["1 day"]
 # Baseline table name (overwritten on each run of module 02). The baseline
-# source is monitor.yaml's own sft_table, agreement-checked against
-# setup/train by scripts/validate_config.py so the baseline cannot point at
-# a different table than training read.
+# source is monitor.yaml's own sft_table; keep it aligned with the table used
+# by setup and training.
 baseline_table: qwen3_4b_instruct_finetuned_requests_baseline
 # Fraction of the SFT table sampled into the baseline (seeded).
 baseline_sample_fraction: 0.05
@@ -437,10 +436,9 @@ label_field: ""
 - `monitor/monitoring_utils.py` — **plain Python module** (no notebook header;
   same precedent as the project-local training modules): the `txn_*`/`response_*` extraction
   helpers plus `parse_quality_monitor_config()`, shared by modules 01 and 02 so
-  serving and baseline tables parse identically. pyspark imports stay inside
-  the DataFrame helpers so `scripts/validate_config.py` can import the parsers
-  in CI (where only pyyaml is installed). Documented as a notebook-format
-  exception in CLAUDE.md.
+  serving and baseline tables parse identically. Pyspark imports stay inside
+  the DataFrame helpers so the configuration parsers remain importable without
+  a Spark session. Documented as a notebook-format exception in CLAUDE.md.
 - `monitor/01_unpack_inference_table.py` — extended with the prompt-feature
   extraction (§4). Schema change ⇒ existing deployments delete the checkpoint
   and unpacked table and reprocess.
@@ -451,11 +449,10 @@ label_field: ""
   table names and dashboard pointer.
 - *(Phase 2, future)* `monitor/03_join_ground_truth.py` — label MERGE task.
 
-### Validation (`scripts/validate_config.py`, implemented)
+### Runtime Configuration Checks
 
-The validator imports `monitoring_utils.parse_quality_monitor_config` — the
-same parser both notebooks use — so every rule below fails in CI exactly as it
-would fail at runtime:
+Module 02 calls `monitoring_utils.parse_quality_monitor_config` before creating
+or updating the monitor. It rejects invalid settings for these rules:
 
 - `prompt_fields` entries must be `{name, type}` mappings with identifier-safe
   unique names and a `type` in `{string, int, double, timestamp}`;
@@ -467,14 +464,10 @@ would fail at runtime:
   or `prompt_fields` entry); `granularities` must use supported window
   spellings; `baseline_sample_fraction` must be in `(0, 1]`;
   `baseline_table` is required.
-- **Warning (non-fatal)**: a `prompt_fields` name with no `- <name>: ` line in
-  `setup/02_stage_training_data.py`'s prompt template — the `txn_` column
-  would be 100% null on prompts built by this repo's setup stage. A warning
-  rather than an error because the template is example-specific.
-- catalog/schema live only in the repo-root `global.yaml` (the no-shadowing
-  check keeps stage YAMLs from re-introducing them); `sft_table` and the
-  payload-table name are stage-owned and agreement-checked by
-  `scripts/validate_config.py`.
+
+Catalog/schema live in the repo-root `global.yaml`. The `sft_table` and payload
+table names are stage-owned and must remain aligned with setup, training, and
+deployment configuration.
 
 ### Permissions
 

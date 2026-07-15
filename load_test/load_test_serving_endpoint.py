@@ -233,7 +233,7 @@ if "READY" not in ready_state.upper():
 # MAGIC %md
 # MAGIC ## Build request payloads from staged transaction records
 # MAGIC
-# MAGIC The staged table holds raw transaction records (prompt text is rendered at training time, not stored), so the load test samples eval-split rows and renders each prompt with the same shared template training uses (`utils.render_fraud_prompt`, checked against setup and each trainer by `scripts/validate_config.py`) — the request shape matches fine-tuning exactly, while the traffic itself is data the model never trained on.
+# MAGIC The staged table holds raw transaction records (prompt text is rendered at training time, not stored), so the load test samples eval-split rows and renders each prompt with the same shared template training uses (`utils.render_fraud_prompt`; keep it synchronized with setup and each trainer) — the request shape matches fine-tuning exactly, while the traffic itself is data the model never trained on.
 # MAGIC Each request sends a chat payload with one user message, plus deterministic generation settings.
 # MAGIC
 # MAGIC With `disable_thinking: true` (the default), every payload also carries `chat_template_kwargs: {"enable_thinking": false}` — vLLM forwards it into the model's chat template, keeping hybrid reasoning models (base Qwen3) from spending the entire `max_tokens` budget on a reasoning block before the JSON answer. This mirrors training, which renders its chat templates with `enable_thinking=False`.
@@ -381,7 +381,7 @@ if (smoke_test_pdf["status_code"] >= 400).any():
 # MAGIC The load test divides `target_qps` across `load_generator_workers` Spark tasks.
 # MAGIC Each task uses asynchronous HTTP requests with bounded concurrency and attempts to pace requests at its assigned share of the target rate.
 # MAGIC
-# MAGIC The achieved QPS may be lower than the target if the load-generator compute, network path, endpoint queue, or provisioned endpoint replicas become saturated.
+# MAGIC The achieved QPS may be lower than the target if the load-generator compute, network path, endpoint queue, or fixed endpoint replicas become saturated.
 # MAGIC The summary metrics below make that gap visible.
 # MAGIC
 # MAGIC **Inference logging captures this traffic too**: deployment always enables AI Gateway inference tables, so every load-test request/response lands in the endpoint's `<inference_table_prefix>_payload` table (delivery within ~1 hour) and flows into the monitoring stage's unpacked table on its next run. Large tests inflate both tables — and at sustained very high throughput (roughly >70 MB/s of payloads), log delivery may degrade; consider that when sizing `target_qps` or interpreting monitor metrics for load-test windows.
@@ -613,7 +613,7 @@ display(spark.table(results_table_q))
 # MAGIC If the endpoint does not sustain the configured target, use the result tables to separate load-generator limits from serving limits:
 # MAGIC
 # MAGIC - High client-side failures or exceptions usually indicate the load generator needs more workers, more concurrency, or a longer timeout.
-# MAGIC - HTTP `429`, `503`, or long tail latency usually indicates endpoint queueing or insufficient provisioned serving capacity — raise `serving_provisioned_concurrency` in `train/train_qwen_unsloth/train.yaml`'s `deploy_config` and rerun the deployment notebook (capacity is fixed during the custom LLM serving beta; requests beyond it are rejected with instant 429s).
+# MAGIC - HTTP `429`, `503`, or long tail latency usually indicates endpoint queueing or insufficient serving capacity — increase `serving_workload_size` (`Small` → `Medium` → `Large`) or select a larger supported `serving_workload_type` in `train/train_qwen_unsloth/train.yaml`, then rerun the deployment notebook. Capacity is fixed during the custom LLM serving beta.
 # MAGIC - Low achieved QPS with low endpoint latency usually indicates the notebook load generator is saturated before the endpoint.
 # MAGIC
 # MAGIC For production capacity testing, run this notebook against each endpoint size you plan to evaluate and compare the persisted summaries in the results table.

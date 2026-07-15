@@ -8,8 +8,7 @@ Most stage `.py` files are Databricks notebook sources. Plain modules include ea
 
 ## Build, Test, and Development Commands
 
-- `python scripts/validate_config.py`: validate cross-file YAML contracts without connecting to a workspace.
-- `python -m compileall -q setup train load_test monitor scripts`: compile-check all maintained Python sources, matching CI.
+- `python -m compileall -q setup train load_test monitor`: compile-check all maintained Python sources, matching CI.
 - `.venv/bin/python setup/01_load_dataset.py` and `.venv/bin/python setup/02_stage_training_data.py`: run setup through Databricks Connect.
 - `cd train/train_qwen_unsloth && COPYFILE_DISABLE=1 air run --file train.yaml --watch`: submit Qwen training.
 - `cd train/train_phi_4_unsloth && COPYFILE_DISABLE=1 air run --file train.yaml --watch`: submit Phi-4 training.
@@ -24,7 +23,7 @@ Use Python with four-space indentation, `snake_case` functions and variables, an
 
 ## Testing Guidelines
 
-Before every pull request, run both CI commands above. When changing YAML, verify every duplicated stage contract remains aligned. Workspace-dependent changes should be exercised in the appropriate notebook or AIR workload and documented in the PR.
+Before every pull request, run the compile check above. When changing YAML, verify every duplicated stage contract remains aligned. Workspace-dependent changes should be exercised in the appropriate notebook or AIR workload and documented in the PR.
 
 ## Commit & Pull Request Guidelines
 

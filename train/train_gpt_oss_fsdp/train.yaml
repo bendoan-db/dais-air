@@ -74,9 +74,13 @@ parameters:
     vllm_gpu_memory_utilization: 0.8
 
     endpoint_name: gpt_oss_120b_finetuned
+    # AI Gateway writes request/response payloads to
+    # <catalog>.<schema>.<inference_table_prefix>_payload.
     inference_table_prefix: gpt_oss_120b_finetuned
     endpoint_description: 'Custom LLM endpoint serving the GPT-OSS FSDP fine-tune.'
+    # GPT-OSS 120B is served on the documented 1xH100 custom LLM tier. During
+    # beta GPU_XLARGE is limited to us-west-2, requires enrollment, and cannot
+    # scale to zero.
     serving_workload_type: GPU_XLARGE
-    serving_provisioned_concurrency: 1
-    serving_workload_size: ''
+    serving_workload_size: Small
     serving_scale_to_zero: false

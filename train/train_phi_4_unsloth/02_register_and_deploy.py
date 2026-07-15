@@ -13,6 +13,8 @@
 # MAGIC Either way, the adapter location is read from the run's `adapter_output_dir` parameter (logged by training), so this notebook needs no knowledge of checkpoint-volume layout.
 # MAGIC
 # MAGIC **Compute**: attach to **Serverless GPU** with the **AI v5** base environment and enough memory/local disk to load, merge, and save this project's model.
+# MAGIC
+# MAGIC Reference: [Serve custom LLMs with Custom Model Serving](https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms).
 
 # COMMAND ----------
 
@@ -35,15 +37,18 @@ if NOTEBOOK_DIR not in sys.path:
 from project_config import load_deploy_config
 
 # Registration/serving settings come from this project's deploy_config.
-# Values shared with other stages (endpoint_name with the load test,
-# inference_table_prefix with the monitor) are checked by
-# scripts/validate_config.py.
+# Keep endpoint_name aligned with the load test and inference_table_prefix
+# aligned with the monitor.
 deploy_context = load_deploy_config()
 globals().update(deploy_context)
 
 print(f"Deploy config: {DEPLOY_CONFIG_PATH} (parameters.deploy_config)")
 print(f"Registered model target: {FULL_MODEL_NAME}")
 print(f"Serving endpoint: {ENDPOINT_NAME}")
+print(
+    "Inference payload table: "
+    f"{UC_CATALOG}.{UC_SCHEMA}.{INFERENCE_TABLE_PREFIX}_payload"
+)
 print(f"Run selection: {'run_id=' + RUN_ID if RUN_ID else f'best {BEST_RUN_METRIC} ({BEST_RUN_METRIC_GOAL}) in {EXPERIMENT_NAME}'}")
 
 # COMMAND ----------
@@ -151,7 +156,7 @@ display(
 # MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
 # MAGIC - The entrypoint launches from the MLflow model's `artifacts/` folder, so the `--model` path is the bare artifact name relative to that folder.
 # MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
-# MAGIC - The serving container installs packages from this project's `requirements.txt` (referenced by `deploy_config`'s `serving_requirements_file`). The pinned `vllm==0.11.0` + `transformers<5` + `opencv-python-headless==4.12.0.88` combination runs on Model Serving's FIPS-enabled pods, and the base model's architecture must be in that vLLM's supported model list.
+# MAGIC - The serving container installs packages from this project's `requirements.txt` (referenced by `deploy_config`'s `serving_requirements_file`). Its vLLM, transformers, MLflow, SDK, and OpenCV pins follow the current Databricks custom LLM starter environment; the base model's architecture must be in that vLLM version's supported model list.
 # MAGIC
 # MAGIC Registration is separate from training so a failed registration or deployment can be rerun without re-training.
 
@@ -178,6 +183,7 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
     import shutil
 
     import mlflow
+    from mlflow.pyfunc.model import ChatCompletionResponse, ChatModel
 
     mlflow.set_registry_uri("databricks-uc")
 
@@ -186,20 +192,9 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
     # unpickle the model without any repo code and no code_paths are needed in
     # log_model. If this class ever moves into a module or imports repo helpers,
     # registration must add the relevant project files as code_paths.
-    class CustomLlmEntrypointPlaceholder(mlflow.pyfunc.PythonModel):
-        def predict(self, context, model_input, params=None):
-            return {
-                "choices": [
-                    {
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": "Inference is handled by the custom vLLM entrypoint.",
-                        },
-                        "finish_reason": "stop",
-                    }
-                ]
-            }
+    class CustomLlmEntrypointPlaceholder(ChatModel):
+        def predict(self, context, messages, params):
+            return ChatCompletionResponse.from_dict({"choices": []})
 
     metadata = {
         "task": CUSTOM_LLM_TASK,
@@ -314,8 +309,8 @@ display(pd.DataFrame([registration_result]))
 # MAGIC The endpoint configuration is controlled by this project's `train.yaml` `deploy_config`:
 # MAGIC
 # MAGIC - `endpoint_name` is the serving endpoint name used by the load-test notebook.
-# MAGIC - `serving_workload_type` selects the GPU class, such as `GPU_MEDIUM` for A10 or `GPU_XLARGE` for H100.
-# MAGIC - `serving_provisioned_concurrency` sets the fixed provisioned capacity behind the endpoint (custom LLM serving does not autoscale during beta — size for peak traffic).
+# MAGIC - `serving_workload_type` selects a documented custom LLM GPU class: `GPU_SMALL` (T4), `GPU_MEDIUM` (A10), or `GPU_XLARGE` (H100).
+# MAGIC - `serving_workload_size` (`Small`, `Medium`, or `Large`) controls the fixed replica capacity; custom LLM serving does not autoscale between non-zero replica counts during beta.
 # MAGIC - `serving_scale_to_zero` is useful for development, but should be disabled for latency-sensitive production traffic.
 # MAGIC
 # MAGIC The served entity also sets `VLLM_USE_FLASHINFER_SAMPLER=0`: the serving container cannot JIT-compile FlashInfer kernels (no `ninja`/`nvcc`), so vLLM must use its native PyTorch sampler.
@@ -358,9 +353,8 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_name=FULL_MODEL_NAME,
         entity_version=str(model_version),
         workload_type=workload_type,
-        # Fixed capacity — custom LLM serving does not autoscale during beta.
-        min_provisioned_concurrency=SERVING_PROVISIONED_CONCURRENCY,
-        max_provisioned_concurrency=SERVING_PROVISIONED_CONCURRENCY,
+        workload_size=SERVING_WORKLOAD_SIZE,
+        scale_to_zero_enabled=SERVING_SCALE_TO_ZERO,
         environment_vars={
             # The serving container has no ninja/nvcc, so FlashInfer (shipped in
             # the Databricks AI base env) cannot JIT-compile its sampling kernels
@@ -368,8 +362,6 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
             "VLLM_USE_FLASHINFER_SAMPLER": "0",
         },
     )
-    if SERVING_WORKLOAD_SIZE:
-        served_entity_kwargs["workload_size"] = SERVING_WORKLOAD_SIZE
     served_entity = ServedEntityInput(**served_entity_kwargs)
     traffic_config = TrafficConfig(
         routes=[
@@ -402,24 +394,48 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         )
         deployment_action = "created"
 
-    # Inference logging is part of the deployment, not an option: the
-    # monitoring stage depends on the captured requests, so the endpoint is
-    # not considered deployed until its AI Gateway inference table is on.
-    # put_ai_gateway is idempotent and covers both the create and update paths
-    # (update_config does not carry AI Gateway settings). It REPLACES the whole
-    # AI Gateway config — any setting omitted here (or in a later put from the
-    # UI or SDK) is silently disabled, so usage tracking is pinned alongside
-    # inference logging.
-    w.serving_endpoints.put_ai_gateway(
+    # AI Gateway is configured separately from the endpoint model config, so
+    # apply it after both create and update rollouts. PUT replaces the entire
+    # gateway configuration; preserve unrelated settings already on the
+    # endpoint while enabling inference tables and usage tracking.
+    endpoint_details = w.serving_endpoints.get(ENDPOINT_NAME)
+    current_gateway = getattr(endpoint_details, "ai_gateway", None)
+    requested_inference_table = AiGatewayInferenceTableConfig(
+        catalog_name=UC_CATALOG,
+        schema_name=UC_SCHEMA,
+        table_name_prefix=INFERENCE_TABLE_PREFIX,
+        enabled=True,
+    )
+    gateway_response = w.serving_endpoints.put_ai_gateway(
         name=ENDPOINT_NAME,
-        inference_table_config=AiGatewayInferenceTableConfig(
-            catalog_name=UC_CATALOG,
-            schema_name=UC_SCHEMA,
-            table_name_prefix=INFERENCE_TABLE_PREFIX,
-            enabled=True,
-        ),
+        fallback_config=getattr(current_gateway, "fallback_config", None),
+        guardrails=getattr(current_gateway, "guardrails", None),
+        inference_table_config=requested_inference_table,
+        rate_limits=getattr(current_gateway, "rate_limits", None),
         usage_tracking_config=AiGatewayUsageTrackingConfig(enabled=True),
     )
+
+    configured_inference_table = getattr(
+        gateway_response, "inference_table_config", None
+    )
+    if configured_inference_table is None:
+        refreshed_endpoint = w.serving_endpoints.get(ENDPOINT_NAME)
+        refreshed_gateway = getattr(refreshed_endpoint, "ai_gateway", None)
+        configured_inference_table = getattr(
+            refreshed_gateway, "inference_table_config", None
+        )
+    expected_config = requested_inference_table.as_dict()
+    actual_config = (
+        configured_inference_table.as_dict()
+        if configured_inference_table is not None
+        else None
+    )
+    if actual_config != expected_config:
+        raise RuntimeError(
+            f"Inference table configuration failed for {ENDPOINT_NAME}: "
+            f"expected {expected_config}, got {actual_config}"
+        )
+
     inference_payload_table = f"{UC_CATALOG}.{UC_SCHEMA}.{INFERENCE_TABLE_PREFIX}_payload"
 
     endpoint_state = getattr(endpoint, "state", None)
@@ -438,8 +454,9 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         "model_version": str(model_version),
         "served_entity_name": served_entity_name,
         "workload_type": SERVING_WORKLOAD_TYPE,
-        "workload_size": SERVING_WORKLOAD_SIZE or None,
-        "provisioned_concurrency": SERVING_PROVISIONED_CONCURRENCY,
+        "workload_size": SERVING_WORKLOAD_SIZE,
+        "scale_to_zero_enabled": SERVING_SCALE_TO_ZERO,
+        "inference_table_enabled": configured_inference_table.enabled,
         "inference_payload_table": inference_payload_table,
         "endpoint_ready": str(getattr(endpoint_state, "ready", None)),
         "config_update": str(getattr(endpoint_state, "config_update", None)),

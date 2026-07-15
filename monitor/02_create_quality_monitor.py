@@ -45,9 +45,8 @@ from utils import (
     load_yaml_config,
 )
 
-# Stage keys come from monitor.yaml (validated/normalized by
-# parse_quality_monitor_config — the same parser scripts/validate_config.py
-# exercises in CI); catalog/schema come from the repo-root global.yaml.
+# Stage keys come from monitor.yaml and are normalized by
+# parse_quality_monitor_config; catalog/schema come from global.yaml.
 config_path, monitor_config = load_yaml_config("monitor.yaml", base_dir=Path.cwd())
 _, global_config = load_global_config()
 

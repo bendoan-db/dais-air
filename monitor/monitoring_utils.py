@@ -12,9 +12,8 @@ when building the monitor's baseline table — one implementation, so the two
 tables are guaranteed to extract identical columns, the property baseline
 drift comparisons depend on.
 
-``scripts/validate_config.py`` imports the ``parse_*`` functions to validate
-``monitor.yaml`` in CI without a Spark session, which is why the pyspark
-imports stay inside the DataFrame helpers.
+Pyspark imports stay inside the DataFrame helpers so the configuration parsers
+remain importable without a Spark session.
 """
 
 from __future__ import annotations
@@ -107,9 +106,8 @@ def parse_quality_monitor_config(config: dict) -> dict:
     """Validate and normalize the monitor.yaml keys module 02 consumes.
 
     Returns a dict of normalized values; slicing fields are resolved to the
-    extracted column names they refer to. Exercised by
-    ``scripts/validate_config.py`` so misconfigurations fail before any
-    workspace time is spent.
+    extracted column names they refer to. Module 02 calls this before creating
+    or updating the monitor.
     """
     response_json_fields = parse_response_json_fields(config)
     prompt_fields = parse_prompt_fields(config)

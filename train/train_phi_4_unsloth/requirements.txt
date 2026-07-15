@@ -1,7 +1,8 @@
 pyyaml>=6.0.2
 pandas>=2.2.0
 databricks-sdk>=0.102.0
-mlflow>=3.12.0
+mlflow==3.12.0
+openai==2.17.0
 accelerate>=1.11.0
 bitsandbytes>=0.46.0
 datasets>=3.6.0
@@ -10,10 +11,10 @@ peft>=0.19.1
 safetensors>=0.5.0
 torch
 torchao>=0.16.0
-transformers>=4.56.0,<5
+transformers==4.57.6
 trl>=0.24.0
 unsloth
 unsloth_zoo>=2026.4.8
 xformers>=0.0.31.post1
-vllm==0.11.0
+vllm==0.11.2
 opencv-python-headless==4.12.0.88

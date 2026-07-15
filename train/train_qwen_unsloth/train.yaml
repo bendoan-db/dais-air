@@ -87,9 +87,13 @@ parameters:
     vllm_gpu_memory_utilization: 0.8
 
     endpoint_name: qwen3_4b_instruct_finetuned_v2
+    # AI Gateway writes request/response payloads to
+    # <catalog>.<schema>.<inference_table_prefix>_payload.
     inference_table_prefix: qwen3_4b_instruct_finetuned_v2
     endpoint_description: 'Custom LLM endpoint serving the fine-tuned model from the AIR pipeline.'
-    serving_workload_type: GPU_LARGE
-    serving_provisioned_concurrency: 4
-    serving_workload_size: ''
+    # Qwen3-4B fits on the documented 1xA10 custom LLM serving tier. Large
+    # provisions the highest replica count; custom LLM serving does not
+    # autoscale between non-zero replica counts during beta.
+    serving_workload_type: GPU_MEDIUM
+    serving_workload_size: Large
     serving_scale_to_zero: false

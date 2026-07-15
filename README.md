@@ -32,7 +32,6 @@ training project.
 | `train/train_gpt_oss_fsdp/` | Standalone GPT-OSS FSDP training and deployment project. |
 | `load_test/` | Paced asynchronous serving load test with stage-local `utils.py`. |
 | `monitor/` | Inference-table monitoring with stage-local `utils.py` and parsing helpers. |
-| `scripts/validate_config.py` | Offline workload and cross-stage config validation. |
 
 ## Prerequisites
 
@@ -69,11 +68,10 @@ Each project YAML also owns `deploy_config` for its local
 optional model downloads. The GPT-OSS model path is not downloaded by default
 because the snapshot is very large; populate that configured path separately.
 
-Validate all local contracts without a workspace connection:
+Compile-check the local Python sources without a workspace connection:
 
 ```bash
-python scripts/validate_config.py
-python -m compileall -q setup train load_test monitor scripts
+python -m compileall -q setup train load_test monitor
 ```
 
 ## End-to-End Workflow
@@ -166,14 +164,14 @@ notebook selects an explicit `run_id` or the best finished run in that
 project's experiment. Qwen and Phi-4 merge through Unsloth. GPT-OSS loads the saved PEFT
 adapter with `AutoPeftModelForCausalLM` before merging; its 120B packaging step
 requires correspondingly large GPU, host-memory, and local-disk capacity.
-Both register a custom `llm/v1/chat` model, deploy the vLLM entrypoint, and
+All three register a custom `llm/v1/chat` model, deploy the vLLM entrypoint, and
 enable AI Gateway inference logging.
 
 Each project's serving environment is its local `requirements.txt`. The
-`transformers<5`, `vllm==0.11.0`, and
+`transformers==4.57.6`, `vllm==0.11.2`, `mlflow==3.12.0`, and
 `opencv-python-headless==4.12.0.88` pins are required for the current
-FIPS-enabled serving environment. Do not replace them without revalidating
-the target model architecture and serving image.
+Databricks custom LLM serving environment. Do not replace them without
+rechecking the target model architecture and serving image.
 
 ## Local Development
 

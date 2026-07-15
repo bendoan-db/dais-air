@@ -3,7 +3,7 @@
 # (monitor/utils.py load_global_config()). inference_table must equal
 # train/train_qwen_unsloth/train.yaml deploy_config's inference_table_prefix + '_payload' (the
 # table the endpoint's AI Gateway inference logging writes), and sft_table
-# must match setup/train; scripts/validate_config.py checks both.
+# must match setup/train.
 
 # ---- 01_unpack_inference_table.py ----
 # Raw payload table written by the endpoint (AI Gateway inference table).
@@ -71,7 +71,7 @@ slicing_fields:
 # daily unpack-and-refresh job.
 granularities:
   - 1 day
-# SFT table the baseline samples from (must match setup/train; validated).
+# SFT table the baseline samples from; keep it aligned with setup/train.
 sft_table: fraud_sft_dataset
 # Table (in the same catalog.schema) receiving the training-set baseline —
 # the SFT records parsed through the same field extraction as serving

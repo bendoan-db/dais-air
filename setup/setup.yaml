@@ -1,6 +1,5 @@
 # Stage-specific configuration for the setup notebooks. catalog/schema come
 # from the repo-root global.yaml (setup/utils.py load_global_config()).
-# Values shared with other stages are checked by scripts/validate_config.py.
 # The standalone training projects use explicit volume paths rather than
 # loading this file.
 

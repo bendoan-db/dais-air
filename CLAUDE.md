@@ -10,8 +10,7 @@ traffic.
 There is no conventional test suite or build. CI runs:
 
 ```bash
-python -m compileall -q setup train load_test monitor scripts
-python scripts/validate_config.py
+python -m compileall -q setup train load_test monitor
 ```
 
 ## Training Projects
@@ -50,7 +49,7 @@ containing `shard_id=N/*.parquet`. Each rank claims shards where
 `convert_sft: false` requires `prompt` and `assistant_response` columns.
 `convert_sft: true` requires the raw fraud columns defined in each project's
 `sft_conversion.py` and converts each rank's loaded sample once before trainer
-construction. Keep the two project-local converters and setup's shared prompt
+construction. Keep the three project-local converters and setup's shared prompt
 contract synchronized when changing the worked example.
 
 `ignore_partitions: false` preserves rank-to-shard assignment.
@@ -77,8 +76,8 @@ optionally snapshots configured models.
 
 Setup, load test, and monitoring each own a plain, import-safe `utils.py` in
 their stage directory. Keep only functions used by that stage. The setup copy
-owns the canonical fraud prompt/response renderers; the validator checks the
-load-test and trainer copies against it. Trainer projects must not import these
+owns the canonical fraud prompt/response renderers; keep the load-test and
+trainer copies synchronized with it. Trainer projects must not import these
 top-level `utils` modules because GPU packages may register a conflicting
 module with that name.
 
@@ -105,14 +104,18 @@ registration capacity.
 
 Keep these serving requirements unless the platform constraints are retested:
 
-- `transformers>=4.56,<5`
-- `vllm==0.11.0`
+- `transformers==4.57.6`
+- `vllm==0.11.2`
+- `mlflow==3.12.0`
+- `openai==2.17.0`
+- `databricks-sdk>=0.102.0`
 - `opencv-python-headless==4.12.0.88`
 - `VLLM_USE_FLASHINFER_SAMPLER=0`
 
 The entrypoint listens on port 8080 and receives the bare MLflow artifact name,
 not an `artifacts/`-prefixed path. Custom LLM registration uses
-`env_pack="databricks_model_serving"`. `GPU_XLARGE` cannot use scale-to-zero.
+`env_pack="databricks_model_serving"`. During beta, `GPU_XLARGE` requires
+enrollment, is AWS `us-west-2` only, and cannot use scale-to-zero.
 Qwen3.5 is not supported by the pinned FIPS-safe serving stack; the worked
 example uses the non-thinking Qwen3 Instruct variant.
 
@@ -120,6 +123,6 @@ example uses the non-thinking Qwen3 Instruct variant.
 
 `global.yaml` still owns catalog/schema for setup, load test, and monitor.
 Training YAMLs intentionally duplicate those values so each project is
-self-contained. Each YAML owns its deployment settings. The validator checks
-both projects locally; load-test and monitor endpoint contracts currently
-target the Qwen deployment.
+self-contained. Each YAML owns its deployment settings. Keep the load-test and
+monitor endpoint contracts aligned with the Qwen deployment they currently
+target.

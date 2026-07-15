@@ -210,8 +210,7 @@ def load_deploy_config(config_filename: str = "train.yaml") -> dict:
         "ENDPOINT_NAME": _str(config, "endpoint_name"),
         "ENDPOINT_DESCRIPTION": _str(config, "endpoint_description"),
         "SERVING_WORKLOAD_TYPE": _str(config, "serving_workload_type"),
-        "SERVING_PROVISIONED_CONCURRENCY": _int(config, "serving_provisioned_concurrency"),
-        "SERVING_WORKLOAD_SIZE": str(config.get("serving_workload_size") or "").strip(),
+        "SERVING_WORKLOAD_SIZE": _str(config, "serving_workload_size"),
         "SERVING_SCALE_TO_ZERO": _bool(config, "serving_scale_to_zero"),
         "FULL_MODEL_NAME": f"{catalog}.{schema}.{model_name}",
     }

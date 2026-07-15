@@ -78,9 +78,13 @@ parameters:
     vllm_gpu_memory_utilization: 0.8
 
     endpoint_name: phi_4_finetuned
+    # AI Gateway writes request/response payloads to
+    # <catalog>.<schema>.<inference_table_prefix>_payload.
     inference_table_prefix: phi_4_finetuned
     endpoint_description: 'Custom LLM endpoint serving the Phi-4 Unsloth fine-tune.'
-    serving_workload_type: GPU_LARGE
-    serving_provisioned_concurrency: 1
-    serving_workload_size: ''
+    # The merged 14B bf16 model exceeds an A10's memory, so use the documented
+    # 1xH100 custom LLM serving tier. During beta GPU_XLARGE is limited to
+    # us-west-2, requires enrollment, and cannot scale to zero.
+    serving_workload_type: GPU_XLARGE
+    serving_workload_size: Small
     serving_scale_to_zero: false

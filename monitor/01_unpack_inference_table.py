@@ -51,7 +51,7 @@ from utils import (
 
 # Stage keys come from monitor.yaml; catalog/schema come from the repo-root
 # global.yaml. inference_table must equal the endpoint's
-# <inference_table_prefix>_payload (checked by scripts/validate_config.py).
+# <inference_table_prefix>_payload.
 config_path, monitor_config = load_yaml_config("monitor.yaml", base_dir=Path.cwd())
 _, global_config = load_global_config()
 
