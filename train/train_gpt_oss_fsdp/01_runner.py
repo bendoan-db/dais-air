@@ -35,14 +35,13 @@ print(f"Evaluation data: {EVAL_DATA_PATH}")
 print(f"SFT conversion: {'inside trainer' if CONVERT_SFT else 'pre-converted input'}")
 print(f"Partition loading: {'all files per rank' if IGNORE_PARTITIONS else 'rank-assigned shards'}")
 print(f"Output: {TRAINING_OUTPUT_DIR}")
+print(f"MLflow experiment: {EXPERIMENT_PATH}")
 
 # COMMAND ----------
 
 import mlflow
-from databricks.sdk import WorkspaceClient
 
-current_user = WorkspaceClient().current_user.me().user_name
-mlflow.set_experiment(f"/Users/{current_user}/{EXPERIMENT_NAME}")
+mlflow.set_experiment(EXPERIMENT_PATH)
 
 # COMMAND ----------
 

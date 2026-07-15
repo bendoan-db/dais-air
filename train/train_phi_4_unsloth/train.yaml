@@ -1,6 +1,9 @@
 # Self-contained Phi-4 + Unsloth DDP training project.
 # Run from this directory: COPYFILE_DISABLE=1 air run --file train.yaml --watch
+# AIR requires experiment_name as a Jobs task key. Together with
+# mlflow_experiment_directory it resolves to training_config.experiment_path.
 experiment_name: air_hackathon_phi_4
+mlflow_experiment_directory: /Workspace/Shared
 
 environment:
   version: '5'
@@ -26,6 +29,7 @@ parameters:
     catalog: catalog_sandbox_5nwjwb
     schema: air_hackathon_v2
     project_name: phi_4_finetuned
+    experiment_path: /Workspace/Shared/air_hackathon_phi_4
 
     model_name: microsoft/phi-4
     model_weights_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/microsoft-phi-4

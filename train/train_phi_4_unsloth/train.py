@@ -254,6 +254,8 @@ def train_phi4_unsloth(
     mlflow.set_registry_uri("databricks-uc")
     is_main_process = rank == 0
     save_artifacts = save_artifacts and is_main_process
+    if is_main_process:
+        mlflow.set_experiment(EXPERIMENT_PATH)
 
     examples_pdf = prepare_sft_records(
         examples_pdf,

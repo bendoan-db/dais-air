@@ -23,9 +23,15 @@ Training is intentionally split into independent directories:
 
 Each project contains `01_runner.py`, `train.py`, `train.yaml`,
 `project_config.py`, and `requirements.txt`. Its YAML owns all runtime inputs:
-catalog, schema, experiment, compute, model-weight path, prepared train/eval
-paths, output path, and trainer parameters. Trainers must not load
+catalog, schema, experiment path, compute, model-weight path, prepared
+train/eval paths, output path, and trainer parameters. Trainers must not load
 `setup.yaml`, a pipeline stage's `utils.py`, or another project's config.
+
+The notebooks and deploy modules consume only
+`parameters.training_config.experiment_path`. AIR CLI still requires the
+top-level `experiment_name` as a Jobs task key and uses
+`mlflow_experiment_directory`; their concatenation must equal the explicit
+experiment path so CLI and notebook runs land together.
 
 Both launch paths call the same project-local `run_rank_training()`:
 

@@ -13,8 +13,9 @@ fine-tuned Qwen3 model. Training is split into three independent projects:
 
 Each project owns its runner notebook, trainer, requirements, workload YAML,
 and config loader. Its YAML contains the catalog, schema, model-weight path,
-prepared train/eval paths, output path, compute, experiment, and trainer
-parameters. No trainer reads `setup.yaml` or another training project.
+prepared train/eval paths, output path, compute, explicit MLflow experiment
+path, and trainer parameters. No trainer reads `setup.yaml` or another
+training project.
 
 ## Project Layout
 
@@ -59,11 +60,14 @@ under `parameters.training_config` are:
 - `suspicious_amount_threshold`: labeling threshold used only by inline fraud
   conversion.
 - `output_dir`: the UC volume directory that receives adapters.
+- `experiment_path`: the absolute workspace path used by notebook training and
+  deployment run selection.
 
 The workload-level `compute` block sizes both the notebook's `@distributed`
-call and the AIR CLI run. `experiment_name` controls the MLflow experiment.
-Each project YAML also owns `deploy_config` for its local
-`02_register_and_deploy.py` notebook.
+call and the AIR CLI run. AIR still requires its workload-level
+`experiment_name` task key; `mlflow_experiment_directory` and that key must
+resolve to `training_config.experiment_path`. Each project YAML also owns
+`deploy_config` for its local `02_register_and_deploy.py` notebook.
 
 `setup/setup.yaml` separately controls the worked-example data pipeline and
 optional model downloads. The GPT-OSS model path is not downloaded by default

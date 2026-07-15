@@ -8,7 +8,7 @@
 # MAGIC Run selection is driven by this directory's `train.yaml` `deploy_config` section:
 # MAGIC
 # MAGIC - `run_id` set — register exactly that MLflow run's adapter.
-# MAGIC - `run_id` empty — search this project's `experiment_name` for FINISHED runs and pick the best one by `best_run_metric` / `best_run_metric_goal`.
+# MAGIC - `run_id` empty — search this project's configured `experiment_path` for FINISHED runs and pick the best one by `best_run_metric` / `best_run_metric_goal`.
 # MAGIC
 # MAGIC Either way, the adapter location is read from the run's `adapter_output_dir` parameter (logged by training), so this notebook needs no knowledge of checkpoint-volume layout.
 # MAGIC
@@ -49,7 +49,7 @@ print(
     "Inference payload table: "
     f"{UC_CATALOG}.{UC_SCHEMA}.{INFERENCE_TABLE_PREFIX}_payload"
 )
-print(f"Run selection: {'run_id=' + RUN_ID if RUN_ID else f'best {BEST_RUN_METRIC} ({BEST_RUN_METRIC_GOAL}) in {EXPERIMENT_NAME}'}")
+print(f"Run selection: {'run_id=' + RUN_ID if RUN_ID else f'best {BEST_RUN_METRIC} ({BEST_RUN_METRIC_GOAL}) in {EXPERIMENT_PATH}'}")
 
 # COMMAND ----------
 
@@ -62,23 +62,14 @@ print(f"Run selection: {'run_id=' + RUN_ID if RUN_ID else f'best {BEST_RUN_METRI
 # COMMAND ----------
 
 import mlflow
-from databricks.sdk import WorkspaceClient
 
 mlflow.set_registry_uri("databricks-uc")
 
-# A bare experiment name resolves under the current user's folder — the same
-# path the training notebook and AIR CLI use; absolute paths pass through.
-if EXPERIMENT_NAME.startswith("/"):
-    experiment_path = EXPERIMENT_NAME
-else:
-    current_user = WorkspaceClient().current_user.me().user_name
-    experiment_path = f"/Users/{current_user}/{EXPERIMENT_NAME}"
-
-experiment = mlflow.get_experiment_by_name(experiment_path)
+experiment = mlflow.get_experiment_by_name(EXPERIMENT_PATH)
 if experiment is None:
     raise ValueError(
-        f"MLflow experiment not found: {experiment_path}. Run training "
-        "(01_runner.py or the AIR CLI) first, or fix experiment_name in train.yaml."
+        f"MLflow experiment not found: {EXPERIMENT_PATH}. Run training "
+        "(01_runner.py or the AIR CLI) first, or fix experiment_path in train.yaml."
     )
 
 if RUN_ID:
@@ -96,7 +87,7 @@ else:
     adapter_column = "params.adapter_output_dir"
     if runs_pdf.empty or metric_column not in runs_pdf.columns or adapter_column not in runs_pdf.columns:
         raise ValueError(
-            f"No finished runs in {experiment_path} logged both "
+            f"No finished runs in {EXPERIMENT_PATH} logged both "
             f"{BEST_RUN_METRIC!r} and adapter_output_dir — nothing to deploy. "
             "Complete a training run first or set run_id in train.yaml's deploy_config."
         )
@@ -105,7 +96,7 @@ else:
     ]
     if candidate_runs.empty:
         raise ValueError(
-            f"No finished run in {experiment_path} has both {BEST_RUN_METRIC!r} "
+            f"No finished run in {EXPERIMENT_PATH} has both {BEST_RUN_METRIC!r} "
             "and adapter_output_dir. Complete a training run first or set "
             "run_id in train.yaml's deploy_config."
         )
@@ -137,7 +128,7 @@ display(
                 BEST_RUN_METRIC: selection_metric_value,
                 "adapter_output_dir": ADAPTER_OUTPUT_DIR,
                 "base_model": BASE_MODEL,
-                "experiment": experiment_path,
+                "experiment": EXPERIMENT_PATH,
             }
         ]
     )

@@ -1,6 +1,9 @@
 # Self-contained Qwen3 + Unsloth DDP training project.
 # Run from this directory: COPYFILE_DISABLE=1 air run --file train.yaml --watch
+# AIR requires experiment_name as a Jobs task key. Together with
+# mlflow_experiment_directory it resolves to training_config.experiment_path.
 experiment_name: air_hackathon_qwen
+mlflow_experiment_directory: /Workspace/Shared
 
 environment:
   version: '5'
@@ -28,6 +31,7 @@ parameters:
     catalog: catalog_sandbox_5nwjwb
     schema: air_hackathon_v2
     project_name: qwen3_4b_instruct_finetuned
+    experiment_path: /Workspace/Shared/air_hackathon_qwen
 
     # Base weights and input records. Train/eval paths point directly at split
     # directories containing shard_id=N parquet directories.

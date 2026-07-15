@@ -115,9 +115,6 @@ def load_project_config(config_filename: str = "train.yaml") -> dict:
     project_name = _str(config, "project_name")
     max_steps = _int(config, "max_steps")
     notebook_gpus, notebook_gpu_type = _parse_compute(workload_config)
-    experiment_name = str(
-        workload_config.get("experiment_name") or f"{project_name}_finetuning"
-    ).strip()
 
     model_weights_path = _volume_path(config, "model_weights_path")
     response_instruction_part = config.get("response_instruction_part")
@@ -128,7 +125,7 @@ def load_project_config(config_filename: str = "train.yaml") -> dict:
         "PROJECT_NAME": project_name,
         "UC_CATALOG": _str(config, "catalog"),
         "UC_SCHEMA": _str(config, "schema"),
-        "EXPERIMENT_NAME": experiment_name,
+        "EXPERIMENT_PATH": _str(config, "experiment_path"),
         "MODEL_NAME": _str(config, "model_name"),
         "MODEL_WEIGHTS_PATH": model_weights_path,
         "MODEL_LOAD_PATH": model_weights_path,
@@ -196,7 +193,7 @@ def load_deploy_config(config_filename: str = "train.yaml") -> dict:
         "PROJECT_NAME": _str(training_config, "project_name"),
         "UC_CATALOG": catalog,
         "UC_SCHEMA": schema,
-        "EXPERIMENT_NAME": _str(workload, "experiment_name"),
+        "EXPERIMENT_PATH": _str(training_config, "experiment_path"),
         "RUN_ID": str(config.get("run_id") or "").strip(),
         "BEST_RUN_METRIC": _str(config, "best_run_metric"),
         "BEST_RUN_METRIC_GOAL": metric_goal,

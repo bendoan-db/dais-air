@@ -201,7 +201,7 @@ features visible to it.
 | `slicing_exprs` | `["response_action"]` (config-driven) | Risk distribution conditioned on the action taken. `txn_*` columns are valid slice targets too (e.g. `txn_use_chip` to split online vs. chip transactions) — but slices multiply cost, so the default stays minimal. |
 | `baseline_table_name` | `<unpacked_table>_baseline` | Drift vs. the training distribution — features *and* labels (§6). |
 | `output_schema_name` | `<catalog>.<schema>` (same schema by default, configurable) | Metrics tables land next to the tables they describe. |
-| `assets_dir` | `/Workspace/Users/<current user>/quality_monitoring/<unpacked_table>` | Auto-generated dashboard location; derived from the current user like the MLflow experiment path — nothing hardcoded. |
+| `assets_dir` | `/Workspace/Users/<current user>/quality_monitoring/<unpacked_table>` | Auto-generated dashboard location derived from the current user. Training experiment paths are configured explicitly in each training YAML. |
 | `schedule` | *(unset)* | Refresh is orchestrated by the job that runs the unpack notebook (§8), so metrics never lag the data. |
 
 Created via the SDK (`WorkspaceClient().quality_monitors.create(...)`) from a new

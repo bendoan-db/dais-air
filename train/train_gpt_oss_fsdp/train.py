@@ -260,6 +260,8 @@ def train_fsdp(
 
     mlflow.set_registry_uri("databricks-uc")
     is_main_process = rank == 0
+    if is_main_process:
+        mlflow.set_experiment(EXPERIMENT_PATH)
 
     examples_pdf = prepare_sft_records(
         examples_pdf,
