@@ -1,21 +1,23 @@
 # AI Runtime End to End
 
 A Databricks AI Runtime pipeline for preparing supervised fine-tuning data,
-training open-source LLMs, registering a merged model in Unity Catalog,
-deploying it with vLLM, load testing, and monitoring serving traffic.
+training open-source LLMs, registering models in Unity Catalog, deploying them
+through custom LLM serving, load testing, and monitoring serving traffic.
 
 The worked example classifies IBM TabFormer credit-card transactions with a
-fine-tuned Qwen3 model. Training is split into three independent projects:
+fine-tuned Qwen3 model. Training is split into five independent projects:
 
 - `train/train_qwen_unsloth/`: Qwen3-4B with Unsloth LoRA and DDP.
 - `train/train_phi_4_unsloth/`: Microsoft Phi-4 with Unsloth LoRA and DDP.
 - `train/train_gpt_oss_fsdp/`: GPT-OSS 120B with TRL, PEFT, and FSDP2.
+- `train/train_qwen_3_6_27b_fsdp/`: Qwen3.6 27B full-weight training with FSDP2.
+- `train/train_qwen3_4b_fsdp/`: Qwen3 4B full-weight training with FSDP2.
 
-Each project owns its runner notebook, trainer, requirements, workload YAML,
-and config loader. Its YAML contains the catalog, schema, model-weight path,
-prepared train/eval paths, output path, compute, explicit MLflow experiment
-path, and trainer parameters. No trainer reads `setup.yaml` or another
-training project.
+Each project owns its runner notebook, trainer, metric adapter, requirements,
+workload YAML, and config loader. Its YAML contains the catalog, schema,
+model-weight path, prepared train/eval paths, output path, compute, explicit
+MLflow experiment path, and trainer parameters. No trainer reads `setup.yaml`
+or another training project.
 
 ## Project Layout
 
@@ -29,6 +31,8 @@ training project.
 | `train/train_qwen_unsloth/` | Standalone Qwen training and deployment project. |
 | `train/train_phi_4_unsloth/` | Standalone Phi-4 training and deployment project. |
 | `train/train_gpt_oss_fsdp/` | Standalone GPT-OSS FSDP training and deployment project. |
+| `train/train_qwen_3_6_27b_fsdp/` | Standalone Qwen3.6 full-weight FSDP training and deployment project. |
+| `train/train_qwen3_4b_fsdp/` | Standalone Qwen3 4B full-weight FSDP training and deployment project. |
 | `load_test/` | Paced asynchronous serving load test with stage-local `utils.py`. |
 | `monitor/01_unpack_inference_table.py` | Incrementally unpack AI Gateway inference payloads. |
 | `monitor/02_create_quality_monitor.py` | Build the training baseline and data quality monitor. |
@@ -59,7 +63,13 @@ under `parameters.training_config` are:
   rank. Any `training_sample_fraction` is applied only after those files load.
 - `suspicious_amount_threshold`: labeling threshold used only by inline fraud
   conversion.
-- `output_dir`: the UC volume directory that receives adapters.
+- `logging_steps`: training-loss and optimizer metric logging cadence.
+- `eval_steps`: held-out loss and custom classification metric cadence. The
+  default `1` evaluates after every optimizer step.
+- `per_device_eval_batch_size`: evaluation batch size, kept separate from the
+  training batch size to bound logits memory.
+- `output_dir`: the UC volume directory that receives adapters or a complete
+  checkpoint for either full-weight Qwen project.
 - `experiment_path`: the absolute workspace path used by notebook training and
   deployment run selection.
 
@@ -93,8 +103,8 @@ python -m compileall -q setup train load_test monitor
    through another controlled process.
 5. Run one training project's `01_runner.py` on Serverless GPU with AI v5, or
    submit that directory's workload through the AIR CLI.
-6. Run the selected project's `02_register_and_deploy.py` to merge its
-   adapter, register it, and update its serving endpoint.
+6. Run the selected project's `02_register_and_deploy.py` to package its
+   trained weights, register them, and update its serving endpoint.
 7. Run `load_test/load_test_serving_endpoint.py`, then monitoring notebooks
    01-03. Schedule notebook 04 after each quality-monitor refresh.
 
@@ -108,6 +118,8 @@ Notebook entrypoints:
 - `train/train_qwen_unsloth/01_runner.py`
 - `train/train_phi_4_unsloth/01_runner.py`
 - `train/train_gpt_oss_fsdp/01_runner.py`
+- `train/train_qwen_3_6_27b_fsdp/01_runner.py`
+- `train/train_qwen3_4b_fsdp/01_runner.py`
 
 AIR CLI entrypoints:
 
@@ -119,6 +131,12 @@ cd ../train_phi_4_unsloth
 COPYFILE_DISABLE=1 air run --file train.yaml --watch
 
 cd ../train_gpt_oss_fsdp
+COPYFILE_DISABLE=1 air run --file train.yaml --watch
+
+cd ../train_qwen_3_6_27b_fsdp
+COPYFILE_DISABLE=1 air run --file train.yaml --watch
+
+cd ../train_qwen3_4b_fsdp
 COPYFILE_DISABLE=1 air run --file train.yaml --watch
 ```
 
@@ -132,6 +150,22 @@ By default, each rank claims `shard_id=N` directories where
 complete file set and the Trainer's distributed sampler handles batches. This
 mode supports unpartitioned inputs but multiplies CPU memory and I/O by the
 world size. GPU workers require no Spark session in either mode.
+
+## MLflow Training Metrics
+
+Every trainer enables the Hugging Face MLflow reporter and
+`mlflow.transformers.autolog(log_models=False)`. MLflow records training loss,
+gradient norm, learning rate, held-out `eval_loss`, and custom evaluation
+metrics at their configured Trainer step. Custom metrics include next-token
+accuracy, risk-classification accuracy, macro precision/recall/F1, per-class
+precision/recall/F1, and JSON risk parse rate. Vocabulary logits are reduced
+to token IDs on the GPU before gathering to avoid retaining full-logit tensors.
+
+The stepwise classification metrics are teacher-forced diagnostics. The Qwen3
+LoRA and Phi-4 projects also retain their post-training autoregressive fraud
+evaluation as the serving-like quality measurement. Evaluating every step is
+intentionally expensive; increase `eval_steps` or reduce `eval_sample_size`
+for longer runs.
 
 ## Data Contract
 
@@ -166,19 +200,19 @@ require the worked-example setup notebooks.
 
 ## Registration and Serving
 
-Training rank zero logs `adapter_output_dir`; each project's deployment
-notebook selects an explicit `run_id` or the best finished run in that
-project's experiment. Qwen and Phi-4 merge through Unsloth. GPT-OSS loads the saved PEFT
-adapter with `AutoPeftModelForCausalLM` before merging; its 120B packaging step
-requires correspondingly large GPU, host-memory, and local-disk capacity.
-All three register a custom `llm/v1/chat` model, deploy the vLLM entrypoint, and
-enable AI Gateway inference logging.
+Adapter projects log `adapter_output_dir`; the full-weight Qwen3 and Qwen3.6
+projects log `model_output_dir`. Each deployment notebook selects an explicit
+`run_id` or the best finished run in its project experiment. Qwen3 and Phi-4
+LoRA projects merge their adapters, while both full-weight projects package
+their complete FSDP checkpoints directly. Every endpoint enables AI Gateway
+inference logging.
 
-Each project's serving environment is its local `requirements.txt`. The
-`transformers==4.57.6`, `vllm==0.11.2`, `mlflow==3.12.0`, and
-`opencv-python-headless==4.12.0.88` pins are required for the current
-Databricks custom LLM serving environment. Do not replace them without
-rechecking the target model architecture and serving image.
+Each project's serving environment is its local `requirements.txt`. All
+projects except Qwen3.6 retain the FIPS-safe `transformers==4.57.6`,
+`vllm==0.11.2`, and `opencv-python-headless==4.12.0.88` stack. Qwen3.6 is not
+supported by that vLLM version, so its standalone project pins Transformers 5
+and serves through `transformers serve`. Do not unify these environments
+without retesting model architecture support and the target serving image.
 
 ## Local Development
 

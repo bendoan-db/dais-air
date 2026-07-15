@@ -36,6 +36,7 @@ print(f"SFT conversion: {'inside trainer' if CONVERT_SFT else 'pre-converted inp
 print(f"Partition loading: {'all files per rank' if IGNORE_PARTITIONS else 'rank-assigned shards'}")
 print(f"Output: {TRAINING_OUTPUT_DIR}")
 print(f"MLflow experiment: {EXPERIMENT_PATH}")
+print(f"MLflow cadence: train every {LOGGING_STEPS} step(s), eval every {EVAL_STEPS} step(s)")
 
 # COMMAND ----------
 

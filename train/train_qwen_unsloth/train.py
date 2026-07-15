@@ -16,6 +16,8 @@ import os
 # These must be set before unsloth is imported.
 os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.setdefault("HF_MLFLOW_LOG_ARTIFACTS", "FALSE")
+os.environ.setdefault("MLFLOW_FLATTEN_PARAMS", "TRUE")
 
 from contextlib import nullcontext
 
@@ -46,8 +48,10 @@ except ImportError:
 
 try:
     from .sft_conversion import prepare_sft_records
+    from .training_metrics import build_compute_metrics, preprocess_logits_for_metrics
 except ImportError:
     from sft_conversion import prepare_sft_records
+    from training_metrics import build_compute_metrics, preprocess_logits_for_metrics
 
 globals().update(load_project_config())
 if RESPONSE_INSTRUCTION_PART is None or RESPONSE_PART is None:
@@ -250,6 +254,7 @@ def train_qwen3_unsloth(
     world_size: int = 1,
 ) -> str | None:
     import mlflow
+    import mlflow.transformers
     import torch
     from datasets import Dataset
 
@@ -258,6 +263,11 @@ def train_qwen3_unsloth(
     save_artifacts = save_artifacts and is_main_process
     if is_main_process:
         mlflow.set_experiment(EXPERIMENT_PATH)
+        mlflow.transformers.autolog(
+            log_models=False,
+            log_datasets=False,
+            exclusive=False,
+        )
 
     examples_pdf = prepare_sft_records(
         examples_pdf,
@@ -268,6 +278,26 @@ def train_qwen3_unsloth(
         examples_pdf[["prompt", "assistant_response"]],
         preserve_index=False,
     )
+
+    eval_pdf = None
+    eval_dataset = None
+    if EVAL_SAMPLE_SIZE > 0:
+        eval_pdf = sample_eval_records(
+            EVAL_DATA_PATH,
+            EVAL_SAMPLE_SIZE,
+            SEED,
+            stratify_column="is_fraud",
+            ignore_partitions=IGNORE_PARTITIONS,
+        )
+        eval_pdf = prepare_sft_records(
+            eval_pdf,
+            convert_sft=CONVERT_SFT,
+            suspicious_amount_threshold=SUSPICIOUS_AMOUNT_THRESHOLD,
+        )
+        eval_dataset = Dataset.from_pandas(
+            eval_pdf[["prompt", "assistant_response"]],
+            preserve_index=False,
+        )
 
     model, tokenizer = load_unsloth_model(MODEL_LOAD_PATH, device_map=device_map)
 
@@ -295,6 +325,12 @@ def train_qwen3_unsloth(
         batched=True,
         remove_columns=dataset.column_names,
     )
+    if eval_dataset is not None:
+        eval_dataset = eval_dataset.map(
+            formatting_prompts_func,
+            batched=True,
+            remove_columns=eval_dataset.column_names,
+        )
 
     peft_kwargs = {
         "r": LORA_R,
@@ -342,13 +378,17 @@ def train_qwen3_unsloth(
         bf16=is_bfloat16_supported(),
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=1,
+        logging_steps=LOGGING_STEPS,
+        logging_strategy="steps",
+        eval_strategy="steps" if eval_dataset is not None else "no",
+        eval_steps=EVAL_STEPS,
+        per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
         optim="adamw_8bit",
         weight_decay=0.01,
         lr_scheduler_type="linear",
         seed=SEED,
         output_dir=local_output_dir,
-        report_to="none",
+        report_to=["mlflow"],
         run_name=run_name,
         save_strategy="steps",
         save_steps=max(5, MAX_STEPS // 2),
@@ -362,8 +402,11 @@ def train_qwen3_unsloth(
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
         args=training_args,
+        compute_metrics=build_compute_metrics(tokenizer),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
 
     try:
@@ -405,6 +448,9 @@ def train_qwen3_unsloth(
                     "world_size": world_size,
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "max_steps": MAX_STEPS,
+                    "logging_steps": LOGGING_STEPS,
+                    "eval_steps": EVAL_STEPS,
+                    "configured_eval_sample_size": EVAL_SAMPLE_SIZE,
                     "rank_0_training_record_count": len(examples_pdf),
                     "train_data_path": TRAIN_DATA_PATH,
                     "eval_data_path": EVAL_DATA_PATH,
@@ -448,20 +494,8 @@ def train_qwen3_unsloth(
         # recall/precision meaningless. A failed evaluation logs eval_error
         # but keeps the run FINISHED — a completed training (and its adapter)
         # should stay deployable.
-        if EVAL_SAMPLE_SIZE > 0:
+        if eval_pdf is not None:
             try:
-                eval_pdf = sample_eval_records(
-                    EVAL_DATA_PATH,
-                    EVAL_SAMPLE_SIZE,
-                    SEED,
-                    stratify_column="is_fraud",
-                    ignore_partitions=IGNORE_PARTITIONS,
-                )
-                eval_pdf = prepare_sft_records(
-                    eval_pdf,
-                    convert_sft=CONVERT_SFT,
-                    suspicious_amount_threshold=SUSPICIOUS_AMOUNT_THRESHOLD,
-                )
                 fraud_metrics = evaluate_fraud_classification(model, tokenizer, eval_pdf)
                 for metric_name, metric_value in fraud_metrics.items():
                     mlflow.log_metric(metric_name, float(metric_value))

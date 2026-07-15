@@ -15,10 +15,10 @@ Differences from ``train.py``:
   projections for gpt-oss models).
 - Full-sequence loss (response-only masking is an Unsloth feature of the DDP
   path).
-- Evaluation is eval-loss only: a single ``trainer.evaluate()`` pass over a
-  sample of the staged eval split after training. The generation-based
-  fraud-classification evaluation of the DDP path is unavailable — the final
-  model is FSDP-sharded and batched generation would require gathering it.
+- Stepwise evaluation reports held-out loss, token accuracy, and teacher-forced
+  risk-classification metrics. Autoregressive fraud evaluation remains
+  unavailable because the model is FSDP-sharded during training and batched
+  generation would require gathering it.
 
 The project owns its runner, workload YAML, dependencies, and config helpers;
 it does not load the Qwen project's configuration.
@@ -38,6 +38,8 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("NCCL_DEBUG", "WARN")
 # Surface NCCL failures as exceptions instead of hangs.
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("HF_MLFLOW_LOG_ARTIFACTS", "FALSE")
+os.environ.setdefault("MLFLOW_FLATTEN_PARAMS", "TRUE")
 
 from contextlib import nullcontext
 from pathlib import Path
@@ -63,8 +65,10 @@ except ImportError:
 
 try:
     from .sft_conversion import prepare_sft_records
+    from .training_metrics import build_compute_metrics, preprocess_logits_for_metrics
 except ImportError:
     from sft_conversion import prepare_sft_records
+    from training_metrics import build_compute_metrics, preprocess_logits_for_metrics
 
 
 def conversational_records(records_pdf: "pd.DataFrame") -> list[dict]:
@@ -253,6 +257,7 @@ def train_fsdp(
     import tempfile
 
     import mlflow
+    import mlflow.transformers
     import torch
     from datasets import Dataset
     from peft import get_peft_model
@@ -262,6 +267,11 @@ def train_fsdp(
     is_main_process = rank == 0
     if is_main_process:
         mlflow.set_experiment(EXPERIMENT_PATH)
+        mlflow.transformers.autolog(
+            log_models=False,
+            log_datasets=False,
+            exclusive=False,
+        )
 
     examples_pdf = prepare_sft_records(
         examples_pdf,
@@ -272,16 +282,17 @@ def train_fsdp(
     # This FSDP path trains with full-sequence loss.
     dataset = Dataset.from_list(conversational_records(examples_pdf))
 
-    # Eval-loss measurement on the SFT staging's eval split — forward passes
-    # on the sharded model are collective-safe, unlike generation. Every rank
-    # draws the identical seeded sample; the Trainer's distributed sampler
-    # then splits it across ranks.
+    # Stepwise loss and teacher-forced classification metrics use the SFT eval
+    # split. Forward passes on the sharded model are collective-safe, unlike
+    # generation. Every rank draws the identical seeded sample; the Trainer's
+    # distributed sampler then splits it across ranks.
     eval_dataset = None
     if EVAL_SAMPLE_SIZE > 0:
         eval_pdf = sample_eval_records(
             EVAL_DATA_PATH,
             EVAL_SAMPLE_SIZE,
             SEED,
+            stratify_column="is_fraud",
             ignore_partitions=IGNORE_PARTITIONS,
         )
         eval_pdf = prepare_sft_records(
@@ -320,16 +331,18 @@ def train_fsdp(
         max_steps=MAX_STEPS,
         lr_scheduler_type="cosine",
         bf16=True,
-        logging_steps=1,
+        logging_steps=LOGGING_STEPS,
         logging_strategy="steps",
+        eval_strategy="steps" if eval_dataset is not None else "no",
+        eval_steps=EVAL_STEPS,
         save_strategy="no",
-        report_to="none",
+        report_to=["mlflow"],
         run_name=run_name,
         seed=SEED,
         ddp_find_unused_parameters=False,
         dataloader_pin_memory=True,
         max_length=MAX_SEQ_LENGTH,
-        per_device_eval_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
+        per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
         # Activation checkpointing below replaces gradient checkpointing.
         gradient_checkpointing=False,
         # ---- FSDP2 ----
@@ -350,6 +363,8 @@ def train_fsdp(
         train_dataset=dataset,
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
+        compute_metrics=build_compute_metrics(tokenizer),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
 
     run_context = (
@@ -371,6 +386,9 @@ def train_fsdp(
                     "world_size": world_size,
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "max_steps": MAX_STEPS,
+                    "logging_steps": LOGGING_STEPS,
+                    "eval_steps": EVAL_STEPS,
+                    "configured_eval_sample_size": EVAL_SAMPLE_SIZE,
                     "rank_0_training_record_count": len(examples_pdf),
                     "train_data_path": TRAIN_DATA_PATH,
                     "eval_data_path": EVAL_DATA_PATH,
@@ -386,12 +404,6 @@ def train_fsdp(
 
         train_output = trainer.train()
         metrics = getattr(train_output, "metrics", {}) or {}
-
-        # Held-out eval loss on the staged eval split. Collective under FSDP
-        # (the eval forward passes all-gather shards) — every rank must make
-        # this call, like save_model below.
-        if eval_dataset is not None:
-            metrics = {**metrics, **trainer.evaluate()}
 
         # Gathering the sharded parameters for the final adapter is a
         # collective operation — EVERY rank must call save_model (the

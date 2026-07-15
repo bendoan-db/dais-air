@@ -108,18 +108,11 @@ def load_project_config(config_filename: str = "train.yaml") -> dict:
     if not 0.0 < sample_fraction <= 1.0:
         raise ValueError("training_sample_fraction must be in (0, 1]")
 
-    lora_target_modules = _required(config, "lora_target_modules")
-    if not isinstance(lora_target_modules, list) or not lora_target_modules:
-        raise ValueError("lora_target_modules must be a non-empty list")
-
     project_name = _str(config, "project_name")
     max_steps = _int(config, "max_steps")
     notebook_gpus, notebook_gpu_type = _parse_compute(workload_config)
 
     model_weights_path = _volume_path(config, "model_weights_path")
-    response_instruction_part = config.get("response_instruction_part")
-    response_part = config.get("response_part")
-
     return {
         "CONFIG_PATH": config_path,
         "PROJECT_NAME": project_name,
@@ -147,14 +140,6 @@ def load_project_config(config_filename: str = "train.yaml") -> dict:
         "EVAL_SAMPLE_SIZE": _int(config, "eval_sample_size"),
         "LOGGING_STEPS": _int(config, "logging_steps"),
         "EVAL_STEPS": _int(config, "eval_steps"),
-        "LORA_R": _int(config, "lora_r"),
-        "LORA_ALPHA": _int(config, "lora_alpha"),
-        "LORA_DROPOUT": _float(config, "lora_dropout"),
-        "LORA_TARGET_MODULES": [str(module) for module in lora_target_modules],
-        "RESPONSE_INSTRUCTION_PART": (
-            str(response_instruction_part) if response_instruction_part is not None else None
-        ),
-        "RESPONSE_PART": str(response_part) if response_part is not None else None,
         "SEED": _int(config, "seed"),
         "NOTEBOOK_GPUS": notebook_gpus,
         "NOTEBOOK_GPU_TYPE": notebook_gpu_type,
@@ -174,6 +159,9 @@ def load_deploy_config(config_filename: str = "train.yaml") -> dict:
     metric_goal = _str(config, "best_run_metric_goal").lower()
     if metric_goal not in {"minimize", "maximize"}:
         raise ValueError("best_run_metric_goal must be 'minimize' or 'maximize'")
+    serving_reasoning = _str(config, "serving_reasoning").lower()
+    if serving_reasoning not in {"on", "off", "auto"}:
+        raise ValueError("serving_reasoning must be 'on', 'off', or 'auto'")
 
     requirements_path = Path(_str(config, "serving_requirements_file"))
     if not requirements_path.is_absolute():
@@ -203,9 +191,9 @@ def load_deploy_config(config_filename: str = "train.yaml") -> dict:
         "UC_MODEL_NAME": model_name,
         "SERVED_MODEL_NAME": _str(config, "served_model_name"),
         "SERVING_PIP_REQUIREMENTS": serving_requirements,
-        "VLLM_DTYPE": _str(config, "vllm_dtype"),
-        "VLLM_MAX_MODEL_LEN": _int(config, "vllm_max_model_len"),
-        "VLLM_GPU_MEMORY_UTILIZATION": _float(config, "vllm_gpu_memory_utilization"),
+        "SERVING_DTYPE": _str(config, "serving_dtype"),
+        "SERVING_CONTINUOUS_BATCHING": _bool(config, "serving_continuous_batching"),
+        "SERVING_REASONING": serving_reasoning,
         "INFERENCE_TABLE_PREFIX": _str(config, "inference_table_prefix"),
         "ENDPOINT_NAME": _str(config, "endpoint_name"),
         "ENDPOINT_DESCRIPTION": _str(config, "endpoint_description"),
@@ -229,7 +217,6 @@ def _staging_fingerprint(source_dir: Path, source_files: list[Path]) -> str:
 def stage_model_locally(source_dir: str) -> str:
     """Copy volume-hosted model files once per node for fast mmap loading."""
     import fcntl
-    import json
     import shutil
     import tempfile
     import time
@@ -254,13 +241,6 @@ def stage_model_locally(source_dir: str) -> str:
             with ThreadPoolExecutor(max_workers=min(8, len(source_files))) as pool:
                 list(pool.map(lambda path: shutil.copy2(path, destination / path.name), source_files))
 
-            adapter_config_path = destination / "adapter_config.json"
-            if adapter_config_path.exists():
-                adapter_config = json.loads(adapter_config_path.read_text())
-                base_path = str(adapter_config.get("base_model_name_or_path") or "")
-                if base_path.startswith(VOLUME_PATH_PREFIX):
-                    adapter_config["base_model_name_or_path"] = stage_model_locally(base_path)
-                    adapter_config_path.write_text(json.dumps(adapter_config, indent=2))
             marker.touch()
             print(f"Staged {source} to {destination} in {time.monotonic() - started:.1f}s")
         else:

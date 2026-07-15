@@ -1,8 +1,8 @@
-# Self-contained GPT-OSS 120B + PEFT FSDP2 training project.
+# Self-contained Qwen3.6 27B full-weight FSDP2 training project.
 # Run from this directory: COPYFILE_DISABLE=1 air run --file train.yaml --watch
 # AIR requires experiment_name as a Jobs task key. Together with
 # mlflow_experiment_directory it resolves to training_config.experiment_path.
-experiment_name: air_hackathon_gpt_oss_fsdp
+experiment_name: air_hackathon_qwen_3_6_27b_fsdp
 mlflow_experiment_directory: /Workspace/Shared
 
 environment:
@@ -28,11 +28,11 @@ parameters:
   training_config:
     catalog: catalog_sandbox_5nwjwb
     schema: air_hackathon_v2
-    project_name: gpt_oss_120b_finetuned
-    experiment_path: /Workspace/Shared/air_hackathon_gpt_oss_fsdp
+    project_name: qwen_3_6_27b_full_finetuned
+    experiment_path: /Workspace/Shared/air_hackathon_qwen_3_6_27b_fsdp
 
-    model_name: openai/gpt-oss-120b
-    model_weights_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/gpt-oss-120b
+    model_name: Qwen/Qwen3.6-27B
+    model_weights_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3.6-27b
     train_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=train
     eval_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=eval
     # false reads pre-converted prompt/assistant_response rows. When true,
@@ -44,15 +44,15 @@ parameters:
     # shard_id=N directories.
     ignore_partitions: false
     suspicious_amount_threshold: 500.0
-    output_dir: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/gpt_oss_checkpoints/gpt_oss_120b_finetuned/training_demo
+    output_dir: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/qwen_3_6_27b_full_checkpoints/qwen_3_6_27b_finetuned
 
     max_seq_length: 2048
     max_steps: 5
     per_device_train_batch_size: 1
     per_device_eval_batch_size: 1
-    gradient_accumulation_steps: 4
-    learning_rate: 1.5e-4
-    warmup_steps: 5
+    gradient_accumulation_steps: 8
+    learning_rate: 1.0e-5
+    warmup_steps: 1
     training_sample_fraction: 0.0001
     eval_sample_size: 256
     # Trainer/MLflow cadence. eval_steps: 1 records held-out loss and custom
@@ -61,34 +61,27 @@ parameters:
     eval_steps: 1
     seed: 3407
 
-    lora_r: 32
-    lora_alpha: 32
-    lora_dropout: 0.0
-    lora_target_modules:
-      - all-linear
-
-  # Registration and serving settings for this project's deploy notebook.
-  # Merging and packaging a 120B model requires substantially more local disk,
-  # host memory, and GPU capacity than the Qwen project.
+  # This module registers the complete FSDP checkpoint without adapter merge.
+  # Qwen3.6 needs Transformers 5.x (or vLLM >= 0.19); this project uses the
+  # Transformers OpenAI-compatible server to avoid the repository's older,
+  # Qwen3.6-incompatible vLLM serving pin.
   deploy_config:
     run_id: ''
     best_run_metric: trainer_train_loss
     best_run_metric_goal: minimize
 
-    uc_model_name: gpt_oss_120b_finetuned
-    served_model_name: gpt_oss_120b_finetuned
+    uc_model_name: qwen_3_6_27b_full_finetuned
+    served_model_name: qwen_3_6_27b_full_finetuned
     serving_requirements_file: requirements.txt
+    serving_dtype: bfloat16
+    serving_continuous_batching: true
+    serving_reasoning: 'off'
 
-    vllm_dtype: auto
-    vllm_max_model_len: 2048
-    vllm_gpu_memory_utilization: 0.8
-
-    endpoint_name: gpt_oss_120b_finetuned
+    endpoint_name: qwen_3_6_27b_full_finetuned
     # AI Gateway writes request/response payloads to
     # <catalog>.<schema>.<inference_table_prefix>_payload.
-    inference_table_prefix: gpt_oss_120b_finetuned
-    endpoint_description: 'Custom LLM endpoint serving the GPT-OSS FSDP fine-tune.'
-    # Use the GPU_LARGE custom LLM serving tier with fixed non-zero capacity.
+    inference_table_prefix: qwen_3_6_27b_full_finetuned
+    endpoint_description: 'Custom LLM endpoint serving the full-weight Qwen3.6 27B fine-tune.'
     serving_workload_type: GPU_LARGE
     serving_workload_size: Small
     serving_scale_to_zero: false

@@ -20,6 +20,8 @@ Training is intentionally split into independent directories:
 - `train/train_qwen_unsloth/`: Unsloth LoRA + DDP for Qwen3-4B.
 - `train/train_phi_4_unsloth/`: Unsloth LoRA + DDP for Microsoft Phi-4.
 - `train/train_gpt_oss_fsdp/`: TRL + PEFT + FSDP2 for GPT-OSS 120B.
+- `train/train_qwen_3_6_27b_fsdp/`: full-weight TRL + FSDP2 for Qwen3.6 27B.
+- `train/train_qwen3_4b_fsdp/`: full-weight TRL + FSDP2 for Qwen3 4B.
 
 Each project contains `01_runner.py`, `train.py`, `train.yaml`,
 `project_config.py`, and `requirements.txt`. Its YAML owns all runtime inputs:
@@ -39,6 +41,8 @@ Both launch paths call the same project-local `run_rank_training()`:
 cd train/train_qwen_unsloth && COPYFILE_DISABLE=1 air run --file train.yaml --watch
 cd train/train_phi_4_unsloth && COPYFILE_DISABLE=1 air run --file train.yaml --watch
 cd train/train_gpt_oss_fsdp && COPYFILE_DISABLE=1 air run --file train.yaml --watch
+cd train/train_qwen_3_6_27b_fsdp && COPYFILE_DISABLE=1 air run --file train.yaml --watch
+cd train/train_qwen3_4b_fsdp && COPYFILE_DISABLE=1 air run --file train.yaml --watch
 ```
 
 The workload snapshot must remain rooted at `.` and execute
@@ -55,7 +59,7 @@ containing `shard_id=N/*.parquet`. Each rank claims shards where
 worked example produces them with `train/prep_sft.py` in a separate UC volume.
 `convert_sft: true` requires the raw fraud columns defined in each project's
 `sft_conversion.py` and converts each rank's loaded sample once before trainer
-construction. Keep `train/prep_sft.py`, the three project-local converters, and
+construction. Keep `train/prep_sft.py`, the five project-local converters, and
 the load-test renderer synchronized when changing the worked example.
 
 `ignore_partitions: false` preserves rank-to-shard assignment.
@@ -71,7 +75,18 @@ output directory. Saved adapter metadata must restore the durable
 
 Unsloth custom gradient checkpointing is reentrant and unsafe under DDP here.
 Keep HF non-reentrant checkpointing (`use_reentrant=False`). FSDP saves are
-collective; every rank must call `trainer.save_model`.
+collective; every rank must call `trainer.save_model`. Both full-weight
+projects log `model_output_dir` only after rank zero copies the assembled
+checkpoint to the configured UC volume.
+
+Every project uses `report_to=["mlflow"]` together with
+`mlflow.transformers.autolog(log_models=False)`. Keep both: MLflow 3.12's
+Transformers autolog patch adds the callback for Transformers 5, while the
+explicit Trainer reporter is required by the Transformers 4 projects. YAML
+`logging_steps` and `eval_steps` control metric cadence. The project-local
+`training_metrics.py` reduces logits to token IDs before distributed gathering
+and logs teacher-forced token accuracy plus risk-classification metrics; do not
+replace it with full-logit accumulation on these vocabulary sizes.
 
 ## Setup and Shared Helpers
 
@@ -90,9 +105,9 @@ register a conflicting module with that name.
 
 Preserve `# Databricks notebook source`, `# COMMAND ----------`, and
 `# MAGIC` markdown cells in notebook files. Plain modules include each
-project's `train.py`/`project_config.py`/`sft_conversion.py`, each pipeline
-stage's `utils.py`, `monitor/monitoring_utils.py`, and
-`monitor/example_inputs.py`.
+project's `train.py`/`project_config.py`/`sft_conversion.py`/
+`training_metrics.py`, each pipeline stage's `utils.py`,
+`monitor/monitoring_utils.py`, and `monitor/example_inputs.py`.
 
 Workspace notebooks normally use their folder as `Path.cwd()`. Setup notebooks
 also support local Databricks Connect and resolve their directory through
@@ -110,11 +125,11 @@ per-window idempotency token in place to prevent repeated expensive retrains.
 ## Deployment Constraints
 
 Each training project owns `02_register_and_deploy.py` and the corresponding
-`deploy_config` in its `train.yaml`. It selects a FINISHED rank-zero run that
-logged `adapter_output_dir`, uses the project trainer's
-`load_model_for_merge`, and deploys a custom `llm/v1/chat` vLLM entrypoint.
-Qwen and Phi-4 merge with Unsloth; GPT-OSS merges through PEFT and requires 120B-scale
-registration capacity.
+`deploy_config` in its `train.yaml`. Adapter projects select a FINISHED run
+that logged `adapter_output_dir` and merge before registration. Full-weight
+projects select `model_output_dir` and package the complete checkpoint
+directly. Qwen3 4B uses vLLM; Qwen3.6 uses the Transformers 5 OpenAI-compatible
+server because vLLM 0.11 does not support it.
 
 Keep these serving requirements unless the platform constraints are retested:
 
@@ -125,6 +140,9 @@ Keep these serving requirements unless the platform constraints are retested:
 - `databricks-sdk>=0.102.0`
 - `opencv-python-headless==4.12.0.88`
 - `VLLM_USE_FLASHINFER_SAMPLER=0`
+
+These pins apply to every project except Qwen3.6, which owns a separate
+Transformers 5 serving environment in its local `requirements.txt`.
 
 The entrypoint listens on port 8080 and receives the bare MLflow artifact name,
 not an `artifacts/`-prefixed path. Custom LLM registration uses

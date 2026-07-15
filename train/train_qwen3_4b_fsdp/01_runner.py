@@ -1,9 +1,10 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Train Qwen3 with Unsloth DDP
+# MAGIC # Full-weight fine-tune Qwen3 4B with FSDP2
 # MAGIC
-# MAGIC This runner and the AI Runtime CLI both execute this directory's
-# MAGIC `train.py` with the settings in `train.yaml`.
+# MAGIC This runner and the AI Runtime CLI execute this directory's `train.py`
+# MAGIC with the settings in `train.yaml`. The default workload uses eight H100
+# MAGIC GPUs and saves a complete Hugging Face checkpoint, not a LoRA adapter.
 
 # COMMAND ----------
 
@@ -33,8 +34,11 @@ print(f"Model weights: {MODEL_WEIGHTS_PATH}")
 print(f"Training data: {TRAIN_DATA_PATH}")
 print(f"Evaluation data: {EVAL_DATA_PATH}")
 print(f"SFT conversion: {'inside trainer' if CONVERT_SFT else 'pre-converted input'}")
-print(f"Partition loading: {'all files per rank' if IGNORE_PARTITIONS else 'rank-assigned shards'}")
-print(f"Output: {TRAINING_OUTPUT_DIR}")
+print(
+    "Partition loading: "
+    f"{'all files per rank' if IGNORE_PARTITIONS else 'rank-assigned shards'}"
+)
+print(f"Full-model output: {TRAINING_OUTPUT_DIR}")
 print(f"MLflow experiment: {EXPERIMENT_PATH}")
 print(f"MLflow cadence: train every {LOGGING_STEPS} step(s), eval every {EVAL_STEPS} step(s)")
 
@@ -64,13 +68,14 @@ def run_training_job():
 distributed_run_ids = run_training_job.distributed()
 TRAINING_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
 TRAINING_WORLD_SIZE = len(distributed_run_ids)
-TRAINED_ADAPTER_OUTPUT_DIR = f"{TRAINING_OUTPUT_DIR}/{TRAINING_WORLD_SIZE}gpu"
+TRAINED_MODEL_OUTPUT_DIR = f"{TRAINING_OUTPUT_DIR}/{TRAINING_WORLD_SIZE}gpu"
 
 print(f"Training MLflow run ID: {TRAINING_RUN_ID}")
-print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
+print(f"Trained full-model output dir: {TRAINED_MODEL_OUTPUT_DIR}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC The rank-zero MLflow run logs `adapter_output_dir`; use that run with
-# MAGIC this project's `02_register_and_deploy.py` when registration is required.
+# MAGIC The rank-zero MLflow run logs `model_output_dir`. Use that run with
+# MAGIC this project's `02_register_and_deploy.py` to register the complete
+# MAGIC fine-tuned checkpoint and deploy it with inference tables enabled.
