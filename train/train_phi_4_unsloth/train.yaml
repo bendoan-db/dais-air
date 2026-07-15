@@ -38,7 +38,7 @@ parameters:
     # shard_id=N directories by N % world_size.
     ignore_partitions: false
     suspicious_amount_threshold: 500.0
-    output_dir: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/phi_4_checkpoints/phi_4_finetuned/training_demo
+    output_dir: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/checkpoints/phi_4_finetuned/
 
     max_seq_length: 4096
     max_steps: 10
@@ -81,6 +81,6 @@ parameters:
     inference_table_prefix: phi_4_finetuned
     endpoint_description: 'Custom LLM endpoint serving the Phi-4 Unsloth fine-tune.'
     serving_workload_type: GPU_LARGE
-    serving_provisioned_concurrency: 1
+    serving_provisioned_concurrency: 4
     serving_workload_size: ''
     serving_scale_to_zero: false
