@@ -30,4 +30,4 @@ __pycache__/
 # General local caches
 .cache/
 .locks/
-*/unsloth_compiled_cache/*
+train/*/unsloth_compiled_cache/*

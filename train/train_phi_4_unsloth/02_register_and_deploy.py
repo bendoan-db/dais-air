@@ -217,7 +217,20 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
         "messages": [
             {
                 "role": "user",
-                "content": "Classify this card transaction and return compact JSON.",
+                "content": """"
+                You are a fraud decision model for a credit-card transaction stream. Classify the transaction as legitimate, suspicious, or likely_fraud. Return only compact JSON with keys risk, action, and reason.
+
+                Transaction:
+                - user_id: 1683
+                - card_id: 2
+                - timestamp: 1991-08-03 02:27:00
+                - amount_usd: 5.52
+                - use_chip: Swipe Transaction
+                - merchant_city: Irvington
+                - merchant_state: NY
+                - merchant_category_code: 5812
+                - errors: none
+                """,
             }
         ],
         "max_tokens": 64,
