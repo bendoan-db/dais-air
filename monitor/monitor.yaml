@@ -12,7 +12,7 @@ inference_table: qwen3_4b_instruct_finetuned_v2_payload
 # Delta table receiving one unpacked row per request. Created on first run
 # with change data feed enabled (required for efficient incremental monitor
 # refreshes) and partitioned by request_date.
-unpacked_table: qwen3_4b_instruct_finetuned_requests
+unpacked_table: qwen3_4b_instruct_finetuned_v2_requests
 # UC volume holding the streaming checkpoint that makes unpacking
 # incremental: each run processes only payload rows it has not seen yet.
 # Deleting the checkpoint directory reprocesses the full payload table.
@@ -78,8 +78,8 @@ sft_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/frau
 # Table (in the same catalog.schema) receiving the training-set baseline —
 # the SFT records parsed through the same field extraction as serving
 # traffic. Overwritten on every module-02 run; rerun after a retrain.
-baseline_table: qwen3_4b_instruct_finetuned_requests_baseline
-# Fraction of the SFT records sampled into the baseline (seeded, so reruns are
+baseline_table: qwen3_4b_instruct_finetuned_v2_requests_baseline
+# Fraction of the SFT table sampled into the baseline (seeded, so reruns are
 # stable). Distribution baselines need far fewer rows than training does;
 # raise toward 1.0 for small SFT datasets.
 baseline_sample_fraction: 0.05
