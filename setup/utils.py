@@ -1,11 +1,10 @@
-"""Configuration, Unity Catalog, and SFT helpers for the setup stage."""
+"""Configuration and Unity Catalog helpers for the setup stage."""
 
 from pathlib import Path
 
 import yaml
 
 MODULE_DIR = Path(__file__).resolve().parent
-GLOBAL_CONFIG_FILENAME = "global.yaml"
 
 
 def load_yaml_config(
@@ -19,21 +18,6 @@ def load_yaml_config(
             f"Expected YAML mapping in {config_path}, got {type(config).__name__}"
         )
     return config_path, config
-
-
-def load_global_config() -> tuple[Path, dict]:
-    candidates = [
-        MODULE_DIR.parent / GLOBAL_CONFIG_FILENAME,
-        Path.cwd() / GLOBAL_CONFIG_FILENAME,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return load_yaml_config(GLOBAL_CONFIG_FILENAME, base_dir=candidate.parent)
-    raise FileNotFoundError(
-        "global.yaml not found (searched: "
-        + ", ".join(str(candidate) for candidate in candidates)
-        + ")"
-    )
 
 
 def config_value(config: dict, key: str):
@@ -93,47 +77,6 @@ def get_spark_session():
     if hasattr(builder, "serverless"):
         return builder.serverless().getOrCreate()
     return builder.getOrCreate()
-
-
-def render_fraud_prompt(record) -> str:
-    return (
-        "You are a fraud decision model for a credit-card transaction stream. "
-        "Classify the transaction as legitimate, suspicious, or likely_fraud. "
-        "Return only compact JSON with keys risk, action, and reason.\n\n"
-        "Transaction:\n"
-        f"- user_id: {record['user_id_text']}\n"
-        f"- card_id: {record['card_id_text']}\n"
-        f"- timestamp: {record['transaction_ts_text']}\n"
-        f"- amount_usd: {float(record['amount_usd']):.2f}\n"
-        f"- use_chip: {record['use_chip_text']}\n"
-        f"- merchant_city: {record['merchant_city_text']}\n"
-        f"- merchant_state: {record['merchant_state_text']}\n"
-        f"- merchant_category_code: {record['mcc_text']}\n"
-        f"- errors: {record['errors_text']}"
-    )
-
-
-def render_fraud_response(record, suspicious_amount_threshold: float) -> str:
-    import json
-
-    needs_review = bool(record["has_error_signal"]) or (
-        float(record["amount_usd"]) >= suspicious_amount_threshold
-    )
-    if int(record["is_fraud"] or 0) == 1:
-        risk, action = "likely_fraud", "decline_and_escalate"
-        reason = "The historical label marks this transaction as fraud."
-    elif needs_review:
-        risk, action = "suspicious", "step_up_authentication"
-        reason = (
-            "The transaction is not labeled fraud, but amount or error signals "
-            "warrant review."
-        )
-    else:
-        risk, action = "legitimate", "approve"
-        reason = "The historical label is non-fraud and no strong review signal is present."
-    return json.dumps(
-        {"risk": risk, "action": action, "reason": reason}, separators=(",", ":")
-    )
 
 
 def ensure_uc_object(spark, ddl_statement: str) -> None:

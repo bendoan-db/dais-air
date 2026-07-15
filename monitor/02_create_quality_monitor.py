@@ -9,11 +9,11 @@
 # MAGIC
 # MAGIC What one run does:
 # MAGIC
-# MAGIC 1. Rebuilds the baseline table from the SFT dataset, applying the **same** prompt-field and response-JSON extraction module 01 applies to serving traffic (both import `monitoring_utils`) — so baseline drift compares serving traffic against exactly what the model was trained on: covariate shift on `txn_*`, label shift on `response_*`.
+# MAGIC 1. Rebuilds the baseline table from prepared SFT Parquet, applying the **same** prompt-field and response-JSON extraction module 01 applies to serving traffic (both import `monitoring_utils`) — so baseline drift compares serving traffic against exactly what the model was trained on: covariate shift on `txn_*`, label shift on `response_*`.
 # MAGIC 2. Creates or updates the monitor: prediction/timestamp/model-id columns, granularities, slices, the baseline, and custom contract-integrity metrics (JSON output breakage, prompt-template breakage, out-of-vocabulary labels, truncation, per-class prediction rates).
 # MAGIC 3. Triggers a metrics refresh (incremental via the table's change data feed) and prints where the metrics tables and auto-generated dashboard live.
 # MAGIC
-# MAGIC Run on Databricks serverless (CPU) compute **after** module 01 has created and filled the unpacked table. Rerun when a retrain changes the SFT table (to refresh the baseline) or after changing the monitor keys in `monitor.yaml`. Recurring refreshes belong in the job that runs module 01 (unpack task → `quality_monitors.run_refresh` task), so metrics never lag the data — the monitor itself is created without a schedule.
+# MAGIC Run on Databricks serverless (CPU) compute **after** module 01 has created and filled the unpacked table. Rerun when a retrain changes the prepared SFT data (to refresh the baseline) or after changing the monitor keys in `monitor.yaml`. Recurring refreshes belong in the job that runs module 01 (unpack task → `quality_monitors.run_refresh` task), so metrics never lag the data — the monitor itself is created without a schedule.
 # MAGIC
 # MAGIC References:
 # MAGIC
@@ -41,18 +41,16 @@ from utils import (
     config_str,
     full_name,
     get_spark_session,
-    load_global_config,
     load_yaml_config,
 )
 
 # Stage keys come from monitor.yaml and are normalized by
-# parse_quality_monitor_config; catalog/schema come from global.yaml.
+# parse_quality_monitor_config.
 config_path, monitor_config = load_yaml_config("monitor.yaml", base_dir=Path.cwd())
-_, global_config = load_global_config()
 
-UC_CATALOG = config_str(global_config, "catalog")
-UC_SCHEMA = config_str(global_config, "schema")
-SFT_TABLE_NAME = config_str(monitor_config, "sft_table")
+UC_CATALOG = config_str(monitor_config, "catalog")
+UC_SCHEMA = config_str(monitor_config, "schema")
+SFT_DATA_PATH = config_str(monitor_config, "sft_data_path")
 UNPACKED_TABLE_NAME = config_str(monitor_config, "unpacked_table")
 
 monitor_settings = parse_quality_monitor_config(monitor_config)
@@ -72,13 +70,15 @@ MONITORED_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{UNPACKED_TABLE_NAME}"
 BASELINE_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{BASELINE_TABLE_NAME}"
 OUTPUT_SCHEMA_NAME = monitor_settings["monitor_output_schema"] or f"{UC_CATALOG}.{UC_SCHEMA}"
 
-sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 unpacked_table_q = full_name(UC_CATALOG, UC_SCHEMA, UNPACKED_TABLE_NAME)
 baseline_table_q = full_name(UC_CATALOG, UC_SCHEMA, BASELINE_TABLE_NAME)
 
 print(f"Monitor config: {config_path}")
 print(f"Monitored (unpacked) table: {MONITORED_TABLE}")
-print(f"Baseline table: {BASELINE_TABLE} (from {SFT_TABLE_NAME}, fraction {BASELINE_SAMPLE_FRACTION})")
+print(
+    f"Baseline table: {BASELINE_TABLE} "
+    f"(from {SFT_DATA_PATH}, fraction {BASELINE_SAMPLE_FRACTION})"
+)
 print(f"Prediction column: {PREDICTION_COL} in {EXPECTED_PREDICTION_VALUES}")
 print(f"Granularities: {GRANULARITIES}; slices: {SLICING_EXPRS or '(none)'}")
 print(f"Label column: {LABEL_FIELD or '(none — drift-only monitoring)'}")
@@ -116,7 +116,15 @@ if LABEL_FIELD and LABEL_FIELD not in unpacked_columns:
 
 TRAINING_BASELINE_MODEL_ID = "training_baseline"
 
-baseline_df = spark.table(sft_table_q).select("prompt", "assistant_response")
+try:
+    baseline_df = spark.read.parquet(SFT_DATA_PATH).select(
+        "prompt", "assistant_response"
+    )
+except Exception as exc:
+    raise RuntimeError(
+        f"Prepared SFT Parquet is not readable at {SFT_DATA_PATH}. Run "
+        "train/prep_sft.py first or update sft_data_path in monitor.yaml."
+    ) from exc
 if BASELINE_SAMPLE_FRACTION < 1.0:
     baseline_df = baseline_df.sample(fraction=BASELINE_SAMPLE_FRACTION, seed=42)
 
@@ -185,10 +193,10 @@ for column, null_rate in null_rates.items():
 
 if null_rates[PREDICTION_COL] >= 1.0:
     raise RuntimeError(
-        f"{PREDICTION_COL} is 100% null in the baseline — the SFT table's "
+        f"{PREDICTION_COL} is 100% null in the baseline — the prepared SFT "
         "assistant_response does not parse as JSON with a "
         f"{PREDICTION_FIELD!r} key. Check response_json_fields against the "
-        "prompt contract in setup/02_stage_training_data.py."
+        "prompt contract in train/prep_sft.py."
     )
 if PROMPT_FIELDS and all(
     null_rates[f"{PROMPT_COLUMN_PREFIX}{name}"] >= 1.0 for name, _ in PROMPT_FIELDS
@@ -196,8 +204,7 @@ if PROMPT_FIELDS and all(
     raise RuntimeError(
         "Every txn_* column is 100% null in the baseline — the SFT prompts do "
         "not contain the '- <field>: <value>' lines prompt_fields expects. "
-        "Check prompt_fields against the prompt template in "
-        "setup/02_stage_training_data.py."
+        "Check prompt_fields against the prompt template in train/prep_sft.py."
     )
 
 # COMMAND ----------

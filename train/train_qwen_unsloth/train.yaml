@@ -24,10 +24,10 @@ command: python $CODE_SOURCE_PATH/train.py
 parameters:
   training_config:
     # Project identity. These values are local to this workload; the trainer
-    # does not read global.yaml or another stage's YAML.
-    project_name: qwen3_4b_instruct_finetuned
+    # does not read another stage's YAML.
     catalog: catalog_sandbox_5nwjwb
     schema: air_hackathon_v2
+    project_name: qwen3_4b_instruct_finetuned
 
     # Base weights and input records. Train/eval paths point directly at split
     # directories containing shard_id=N parquet directories.
@@ -37,8 +37,9 @@ parameters:
     eval_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=eval
     # false: input rows already contain prompt + assistant_response.
     # true: input rows are raw fraud records and are converted once per rank
-    # before trainer construction. Point the paths above at setup/02's
-    # training_data export when enabling this mode.
+    # before trainer construction. When enabling this mode, point the paths at
+    # /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/training_data/
+    # fraud_raw_dataset/split=<train|eval>.
     convert_sft: false
     # true recursively loads every parquet file under each split path on every
     # rank. false assigns shard_id=N directories by N % world_size.

@@ -45,18 +45,14 @@ from utils import (
     ensure_uc_object,
     full_name,
     get_spark_session,
-    load_global_config,
     load_yaml_config,
 )
 
-# Stage keys come from monitor.yaml; catalog/schema come from the repo-root
-# global.yaml. inference_table must equal the endpoint's
-# <inference_table_prefix>_payload.
+# inference_table must equal the endpoint's <inference_table_prefix>_payload.
 config_path, monitor_config = load_yaml_config("monitor.yaml", base_dir=Path.cwd())
-_, global_config = load_global_config()
 
-UC_CATALOG = config_str(global_config, "catalog")
-UC_SCHEMA = config_str(global_config, "schema")
+UC_CATALOG = config_str(monitor_config, "catalog")
+UC_SCHEMA = config_str(monitor_config, "schema")
 INFERENCE_TABLE_NAME = config_str(monitor_config, "inference_table")
 UNPACKED_TABLE_NAME = config_str(monitor_config, "unpacked_table")
 CHECKPOINT_VOLUME = config_str(monitor_config, "checkpoint_volume")

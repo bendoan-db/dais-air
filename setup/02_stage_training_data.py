@@ -3,16 +3,16 @@
 # MAGIC %md
 # MAGIC # Stage the training data in a Unity Catalog volume
 # MAGIC
-# MAGIC This setup notebook stages the cleaned transaction records written by `01_load_dataset.py` for AI Runtime training:
+# MAGIC This setup notebook stages the cleaned transaction records written by `01_load_dataset.py` in raw form for AI Runtime training:
 # MAGIC
-# MAGIC 1. Writes the training-data Delta table: the raw transaction fields plus stable `training_id`, `split` (train/eval, `eval_fraction` in setup.yaml), and `shard_id` columns, all generated with Spark expressions so the work runs in parallel instead of row by row in Python. **SFT prompt/response formatting is deliberately not applied here** — the training loop renders prompts and labels from the raw fields.
-# MAGIC 2. Exports the records to a Unity Catalog volume as Parquet files partitioned by `split` and `shard_id`, per the AI Runtime data-loading guidance for large Delta tables:
+# MAGIC 1. Adds stable `training_id`, `split` (train/eval, `eval_fraction` in setup.yaml), and `shard_id` columns with Spark expressions. No prompt or response fields are created here.
+# MAGIC 2. Writes the raw records to a Unity Catalog volume as Parquet files partitioned by `split` and `shard_id`, per the AI Runtime data-loading guidance:
 # MAGIC    https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
 # MAGIC
-# MAGIC Reading the exported files directly during training avoids Spark overhead on the GPU workers: each worker claims the `split=train/shard_id=N` directories where `N % world_size == rank` and loads only its own files with Hugging Face `datasets`; the `split=eval` shards are the held-out evaluation set.
+# MAGIC The prepared-SFT path is a separate training-stage concern: `train/prep_sft.py` can read this export and write model-agnostic `prompt`/`assistant_response` records to another volume. Trainers with `convert_sft: true` can read this raw export directly.
 # MAGIC Parquet is used because the training code (Unsloth) consumes Hugging Face `datasets`, which loads Parquet natively as memory-mapped Arrow tables.
 # MAGIC
-# MAGIC **Both the staged table and the volume export are overwritten on every run.**
+# MAGIC **The raw volume export is overwritten on every run.**
 
 # COMMAND ----------
 
@@ -44,7 +44,6 @@ from utils import (
     config_str,
     ensure_uc_object,
     get_spark_session,
-    load_global_config,
     quote_identifier,
 )
 
@@ -62,25 +61,25 @@ config_path = script_dir / "setup.yaml"
 with config_path.open("r", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
-# Stage keys come from setup.yaml; catalog/schema come from the repo-root
-# global.yaml.
-global_config_path, global_config = load_global_config()
-catalog = config_str(global_config, "catalog")
-schema = config_str(global_config, "schema")
-
+catalog = config_str(config, "catalog")
+schema = config_str(config, "schema")
 table = config_str(config, "source_table")
-sft_table = config_str(config, "sft_table")
-sft_volume = config_str(config, "sft_volume")
-sft_files_path = f"/Volumes/{catalog}/{schema}/{sft_volume}/{sft_table}"
+raw_training_volume = config_str(config, "raw_training_volume")
+raw_training_path = config_str(config, "raw_training_path").strip("/")
+if not raw_training_path:
+    raise ValueError("raw_training_path must name a directory inside the volume")
+raw_files_path = (
+    f"/Volumes/{catalog}/{schema}/{raw_training_volume}/{raw_training_path}"
+)
 
 eval_fraction = config_float(config, "eval_fraction")
 if not 0.0 < eval_fraction < 1.0:
     raise ValueError(f"eval_fraction must be between 0 and 1 (exclusive), got {eval_fraction}")
-sft_shards = config_int(config, "sft_shards")
+training_shards = config_int(config, "training_shards")
 
-shard_key_columns = config.get("sft_shard_key_columns")
+shard_key_columns = config.get("shard_key_columns")
 if not isinstance(shard_key_columns, list) or not shard_key_columns:
-    raise ValueError("sft_shard_key_columns must be a non-empty list in setup.yaml")
+    raise ValueError("shard_key_columns must be a non-empty list in setup.yaml")
 shard_key_columns = [str(column_name) for column_name in shard_key_columns]
 
 spark = get_spark_session()
@@ -88,18 +87,16 @@ spark = get_spark_session()
 catalog_q = quote_identifier(catalog)
 schema_q = quote_identifier(schema)
 table_q = quote_identifier(table)
-sft_table_q = quote_identifier(sft_table)
-sft_volume_q = quote_identifier(sft_volume)
+raw_training_volume_q = quote_identifier(raw_training_volume)
 
 full_schema_name = f"{catalog_q}.{schema_q}"
 full_table_name = f"{full_schema_name}.{table_q}"
-full_sft_table_name = f"{full_schema_name}.{sft_table_q}"
-full_sft_volume_name = f"{full_schema_name}.{sft_volume_q}"
+full_raw_training_volume_name = f"{full_schema_name}.{raw_training_volume_q}"
 
 # COMMAND ----------
 
 ensure_uc_object(spark, f"CREATE SCHEMA IF NOT EXISTS {full_schema_name}")
-ensure_uc_object(spark, f"CREATE VOLUME IF NOT EXISTS {full_sft_volume_name}")
+ensure_uc_object(spark, f"CREATE VOLUME IF NOT EXISTS {full_raw_training_volume_name}")
 
 try:
     df = spark.table(full_table_name)
@@ -116,25 +113,22 @@ missing_shard_key_columns = [
 ]
 if missing_shard_key_columns:
     raise ValueError(
-        f"sft_shard_key_columns not found in {full_table_name}: "
-        f"{missing_shard_key_columns}. Update sft_shard_key_columns in "
+        f"shard_key_columns not found in {full_table_name}: "
+        f"{missing_shard_key_columns}. Update shard_key_columns in "
         "setup/setup.yaml to columns that exist in the source table."
     )
 
 print(f"Stage config: {config_path}")
-print(f"Global config: {global_config_path}")
 print(f"Source table: {full_table_name} ({len(source_columns)} columns)")
-print(f"Target training-data table: {full_sft_table_name}")
-print(f"Target parquet export: {sft_files_path}")
+print(f"Raw parquet export: {raw_files_path}")
 print(f"Eval fraction: {eval_fraction}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Create the training records
+# MAGIC ## Create the raw training records
 # MAGIC
-# MAGIC The staged table carries the raw transaction fields; the training loop renders the SFT prompt/response text from them.
-# MAGIC `training_id`, `split`, and `shard_id` are generated with Spark expressions so the work runs in parallel.
+# MAGIC The export carries only raw transaction fields plus `training_id`, `split`, and `shard_id`.
 # MAGIC
 # MAGIC `shard_id` lets distributed training assign data slices by `rt.get_global_rank()` and `rt.get_world_size()` without loading the full table into every GPU worker.
 # MAGIC `split` holds the deterministic 90/10 train/eval assignment (`eval_fraction` in setup.yaml).
@@ -142,7 +136,7 @@ print(f"Eval fraction: {eval_fraction}")
 # COMMAND ----------
 
 # Row identity and shard assignment both derive from the configured shard
-# key columns (sft_shard_key_columns in setup.yaml), so the export stays
+# key columns (shard_key_columns in setup.yaml), so the export stays
 # deterministic for any dataset that supplies its own key columns.
 training_id_col = F.sha2(
     F.concat_ws(
@@ -153,7 +147,7 @@ training_id_col = F.sha2(
 )
 
 shard_key_sql = ", ".join(quote_identifier(column_name) for column_name in shard_key_columns)
-shard_expr = f"pmod(xxhash64({shard_key_sql}), {sft_shards})"
+shard_expr = f"pmod(xxhash64({shard_key_sql}), {training_shards})"
 
 # The split hashes the same key columns but with a salt literal, so it is
 # deterministic across reruns yet independent of shard_id — reusing the
@@ -166,7 +160,7 @@ split_expr = (
     f"< {eval_threshold} THEN 'eval' ELSE 'train' END"
 )
 
-staged_df = (
+raw_training_df = (
     df.withColumn("training_id", training_id_col)
     .withColumn("split", F.expr(split_expr))
     .withColumn("shard_id", F.expr(shard_expr).cast("int"))
@@ -189,30 +183,16 @@ staged_df = (
     )
 )
 
-(
-    staged_df.write.format("delta")
-    .mode("overwrite")
-    .option("overwriteSchema", "true")
-    .saveAsTable(full_sft_table_name)
+display(
+    raw_training_df.select(
+        "training_id", "split", "shard_id", "amount_usd", "fraud_label", "merchant_city_text"
+    ).limit(10)
 )
-
-spark.sql(
-    f"""
-    COMMENT ON TABLE {full_sft_table_name}
-    IS 'Raw transaction training records (train/eval split, hash-sharded) for the AIR fraud demo; SFT formatting happens in the training loop'
-    """
-)
-
-print(f"Overwrote training-data Delta table {full_sft_table_name}")
-
-# COMMAND ----------
-
-print(spark.table(full_sft_table_name))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Export the training records to a Unity Catalog volume as Parquet
+# MAGIC ## Export raw records to a Unity Catalog volume as Parquet
 # MAGIC
 # MAGIC AI Runtime's data-loading guidance recommends exporting large Delta tables to a UC volume and reading the files directly during training, which avoids Spark overhead on the GPU workers:
 # MAGIC https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
@@ -222,26 +202,26 @@ print(spark.table(full_sft_table_name))
 # COMMAND ----------
 
 (
-    spark.table(full_sft_table_name)
-    .repartition(sft_shards, "shard_id")
+    raw_training_df
+    .repartition(training_shards, "shard_id")
     .write.mode("overwrite")
     .partitionBy("split", "shard_id")
-    .parquet(sft_files_path)
+    .parquet(raw_files_path)
 )
 
-print(f"Exported train/eval parquet shards to {sft_files_path}")
+print(f"Exported raw train/eval parquet shards to {raw_files_path}")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Verify the staged table and the volume export
+# MAGIC ## Verify the raw volume export
 # MAGIC
-# MAGIC Training fails fast when the parquet export is missing or incomplete, so this cell confirms both splits hold every shard and every staged row before any GPU time is spent.
+# MAGIC This cell confirms both splits hold every shard and every raw record before any GPU time is spent.
 # MAGIC The export is checked by reading it back through Spark (rather than listing the FUSE mount), so verification also works on local Databricks Connect runs.
 
 # COMMAND ----------
 
-staged_loaded_df = spark.table(full_sft_table_name)
+source_count = raw_training_df.count()
 
 split_summary_expressions = [
     F.count("*").alias("row_count"),
@@ -249,7 +229,7 @@ split_summary_expressions = [
     F.min("shard_id").alias("min_shard_id"),
     F.max("shard_id").alias("max_shard_id"),
 ]
-if "is_fraud" in staged_loaded_df.columns:
+if "is_fraud" in raw_training_df.columns:
     split_summary_expressions.extend(
         [
             F.sum("is_fraud").alias("fraud_row_count"),
@@ -257,16 +237,10 @@ if "is_fraud" in staged_loaded_df.columns:
         ]
     )
 
-display(staged_loaded_df.groupBy("split").agg(*split_summary_expressions))
-display(
-    staged_loaded_df.select(
-        "training_id", "split", "shard_id", "amount_usd", "fraud_label", "merchant_city_text"
-    ).limit(10)
-)
+display(raw_training_df.groupBy("split").agg(*split_summary_expressions))
 
-export_df = spark.read.parquet(sft_files_path)
+export_df = spark.read.parquet(raw_files_path)
 export_row_count = export_df.count()
-table_row_count = staged_loaded_df.count()
 
 export_split_summary = {
     row["split"]: row
@@ -278,7 +252,7 @@ export_split_summary = {
     .collect()
 }
 
-print(f"Parquet export: {export_row_count} rows at {sft_files_path}")
+print(f"Raw parquet export: {export_row_count} rows at {raw_files_path}")
 for split_name in ("train", "eval"):
     summary_row = export_split_summary.get(split_name)
     if summary_row is None:
@@ -291,16 +265,16 @@ for split_name in ("train", "eval"):
         f"({summary_row['row_count'] / export_row_count:.1%}) "
         f"in {summary_row['shard_count']} shards"
     )
-    if summary_row["shard_count"] != sft_shards:
+    if summary_row["shard_count"] != training_shards:
         raise ValueError(
-            f"Expected {sft_shards} shard_id partitions in the split={split_name} export, "
-            f"found {summary_row['shard_count']}. For small datasets, lower sft_shards "
+            f"Expected {training_shards} shard_id partitions in the split={split_name} export, "
+            f"found {summary_row['shard_count']}. For small datasets, lower training_shards "
             "(or raise eval_fraction) in setup/setup.yaml so every shard has rows in both splits."
         )
-if export_row_count != table_row_count:
+if export_row_count != source_count:
     raise ValueError(
-        f"Parquet export has {export_row_count} rows but {full_sft_table_name} has "
-        f"{table_row_count} — the export is incomplete; rerun this notebook."
+        f"Raw parquet export has {export_row_count} rows but the source transform has "
+        f"{source_count} — the export is incomplete; rerun this notebook."
     )
 
-print("Raw training data staged. Next: setup/03_prepare_sft.py.")
+print("Raw training data staged. Next: train/prep_sft.py or a trainer with convert_sft: true.")

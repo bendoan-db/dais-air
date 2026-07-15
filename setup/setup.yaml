@@ -1,18 +1,14 @@
-# Stage-specific configuration for the setup notebooks. catalog/schema come
-# from the repo-root global.yaml (setup/utils.py load_global_config()).
-# The standalone training projects use explicit volume paths rather than
-# loading this file.
+# Stage-specific configuration for the setup notebooks. The standalone
+# training projects use explicit volume paths rather than loading this file.
+catalog: catalog_sandbox_5nwjwb
+schema: air_hackathon_v2
 
 # Cleaned transaction table written by 01 and read by 02.
 source_table: fraud_dataset
-# Staged training-data table and export volume written by 02 and read by
-# training. The table holds raw transaction fields plus split/shard columns;
-# SFT prompt/response formatting happens in the training loop, not here.
-sft_table: fraud_sft_dataset
-sft_volume: training_data
-# Model-agnostic prompt/response export written by 03_prepare_sft.py.
-sft_staging_volume: sft_staging
-suspicious_amount_threshold: 500.0
+# Raw Parquet export written by 02. SFT prompt/response formatting is owned by
+# train/prep_sft.py or by a trainer running with convert_sft: true.
+raw_training_volume: training_data
+raw_training_path: fraud_raw_dataset
 
 # ---- 01_load_dataset.py (example dataset ingestion) ----
 staging_volume: setup_assets
@@ -23,17 +19,17 @@ force_download: false
 
 # ---- 02_stage_training_data.py (train/eval split + volume staging) ----
 # Fraction of rows assigned to the evaluation split; the rest are the
-# training split. Assignment is a salted hash of sft_shard_key_columns, so
+# training split. Assignment is a salted hash of shard_key_columns, so
 # it is deterministic across reruns and independent of shard_id. Both splits
 # are exported partitioned by shard_id.
 eval_fraction: 0.1
 # Number of hash shards in the parquet export. Must divide evenly by every
 # GPU count you plan to train with (128 covers 1/2/4/8/16).
-sft_shards: 128
+training_shards: 128
 # Columns hashed to assign each row a stable shard_id (and a training_id).
 # Any set of columns that uniquely-ish identifies a row works; when bringing
 # your own dataset, list its natural key columns here.
-sft_shard_key_columns:
+shard_key_columns:
   - user_id_text
   - card_id_text
   - transaction_ts_text

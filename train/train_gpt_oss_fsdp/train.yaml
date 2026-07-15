@@ -23,17 +23,18 @@ command: python $CODE_SOURCE_PATH/train.py
 
 parameters:
   training_config:
-    project_name: gpt_oss_120b_finetuned
     catalog: catalog_sandbox_5nwjwb
     schema: air_hackathon_v2
+    project_name: gpt_oss_120b_finetuned
 
     model_name: openai/gpt-oss-120b
     model_weights_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/gpt-oss-120b
     train_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=train
     eval_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=eval
     # false reads pre-converted prompt/assistant_response rows. When true,
-    # point these paths at raw setup/02 split shards; each rank converts its
-    # loaded records before constructing the TRL dataset.
+    # point these paths at /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/
+    # training_data/fraud_raw_dataset/split=<train|eval>; each rank converts
+    # its loaded records before constructing the TRL dataset.
     convert_sft: false
     # true loads all parquet files for every rank; false uses rank-assigned
     # shard_id=N directories.

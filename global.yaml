@@ -1,6 +1,0 @@
-# Global configuration — the Unity Catalog identity shared by setup, load
-# test, and monitoring. Each stage loads this file through its local
-# utils.load_global_config(); standalone training projects carry their own
-# catalog/schema values.
-catalog: catalog_sandbox_5nwjwb
-schema: air_hackathon_v2

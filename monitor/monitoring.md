@@ -229,13 +229,13 @@ carries the training-time *feature* distribution, not just the label
 distribution.
 
 `monitor/02_create_quality_monitor.py` builds the baseline table
-(`baseline_table` in `monitor.yaml`) from the SFT table (`sft_table` in
-`monitor.yaml`, agreement-checked against setup/train — the same table
-training and the load test read):
+(`baseline_table` in `monitor.yaml`) from the prepared SFT Parquet path
+(`sft_data_path` in `monitor.yaml`, aligned with `train/prep_sft.py` and the
+trainers' prepared input paths):
 
 1. Sample the SFT records (`baseline_sample_fraction`, seeded so reruns are
    stable) — distribution baselines need far fewer rows than training does,
-   and the SFT table can run to tens of millions of rows.
+   and the prepared SFT files can contain tens of millions of rows.
 2. Parse the `prompt` column with the **same** `prompt_fields` extraction from
    `monitoring_utils.py` (§4) → `txn_amount_usd`, `txn_use_chip`, ... columns.
    Baseline feature drift is therefore covariate shift measured against exactly
@@ -290,7 +290,7 @@ metrics are computed immediately after new payload rows are unpacked:
 Cadence: daily by default (matches the `1 day` granularity); hourly for
 high-traffic endpoints, with the `1 hour` granularity enabled to match.
 Rebuilding the baseline (module 02) is **not** part of this job — it reruns only
-after a retrain changes the SFT table.
+after a retrain changes the prepared SFT data.
 
 ## 9. Phase 2 — late-arriving ground truth
 
@@ -420,10 +420,10 @@ slicing_fields: [action]
 # Monitor windows; each granularity adds refresh cost.
 granularities: ["1 day"]
 # Baseline table name (overwritten on each run of module 02). The baseline
-# source is monitor.yaml's own sft_table; keep it aligned with the table used
-# by setup and training.
+# source is monitor.yaml's own sft_data_path; keep it aligned with
+# train/prep_sft.py and the prepared paths used for training.
 baseline_table: qwen3_4b_instruct_finetuned_requests_baseline
-# Fraction of the SFT table sampled into the baseline (seeded).
+# Fraction of the prepared SFT records sampled into the baseline (seeded).
 baseline_sample_fraction: 0.05
 # Where metrics tables land; empty = same catalog.schema as the monitored table.
 monitor_output_schema: ""
@@ -443,7 +443,7 @@ label_field: ""
   extraction (§4). Schema change ⇒ existing deployments delete the checkpoint
   and unpacked table and reprocess.
 - `monitor/02_create_quality_monitor.py` — Databricks notebook (serverless
-  CPU): builds the baseline table (features + labels) from the SFT table,
+  CPU): builds the baseline table (features + labels) from prepared SFT Parquet,
   creates-or-updates the monitor idempotently (keeping the existing dashboard
   on update), waits for `ACTIVE`, triggers a refresh, and prints the metrics
   table names and dashboard pointer.
@@ -465,9 +465,9 @@ or updating the monitor. It rejects invalid settings for these rules:
   spellings; `baseline_sample_fraction` must be in `(0, 1]`;
   `baseline_table` is required.
 
-Catalog/schema live in the repo-root `global.yaml`. The `sft_table` and payload
-table names are stage-owned and must remain aligned with setup, training, and
-deployment configuration.
+Catalog/schema and the `sft_data_path` are owned by `monitor.yaml`. The payload
+table name must remain aligned with SFT preparation, training, and deployment
+configuration.
 
 ### Permissions
 

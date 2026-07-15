@@ -6,7 +6,7 @@
 # MAGIC This setup notebook downloads the IBM TabFormer credit-card dataset, stages the archive in a Unity Catalog volume, and overwrites the cleaned transaction Delta table.
 # MAGIC
 # MAGIC The table is prepared for downstream use by standardizing column names, casting core fields, creating `transaction_ts`, and adding reusable prompt-ready fields such as `amount_usd`, `*_text`, `errors_text`, `has_error_signal`, and `fraud_label`.
-# MAGIC The supervised fine-tuning records are built from this table by `02_stage_training_data.py`, which writes the SFT Delta table and stages it in a Unity Catalog volume for AI Runtime training.
+# MAGIC `02_stage_training_data.py` reads this table and stages raw train/eval Parquet in a Unity Catalog volume. Optional SFT preparation happens later in `train/prep_sft.py`.
 
 # COMMAND ----------
 
@@ -50,7 +50,6 @@ from utils import (
     config_str,
     ensure_uc_object,
     get_spark_session,
-    load_global_config,
     quote_identifier,
 )
 
@@ -59,12 +58,8 @@ config_path = script_dir / "setup.yaml"
 with config_path.open("r", encoding="utf-8") as config_file:
     config = yaml.safe_load(config_file)
 
-# Stage keys come from setup.yaml; catalog/schema come from the repo-root
-# global.yaml.
-global_config_path, global_config = load_global_config()
-catalog = config_str(global_config, "catalog")
-schema = config_str(global_config, "schema")
-
+catalog = config_str(config, "catalog")
+schema = config_str(config, "schema")
 table = config_str(config, "source_table")
 staging_volume = config_str(config, "staging_volume")
 dataset_name = config_str(config, "dataset_name")
@@ -96,7 +91,6 @@ archive_path = dataset_root / archive_filename
 dataset_root.mkdir(parents=True, exist_ok=True)
 
 print(f"Stage config: {config_path}")
-print(f"Global config: {global_config_path}")
 print(f"Target table: {full_table_name}")
 print(f"Staging path: {dataset_root}")
 

@@ -1,9 +1,10 @@
-# Stage-specific configuration for the monitoring stage. catalog/schema
-# come from the repo-root global.yaml
-# (monitor/utils.py load_global_config()). inference_table must equal
+# Stage-specific configuration for the monitoring stage.
+catalog: catalog_sandbox_5nwjwb
+schema: air_hackathon_v2
+
+# inference_table must equal
 # train/train_qwen_unsloth/train.yaml deploy_config's inference_table_prefix + '_payload' (the
-# table the endpoint's AI Gateway inference logging writes), and sft_table
-# must match setup/train.
+# table the endpoint's AI Gateway inference logging writes).
 
 # ---- 01_unpack_inference_table.py ----
 # Raw payload table written by the endpoint (AI Gateway inference table).
@@ -71,15 +72,16 @@ slicing_fields:
 # daily unpack-and-refresh job.
 granularities:
   - 1 day
-# SFT table the baseline samples from; keep it aligned with setup/train.
-sft_table: fraud_sft_dataset
+# Prepared SFT Parquet used for the training baseline. Keep this aligned with
+# train/prep_sft.py's OUTPUT_SFT_PARQUET_PATH and trainer input paths.
+sft_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset
 # Table (in the same catalog.schema) receiving the training-set baseline —
 # the SFT records parsed through the same field extraction as serving
 # traffic. Overwritten on every module-02 run; rerun after a retrain.
 baseline_table: qwen3_4b_instruct_finetuned_requests_baseline
-# Fraction of the SFT table sampled into the baseline (seeded, so reruns are
+# Fraction of the SFT records sampled into the baseline (seeded, so reruns are
 # stable). Distribution baselines need far fewer rows than training does;
-# raise toward 1.0 for small SFT tables.
+# raise toward 1.0 for small SFT datasets.
 baseline_sample_fraction: 0.05
 # Where the monitor's metrics tables land; empty = the same catalog.schema
 # as the monitored table.

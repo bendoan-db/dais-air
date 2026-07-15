@@ -25,8 +25,7 @@ Each project contains `01_runner.py`, `train.py`, `train.yaml`,
 `project_config.py`, and `requirements.txt`. Its YAML owns all runtime inputs:
 catalog, schema, experiment, compute, model-weight path, prepared train/eval
 paths, output path, and trainer parameters. Trainers must not load
-`global.yaml`, `setup.yaml`, a pipeline stage's `utils.py`, or another
-project's config.
+`setup.yaml`, a pipeline stage's `utils.py`, or another project's config.
 
 Both launch paths call the same project-local `run_rank_training()`:
 
@@ -46,11 +45,12 @@ full workload or only `parameters`; project loaders support both shapes.
 containing `shard_id=N/*.parquet`. Each rank claims shards where
 `N % world_size == rank`; no Spark session runs on GPU workers.
 
-`convert_sft: false` requires `prompt` and `assistant_response` columns.
+`convert_sft: false` requires `prompt` and `assistant_response` columns; the
+worked example produces them with `train/prep_sft.py` in a separate UC volume.
 `convert_sft: true` requires the raw fraud columns defined in each project's
 `sft_conversion.py` and converts each rank's loaded sample once before trainer
-construction. Keep the three project-local converters and setup's shared prompt
-contract synchronized when changing the worked example.
+construction. Keep `train/prep_sft.py`, the three project-local converters, and
+the load-test renderer synchronized when changing the worked example.
 
 `ignore_partitions: false` preserves rank-to-shard assignment.
 `ignore_partitions: true` recursively enumerates all Parquet files for every
@@ -70,16 +70,15 @@ collective; every rank must call `trainer.save_model`.
 ## Setup and Shared Helpers
 
 `setup/01_load_dataset.py` ingests TabFormer. `setup/02_stage_training_data.py`
-creates deterministic raw train/eval shards. `setup/03_prepare_sft.py` renders
-model-agnostic prompts/responses. `setup/04_download_base_model_weights.py`
-optionally snapshots configured models.
+creates deterministic raw train/eval Parquet shards without SFT fields.
+`train/prep_sft.py` optionally renders model-agnostic prompts/responses into a
+separate UC volume. `setup/04_download_base_model_weights.py` optionally
+snapshots configured models.
 
 Setup, load test, and monitoring each own a plain, import-safe `utils.py` in
-their stage directory. Keep only functions used by that stage. The setup copy
-owns the canonical fraud prompt/response renderers; keep the load-test and
-trainer copies synchronized with it. Trainer projects must not import these
-top-level `utils` modules because GPU packages may register a conflicting
-module with that name.
+their stage directory. Keep only functions used by that stage. Trainer projects
+must not import these top-level `utils` modules because GPU packages may
+register a conflicting module with that name.
 
 ## Notebook Format
 
@@ -121,8 +120,8 @@ example uses the non-thinking Qwen3 Instruct variant.
 
 ## Configuration Ownership
 
-`global.yaml` still owns catalog/schema for setup, load test, and monitor.
-Training YAMLs intentionally duplicate those values so each project is
-self-contained. Each YAML owns its deployment settings. Keep the load-test and
-monitor endpoint contracts aligned with the Qwen deployment they currently
-target.
+Every stage YAML owns its catalog/schema. Training YAMLs keep those values
+inside `parameters.training_config`, where the AIR workload schema permits
+custom fields. Each training YAML also owns its deployment settings. Keep the
+load-test and monitor endpoint contracts aligned with the Qwen deployment they
+currently target.

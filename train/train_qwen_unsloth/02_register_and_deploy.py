@@ -473,5 +473,5 @@ display(pd.DataFrame([deployment_result]))
 # MAGIC
 # MAGIC The endpoint serves the fine-tuned model behind the OpenAI-compatible chat contract (`/serving-endpoints/<endpoint_name>/invocations`).
 # MAGIC
-# MAGIC - Load test it with `load_test/load_test_serving_endpoint.py`, which samples real prompts from the SFT table and records throughput/latency to a results table.
+# MAGIC - Load test it with `load_test/load_test_serving_endpoint.py`, which renders prompts from the raw eval Parquet and records throughput/latency to a results table.
 # MAGIC - Rerunning this notebook after a new training run re-selects the best run (or honors `run_id`), registers a new model version, and rolls the endpoint to it.

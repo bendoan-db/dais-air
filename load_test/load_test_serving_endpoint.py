@@ -57,7 +57,6 @@ from utils import (
     ensure_uc_object,
     full_name,
     get_spark_session,
-    load_global_config,
     load_yaml_config,
     render_fraud_prompt,
 )
@@ -81,12 +80,9 @@ from pyspark.sql import functions as F
 
 config_path, load_test_config = load_yaml_config("serving_load_test.yaml", base_dir=Path.cwd())
 
-# Stage keys come from serving_load_test.yaml; catalog/schema come from the
-# repo-root global.yaml.
-_, global_config = load_global_config()
-UC_CATALOG = config_str(global_config, "catalog")
-UC_SCHEMA = config_str(global_config, "schema")
-SFT_TABLE_NAME = config_str(load_test_config, "sft_table")
+UC_CATALOG = config_str(load_test_config, "catalog")
+UC_SCHEMA = config_str(load_test_config, "schema")
+RAW_DATA_PATH = config_str(load_test_config, "raw_data_path")
 ENDPOINT_NAME = config_str(load_test_config, "endpoint_name")
 RESULTS_TABLE_NAME = config_str(load_test_config, "results_table")
 
@@ -115,7 +111,6 @@ if WORKER_CONCURRENCY <= 0:
     raise ValueError("worker_concurrency must be greater than zero.")
 
 schema_q = full_name(UC_CATALOG, UC_SCHEMA)
-sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 results_table_q = full_name(UC_CATALOG, UC_SCHEMA, RESULTS_TABLE_NAME)
 
 spark = get_spark_session()
@@ -131,7 +126,7 @@ print(
 
 config_summary = {
     "config_path": str(config_path),
-    "sft_table": f"{UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}",
+    "raw_data_path": RAW_DATA_PATH,
     "endpoint_name": ENDPOINT_NAME,
     "results_table": f"{UC_CATALOG}.{UC_SCHEMA}.{RESULTS_TABLE_NAME}",
     "target_qps": TARGET_QPS,
@@ -233,7 +228,7 @@ if "READY" not in ready_state.upper():
 # MAGIC %md
 # MAGIC ## Build request payloads from staged transaction records
 # MAGIC
-# MAGIC The staged table holds raw transaction records (prompt text is rendered at training time, not stored), so the load test samples eval-split rows and renders each prompt with the same shared template training uses (`utils.render_fraud_prompt`; keep it synchronized with setup and each trainer) — the request shape matches fine-tuning exactly, while the traffic itself is data the model never trained on.
+# MAGIC The staged Parquet export holds raw transaction records (prompt text is rendered at training time, not stored), so the load test samples eval-split rows and renders each prompt with the same template training uses (`utils.render_fraud_prompt`; keep it synchronized with `train/prep_sft.py` and each trainer) — the request shape matches fine-tuning exactly, while the traffic itself is data the model never trained on.
 # MAGIC Each request sends a chat payload with one user message, plus deterministic generation settings.
 # MAGIC
 # MAGIC With `disable_thinking: true` (the default), every payload also carries `chat_template_kwargs: {"enable_thinking": false}` — vLLM forwards it into the model's chat template, keeping hybrid reasoning models (base Qwen3) from spending the entire `max_tokens` budget on a reasoning block before the JSON answer. This mirrors training, which renders its chat templates with `enable_thinking=False`.
@@ -241,7 +236,7 @@ if "READY" not in ready_state.upper():
 # COMMAND ----------
 
 record_pdf = (
-    spark.table(sft_table_q)
+    spark.read.parquet(RAW_DATA_PATH)
     .where(F.col("split") == "eval")
     .select(*FRAUD_RECORD_COLUMNS)
     .sample(withReplacement=False, fraction=PROMPT_SAMPLE_FRACTION, seed=3407)
@@ -251,8 +246,9 @@ record_pdf = (
 
 if record_pdf.empty:
     raise ValueError(
-        f"No eval-split records were loaded from {UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}. "
-        "Run setup/02_stage_training_data.py to (re)stage the table with train/eval splits."
+        f"No eval-split records were loaded from {RAW_DATA_PATH}. "
+        "Run setup/02_stage_training_data.py to (re)stage the raw Parquet "
+        "export with train/eval splits."
     )
 
 prompts = [render_fraud_prompt(record) for record in record_pdf.to_dict("records")]

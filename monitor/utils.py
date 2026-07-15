@@ -5,7 +5,6 @@ from pathlib import Path
 import yaml
 
 MODULE_DIR = Path(__file__).resolve().parent
-GLOBAL_CONFIG_FILENAME = "global.yaml"
 
 
 def load_yaml_config(
@@ -19,21 +18,6 @@ def load_yaml_config(
             f"Expected YAML mapping in {config_path}, got {type(config).__name__}"
         )
     return config_path, config
-
-
-def load_global_config() -> tuple[Path, dict]:
-    candidates = [
-        MODULE_DIR.parent / GLOBAL_CONFIG_FILENAME,
-        Path.cwd() / GLOBAL_CONFIG_FILENAME,
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return load_yaml_config(GLOBAL_CONFIG_FILENAME, base_dir=candidate.parent)
-    raise FileNotFoundError(
-        "global.yaml not found (searched: "
-        + ", ".join(str(candidate) for candidate in candidates)
-        + ")"
-    )
 
 
 def config_value(config: dict, key: str):

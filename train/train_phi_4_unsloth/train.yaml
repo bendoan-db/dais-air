@@ -23,16 +23,17 @@ command: python $CODE_SOURCE_PATH/train.py
 
 parameters:
   training_config:
-    project_name: phi_4_finetuned
     catalog: catalog_sandbox_5nwjwb
     schema: air_hackathon_v2
+    project_name: phi_4_finetuned
 
     model_name: microsoft/phi-4
     model_weights_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/microsoft-phi-4
     train_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=train
     eval_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=eval
     # false reads prompt/assistant_response directly. When true, point these
-    # paths at raw setup/02 splits and convert each loaded rank slice locally.
+    # paths at /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/training_data/
+    # fraud_raw_dataset/split=<train|eval> and convert each rank slice locally.
     convert_sft: false
     # true recursively loads all parquet files for every rank; false assigns
     # shard_id=N directories by N % world_size.

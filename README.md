@@ -14,19 +14,17 @@ fine-tuned Qwen3 model. Training is split into three independent projects:
 Each project owns its runner notebook, trainer, requirements, workload YAML,
 and config loader. Its YAML contains the catalog, schema, model-weight path,
 prepared train/eval paths, output path, compute, experiment, and trainer
-parameters. Neither trainer reads `global.yaml`, `setup.yaml`, or the other
-training project.
+parameters. No trainer reads `setup.yaml` or another training project.
 
 ## Project Layout
 
 | Path | Purpose |
 | --- | --- |
-| `global.yaml` | Catalog/schema shared by setup, load test, and monitoring. |
 | `setup/01_load_dataset.py` | Download and clean TabFormer transactions. |
 | `setup/02_stage_training_data.py` | Create deterministic train/eval splits and raw Parquet shards. |
-| `setup/03_prepare_sft.py` | Render model-agnostic prompt/response records into SFT Parquet shards. |
 | `setup/04_download_base_model_weights.py` | Snapshot configured Hugging Face models into UC volumes. |
-| `setup/utils.py` | Setup config, catalog, Spark, and canonical SFT rendering helpers. |
+| `setup/utils.py` | Setup config, catalog, and Spark helpers. |
+| `train/prep_sft.py` | Convert raw Parquet shards into prepared SFT Parquet in a separate UC volume. |
 | `train/train_qwen_unsloth/` | Standalone Qwen training and deployment project. |
 | `train/train_phi_4_unsloth/` | Standalone Phi-4 training and deployment project. |
 | `train/train_gpt_oss_fsdp/` | Standalone GPT-OSS FSDP training and deployment project. |
@@ -67,6 +65,8 @@ Each project YAML also owns `deploy_config` for its local
 `setup/setup.yaml` separately controls the worked-example data pipeline and
 optional model downloads. The GPT-OSS model path is not downloaded by default
 because the snapshot is very large; populate that configured path separately.
+Setup, load testing, and monitoring each define their own `catalog` and
+`schema` at the top of their sibling YAML; there is no repository-wide config.
 
 Compile-check the local Python sources without a workspace connection:
 
@@ -78,7 +78,7 @@ python -m compileall -q setup train load_test monitor
 
 1. Run `setup/01_load_dataset.py` on Databricks serverless compute.
 2. Run `setup/02_stage_training_data.py` to create raw train/eval shards.
-3. With `convert_sft: false`, run `setup/03_prepare_sft.py` to write `prompt`,
+3. With `convert_sft: false`, run `train/prep_sft.py` to write `prompt`,
    `assistant_response`, and `is_fraud` records. With `convert_sft: true`, skip
    this step and point the project paths at setup/02's raw split directories.
 4. Run `setup/04_download_base_model_weights.py` when the selected model is
@@ -175,8 +175,8 @@ rechecking the target model architecture and serving image.
 
 ## Local Development
 
-Setup notebooks 01-03 can run through Databricks Connect after installing
-their lightweight local dependencies:
+The data setup and SFT preparation notebooks can run through Databricks
+Connect after installing their lightweight local dependencies:
 
 ```bash
 python -m venv .venv
@@ -184,7 +184,7 @@ source .venv/bin/activate
 pip install "databricks-connect>=17.0.0" "pyyaml>=6.0.2" "pandas>=2.2.0"
 .venv/bin/python setup/01_load_dataset.py
 .venv/bin/python setup/02_stage_training_data.py
-.venv/bin/python setup/03_prepare_sft.py
+.venv/bin/python train/prep_sft.py
 ```
 
 The training runners require Databricks Serverless GPU and cannot run locally.
