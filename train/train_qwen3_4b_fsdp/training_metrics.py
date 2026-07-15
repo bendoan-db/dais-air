@@ -16,6 +16,67 @@ def preprocess_logits_for_metrics(logits, _labels):
     return logits.argmax(dim=-1)
 
 
+def _as_token_id_matrix(values, name: str):
+    """Flatten dense or ragged Trainer outputs into a padded token-id matrix."""
+    import numpy as np
+
+    def as_array(value):
+        try:
+            return np.asarray(value)
+        except ValueError:
+            if not isinstance(value, (list, tuple)):
+                raise
+            object_array = np.empty(len(value), dtype=object)
+            object_array[:] = list(value)
+            return object_array
+
+    # Causal LM outputs can be wrapped in a tuple with auxiliary model outputs.
+    if isinstance(values, tuple):
+        values = values[0]
+
+    array = as_array(values)
+    if array.dtype != object:
+        if array.ndim == 1:
+            return array.reshape(1, -1)
+        if array.ndim >= 2:
+            return array.reshape(-1, array.shape[-1])
+
+    rows = []
+
+    def collect_rows(value):
+        nested = as_array(value)
+        if nested.dtype != object:
+            if nested.ndim == 0:
+                raise ValueError(f"{name} contains a scalar instead of token IDs")
+            if nested.ndim == 1:
+                rows.append(nested.astype(np.int64, copy=False))
+                return
+            rows.extend(
+                row.astype(np.int64, copy=False)
+                for row in nested.reshape(-1, nested.shape[-1])
+            )
+            return
+
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(
+                f"Could not normalize {name} item of type {type(value).__name__}"
+            )
+        for item in value:
+            collect_rows(item)
+
+    collect_rows(values)
+    if not rows:
+        raise ValueError(f"{name} contains no token-id rows")
+
+    width = max(len(row) for row in rows)
+    matrix = np.full((len(rows), width), -100, dtype=np.int64)
+    for row_index, row in enumerate(rows):
+        matrix[row_index, : len(row)] = row
+    return matrix
+
+
 def _extract_risk(text: str) -> str | None:
     matches = RISK_PATTERN.findall(text)
     if not matches:
@@ -96,15 +157,28 @@ def build_compute_metrics(tokenizer) -> Callable:
     def compute_metrics(eval_prediction) -> dict[str, float]:
         import numpy as np
 
-        predictions = eval_prediction.predictions
-        if isinstance(predictions, tuple):
-            predictions = predictions[0]
-        predictions = np.asarray(predictions)
-        labels = np.asarray(eval_prediction.label_ids)
-        if predictions.ndim != 2 or labels.ndim != 2:
+        predictions = _as_token_id_matrix(
+            eval_prediction.predictions, "predictions"
+        )
+        labels = _as_token_id_matrix(eval_prediction.label_ids, "labels")
+        if predictions.shape[0] != labels.shape[0]:
             raise ValueError(
-                "Expected token-id predictions and labels with shape "
-                f"[batch, sequence], got {predictions.shape} and {labels.shape}"
+                "Predictions and labels contain different row counts: "
+                f"{predictions.shape[0]} and {labels.shape[0]}"
+            )
+
+        sequence_length = max(predictions.shape[1], labels.shape[1])
+        if predictions.shape[1] < sequence_length:
+            predictions = np.pad(
+                predictions,
+                ((0, 0), (0, sequence_length - predictions.shape[1])),
+                constant_values=-100,
+            )
+        if labels.shape[1] < sequence_length:
+            labels = np.pad(
+                labels,
+                ((0, 0), (0, sequence_length - labels.shape[1])),
+                constant_values=-100,
             )
 
         shifted_predictions = predictions[:, :-1]

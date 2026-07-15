@@ -259,6 +259,7 @@ def train_full_weight_fsdp(
         eval_steps=EVAL_STEPS,
         do_eval=eval_dataset is not None,
         prediction_loss_only=False,
+        eval_do_concat_batches=True,
         save_strategy="no",
         report_to=["mlflow"],
         run_name=run_name,

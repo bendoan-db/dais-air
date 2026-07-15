@@ -392,6 +392,7 @@ def train_qwen3_unsloth(
         eval_steps=EVAL_STEPS,
         do_eval=eval_dataset is not None,
         prediction_loss_only=False,
+        eval_do_concat_batches=True,
         per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
         optim="adamw_8bit",
         weight_decay=0.01,
