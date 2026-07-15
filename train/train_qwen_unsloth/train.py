@@ -48,10 +48,18 @@ except ImportError:
 
 try:
     from .sft_conversion import prepare_sft_records
-    from .training_metrics import build_compute_metrics, preprocess_logits_for_metrics
+    from .training_metrics import (
+        build_compute_metrics,
+        build_mlflow_metrics_callback,
+        preprocess_logits_for_metrics,
+    )
 except ImportError:
     from sft_conversion import prepare_sft_records
-    from training_metrics import build_compute_metrics, preprocess_logits_for_metrics
+    from training_metrics import (
+        build_compute_metrics,
+        build_mlflow_metrics_callback,
+        preprocess_logits_for_metrics,
+    )
 
 globals().update(load_project_config())
 if RESPONSE_INSTRUCTION_PART is None or RESPONSE_PART is None:
@@ -382,6 +390,8 @@ def train_qwen3_unsloth(
         logging_strategy="steps",
         eval_strategy="steps" if eval_dataset is not None else "no",
         eval_steps=EVAL_STEPS,
+        do_eval=eval_dataset is not None,
+        prediction_loss_only=False,
         per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
         optim="adamw_8bit",
         weight_decay=0.01,
@@ -407,6 +417,7 @@ def train_qwen3_unsloth(
         args=training_args,
         compute_metrics=build_compute_metrics(tokenizer),
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        callbacks=[build_mlflow_metrics_callback(eval_dataset is not None)],
     )
 
     try:

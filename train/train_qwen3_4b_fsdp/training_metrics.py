@@ -4,7 +4,9 @@ import re
 from collections.abc import Callable
 
 RISK_LABELS = ("legitimate", "suspicious", "likely_fraud")
-RISK_PATTERN = re.compile(r'"risk"\s*:\s*"([^"]+)"', re.IGNORECASE)
+RISK_PATTERN = re.compile(
+    r"""["']risk["']\s*:\s*["']([^"']+)["']""", re.IGNORECASE
+)
 
 
 def preprocess_logits_for_metrics(logits, _labels):
@@ -18,7 +20,7 @@ def _extract_risk(text: str) -> str | None:
     matches = RISK_PATTERN.findall(text)
     if not matches:
         return None
-    risk = matches[-1].lower()
+    risk = matches[-1].strip().lower()
     return risk if risk in RISK_LABELS else None
 
 
@@ -133,15 +135,70 @@ def build_compute_metrics(tokenizer) -> Callable:
             expected_risks.append(expected_risk)
             predicted_risks.append(_extract_risk(predicted_text))
 
-        if expected_risks:
-            metrics.update(_classification_metrics(expected_risks, predicted_risks))
-            metrics["classification_target_coverage"] = _safe_divide(
-                len(expected_risks), labels.shape[0]
-            )
-        else:
-            metrics["classification_sample_count"] = 0.0
-            metrics["classification_target_coverage"] = 0.0
-            metrics["classification_parse_rate"] = 0.0
+        # Always return the complete schema. Missing targets are a data-quality
+        # signal, not a reason for accuracy/F1 metrics to disappear from MLflow.
+        metrics.update(_classification_metrics(expected_risks, predicted_risks))
+        metrics["classification_target_coverage"] = _safe_divide(
+            len(expected_risks), labels.shape[0]
+        )
         return metrics
 
     return compute_metrics
+
+
+def build_mlflow_metrics_callback(evaluation_enabled: bool):
+    """Log and verify custom evaluation metrics on Trainer evaluation events."""
+    from transformers import TrainerCallback
+
+    class MlflowClassificationMetricsCallback(TrainerCallback):
+        def __init__(self):
+            self.evaluation_count = 0
+
+        def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+            if not evaluation_enabled:
+                return
+
+            self.evaluation_count += 1
+            metrics = metrics or {}
+            coverage_key = "eval_classification_target_coverage"
+            if coverage_key not in metrics:
+                raise RuntimeError(
+                    "Evaluation completed without custom classification metrics. "
+                    "Ensure compute_metrics is configured and "
+                    "prediction_loss_only is false."
+                )
+
+            if not state.is_world_process_zero:
+                return
+
+            import mlflow
+
+            custom_metrics = {
+                key: float(value)
+                for key, value in metrics.items()
+                if key == "eval_token_accuracy"
+                or key.startswith("eval_classification_")
+            }
+            if mlflow.active_run() is None:
+                raise RuntimeError(
+                    "Custom evaluation metrics were computed without an active "
+                    "MLflow run."
+                )
+            # Log explicitly instead of relying only on the Transformers
+            # integration so custom metrics survive integration/version changes.
+            mlflow.log_metrics(custom_metrics, step=int(state.global_step))
+
+            if custom_metrics[coverage_key] == 0.0:
+                print(
+                    "WARNING: Evaluation targets contain no recognized risk "
+                    "labels; classification metrics were logged as zero."
+                )
+
+        def on_train_end(self, args, state, control, **kwargs):
+            if evaluation_enabled and self.evaluation_count == 0:
+                raise RuntimeError(
+                    "Training completed without evaluation, so no classification "
+                    "metrics were logged. Check eval_steps and eval_sample_size."
+                )
+
+    return MlflowClassificationMetricsCallback()
