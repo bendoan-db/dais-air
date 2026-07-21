@@ -1,0 +1,98 @@
+# Self-contained Phi-4 + Unsloth DDP training project.
+# Run from this directory: COPYFILE_DISABLE=1 air run --file train.yaml --watch
+# AIR requires experiment_name as a Jobs task key. Together with
+# mlflow_experiment_directory it resolves to training_config.experiment_path.
+experiment_name: air_hackathon_phi_4
+mlflow_experiment_directory: /Workspace/Shared
+
+environment:
+  version: '5'
+  dependencies:
+    - -r requirements.txt
+
+compute:
+  num_accelerators: 8
+  accelerator_type: GPU_8xH100
+
+env_variables:
+  DATABRICKS_RUNTIME_VERSION: '15.4'
+
+code_source:
+  type: snapshot
+  snapshot:
+    root_path: .
+
+command: python $CODE_SOURCE_PATH/train.py
+
+parameters:
+  training_config:
+    catalog: catalog_sandbox_5nwjwb
+    schema: air_hackathon_v2
+    project_name: phi_4_finetuned
+    experiment_path: /Workspace/Shared/air_hackathon_phi_4
+
+    model_name: microsoft/phi-4
+    model_weights_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/microsoft-phi-4
+    train_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=train
+    eval_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=eval
+    # false reads prompt/assistant_response directly. When true, point these
+    # paths at /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/training_data/
+    # fraud_raw_dataset/split=<train|eval> and convert each rank slice locally.
+    convert_sft: false
+    # true recursively loads all parquet files for every rank; false assigns
+    # shard_id=N directories by N % world_size.
+    ignore_partitions: false
+    suspicious_amount_threshold: 500.0
+    output_dir: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/checkpoints/phi_4_finetuned/
+
+    max_seq_length: 4096
+    max_steps: 10
+    per_device_train_batch_size: 2
+    per_device_eval_batch_size: 1
+    gradient_accumulation_steps: 8
+    learning_rate: 2e-4
+    warmup_steps: 5
+    training_sample_fraction: 0.0001
+    eval_sample_size: 200
+    # Trainer/MLflow cadence. eval_steps: 1 records held-out loss and custom
+    # classification metrics after every optimizer step.
+    logging_steps: 1
+    eval_steps: 1
+    seed: 3407
+
+    lora_r: 16
+    lora_alpha: 16
+    lora_dropout: 0.0
+    # Phi-4 uses fused attention and MLP projections.
+    lora_target_modules:
+      - qkv_proj
+      - o_proj
+      - gate_up_proj
+      - down_proj
+
+    # microsoft/phi-4 chat-template markers for response-only loss masking.
+    response_instruction_part: "<|im_start|>user<|im_sep|>"
+    response_part: "<|im_start|>assistant<|im_sep|>"
+
+  deploy_config:
+    run_id: ''
+    best_run_metric: trainer_train_loss
+    best_run_metric_goal: minimize
+
+    uc_model_name: phi_4_finetuned
+    served_model_name: phi_4_finetuned
+    serving_requirements_file: requirements.txt
+
+    vllm_dtype: auto
+    vllm_max_model_len: 4096
+    vllm_gpu_memory_utilization: 0.8
+
+    endpoint_name: phi_4_finetuned
+    # AI Gateway writes request/response payloads to
+    # <catalog>.<schema>.<inference_table_prefix>_payload.
+    inference_table_prefix: phi_4_finetuned
+    endpoint_description: 'Custom LLM endpoint serving the Phi-4 Unsloth fine-tune.'
+    # Use the GPU_LARGE custom LLM serving tier with fixed non-zero capacity.
+    serving_workload_type: GPU_LARGE
+    serving_workload_size: Small
+    serving_scale_to_zero: false

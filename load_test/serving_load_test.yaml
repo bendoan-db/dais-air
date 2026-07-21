@@ -1,8 +1,9 @@
-# Stage-specific configuration for the load-test notebook. catalog/schema
-# come from the repo-root global.yaml. sft_table must match setup/train and
-# endpoint_name must match train/train.yaml's deploy_config;
-# scripts/validate_config.py checks both agreements.
-sft_table: fraud_sft_dataset
+# Stage-specific configuration for the load-test notebook.
+catalog: catalog_sandbox_5nwjwb
+schema: air_hackathon_v2
+
+# Raw Parquet export written by setup/02_stage_training_data.py.
+raw_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/training_data/fraud_raw_dataset
 endpoint_name: qwen3_4b_instruct_finetuned_v2
 
 # Delta table (in the shared catalog.schema) that accumulates one summary row
@@ -11,8 +12,8 @@ results_table: serving_load_test_results
 
 # Requests per second across the whole worker fleet. Every planned request is
 # billed serving traffic (planned requests = target_qps x duration_seconds) —
-# start small to validate, then raise toward the endpoint's provisioned
-# capacity. Requests beyond provisioned capacity are rejected with 429s.
+# start small, then raise toward the endpoint's fixed replica capacity.
+# Sustained overload can queue requests or return 429/503 responses.
 target_qps: 3
 duration_seconds: 90
 # Each worker is one Spark task running its own asyncio loop; workers only run
@@ -24,6 +25,10 @@ load_generator_workers: 2
 worker_concurrency: 4
 request_timeout_seconds: 30
 
+# Request prompts are rendered live from raw records sampled from the staged
+# export's eval split (rows the model never trained on), using the stage-local
+# prompt renderer. Keep its template synchronized with train/prep_sft.py and
+# each trainer.
 prompt_sample_fraction: 0.001
 prompt_sample_size: 1000
 smoke_test_requests: 2

@@ -9,11 +9,11 @@
 # MAGIC
 # MAGIC What one run does:
 # MAGIC
-# MAGIC 1. Rebuilds the baseline table from the SFT dataset, applying the **same** prompt-field and response-JSON extraction module 01 applies to serving traffic (both import `monitoring_utils`) — so baseline drift compares serving traffic against exactly what the model was trained on: covariate shift on `txn_*`, label shift on `response_*`.
+# MAGIC 1. Rebuilds the baseline table from prepared SFT Parquet, applying the **same** prompt-field and response-JSON extraction module 01 applies to serving traffic (both import `monitoring_utils`) — so baseline drift compares serving traffic against exactly what the model was trained on: covariate shift on `txn_*`, label shift on `response_*`.
 # MAGIC 2. Creates or updates the monitor: prediction/timestamp/model-id columns, granularities, slices, the baseline, and custom contract-integrity metrics (JSON output breakage, prompt-template breakage, out-of-vocabulary labels, truncation, per-class prediction rates).
 # MAGIC 3. Triggers a metrics refresh (incremental via the table's change data feed) and prints where the metrics tables and auto-generated dashboard live.
 # MAGIC
-# MAGIC Run on Databricks serverless (CPU) compute **after** module 01 has created and filled the unpacked table. Rerun when a retrain changes the SFT table (to refresh the baseline) or after changing the monitor keys in `monitor.yaml`. Recurring refreshes belong in the job that runs module 01 (unpack task → `quality_monitors.run_refresh` task), so metrics never lag the data — the monitor itself is created without a schedule.
+# MAGIC Run on Databricks serverless (CPU) compute **after** module 01 has created and filled the unpacked table. Rerun when a retrain changes the prepared SFT data (to refresh the baseline) or after changing the monitor keys in `monitor.yaml`. Recurring refreshes belong in the job that runs module 01 (unpack task → `quality_monitors.run_refresh` task), so metrics never lag the data — the monitor itself is created without a schedule.
 # MAGIC
 # MAGIC References:
 # MAGIC
@@ -22,16 +22,14 @@
 
 # COMMAND ----------
 
-# training_utils (train/) and monitoring_utils (this folder) are plain
-# Python modules, not notebooks; insert their directories into sys.path.
+# utils.py and monitoring_utils.py are plain monitoring-stage modules, not
+# notebooks; insert this notebook's directory into sys.path.
 import sys
 from pathlib import Path
 
-TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
 MONITOR_MODULE_DIR = str(Path.cwd().resolve())
-for module_dir in (TRAIN_MODULE_DIR, MONITOR_MODULE_DIR):
-    if module_dir not in sys.path:
-        sys.path.insert(0, module_dir)
+if MONITOR_MODULE_DIR not in sys.path:
+    sys.path.insert(0, MONITOR_MODULE_DIR)
 
 from monitoring_utils import (
     PROMPT_COLUMN_PREFIX,
@@ -39,23 +37,20 @@ from monitoring_utils import (
     with_prompt_fields,
     with_response_fields,
 )
-from training_utils import (
+from utils import (
     config_str,
     full_name,
     get_spark_session,
-    load_global_config,
     load_yaml_config,
 )
 
-# Stage keys come from monitor.yaml (validated/normalized by
-# parse_quality_monitor_config — the same parser scripts/validate_config.py
-# exercises in CI); catalog/schema come from the repo-root global.yaml.
+# Stage keys come from monitor.yaml and are normalized by
+# parse_quality_monitor_config.
 config_path, monitor_config = load_yaml_config("monitor.yaml", base_dir=Path.cwd())
-_, global_config = load_global_config()
 
-UC_CATALOG = config_str(global_config, "catalog")
-UC_SCHEMA = config_str(global_config, "schema")
-SFT_TABLE_NAME = config_str(monitor_config, "sft_table")
+UC_CATALOG = config_str(monitor_config, "catalog")
+UC_SCHEMA = config_str(monitor_config, "schema")
+SFT_DATA_PATH = config_str(monitor_config, "sft_data_path")
 UNPACKED_TABLE_NAME = config_str(monitor_config, "unpacked_table")
 
 monitor_settings = parse_quality_monitor_config(monitor_config)
@@ -75,13 +70,15 @@ MONITORED_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{UNPACKED_TABLE_NAME}"
 BASELINE_TABLE = f"{UC_CATALOG}.{UC_SCHEMA}.{BASELINE_TABLE_NAME}"
 OUTPUT_SCHEMA_NAME = monitor_settings["monitor_output_schema"] or f"{UC_CATALOG}.{UC_SCHEMA}"
 
-sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 unpacked_table_q = full_name(UC_CATALOG, UC_SCHEMA, UNPACKED_TABLE_NAME)
 baseline_table_q = full_name(UC_CATALOG, UC_SCHEMA, BASELINE_TABLE_NAME)
 
 print(f"Monitor config: {config_path}")
 print(f"Monitored (unpacked) table: {MONITORED_TABLE}")
-print(f"Baseline table: {BASELINE_TABLE} (from {SFT_TABLE_NAME}, fraction {BASELINE_SAMPLE_FRACTION})")
+print(
+    f"Baseline table: {BASELINE_TABLE} "
+    f"(from {SFT_DATA_PATH}, fraction {BASELINE_SAMPLE_FRACTION})"
+)
 print(f"Prediction column: {PREDICTION_COL} in {EXPECTED_PREDICTION_VALUES}")
 print(f"Granularities: {GRANULARITIES}; slices: {SLICING_EXPRS or '(none)'}")
 print(f"Label column: {LABEL_FIELD or '(none — drift-only monitoring)'}")
@@ -119,7 +116,15 @@ if LABEL_FIELD and LABEL_FIELD not in unpacked_columns:
 
 TRAINING_BASELINE_MODEL_ID = "training_baseline"
 
-baseline_df = spark.table(sft_table_q).select("prompt", "assistant_response")
+try:
+    baseline_df = spark.read.parquet(SFT_DATA_PATH).select(
+        "prompt", "assistant_response"
+    )
+except Exception as exc:
+    raise RuntimeError(
+        f"Prepared SFT Parquet is not readable at {SFT_DATA_PATH}. Run "
+        "train/prep_sft.py first or update sft_data_path in monitor.yaml."
+    ) from exc
 if BASELINE_SAMPLE_FRACTION < 1.0:
     baseline_df = baseline_df.sample(fraction=BASELINE_SAMPLE_FRACTION, seed=42)
 
@@ -188,10 +193,10 @@ for column, null_rate in null_rates.items():
 
 if null_rates[PREDICTION_COL] >= 1.0:
     raise RuntimeError(
-        f"{PREDICTION_COL} is 100% null in the baseline — the SFT table's "
+        f"{PREDICTION_COL} is 100% null in the baseline — the prepared SFT "
         "assistant_response does not parse as JSON with a "
         f"{PREDICTION_FIELD!r} key. Check response_json_fields against the "
-        "prompt contract in setup/02_stage_training_data.py."
+        "prompt contract in train/prep_sft.py."
     )
 if PROMPT_FIELDS and all(
     null_rates[f"{PROMPT_COLUMN_PREFIX}{name}"] >= 1.0 for name, _ in PROMPT_FIELDS
@@ -199,8 +204,7 @@ if PROMPT_FIELDS and all(
     raise RuntimeError(
         "Every txn_* column is 100% null in the baseline — the SFT prompts do "
         "not contain the '- <field>: <value>' lines prompt_fields expects. "
-        "Check prompt_fields against the prompt template in "
-        "setup/02_stage_training_data.py."
+        "Check prompt_fields against the prompt template in train/prep_sft.py."
     )
 
 # COMMAND ----------
@@ -395,6 +399,7 @@ print(f"{w.config.host}/explore/data/{UC_CATALOG}/{UC_SCHEMA}/{UNPACKED_TABLE_NA
 # MAGIC %md
 # MAGIC ## Next steps
 # MAGIC
-# MAGIC - **Schedule**: one job with two sequential tasks — `01_unpack_inference_table.py`, then `quality_monitors.run_refresh` — daily by default (matching the `1 day` granularity). Rerun **this** notebook only after a retrain (baseline rebuild) or a `monitor.yaml` change.
-# MAGIC - **Alerts**: SQL alerts over the drift and profile metrics tables — prediction/feature drift vs. the `training_baseline` model id (`drift_type = 'BASELINE'`), the custom contract metrics (`column_name = ':table'`), and volume collapse. `monitor/monitoring.md` §11 has the suggested queries; exclude the current in-progress window (inference logs arrive with up to ~1 hour of lag).
+# MAGIC - **SQL alert setup**: set `drift_alert_warehouse_id`, then run `03_create_drift_sql_alert.py`. It idempotently creates or updates the scheduled baseline-drift alert.
+# MAGIC - **Schedule**: run `01_unpack_inference_table.py`, refresh this monitor, then run `04_trigger_retraining.py`. The last step checks the refreshed drift metrics and starts `retraining_job_id` only when thresholds are breached and cooldown checks pass.
+# MAGIC - **Profile alerts**: contract-integrity metrics and volume collapse live in the profile metrics table and remain separate alert candidates. `monitor/monitoring.md` §11 has suggested queries.
 # MAGIC - **Phase 2 (ground truth)**: when late-arriving fraud labels exist, MERGE them into the unpacked table keyed by `client_request_id` (callers must send the header) and set `label_field` in `monitor.yaml` — the monitor then computes precision/recall/confusion per window and slice.

@@ -1,8 +1,0 @@
-# Global configuration — the Unity Catalog identity shared by every
-# pipeline module (setup, train+deploy, load test, monitor). Each module
-# loads this file through training_utils.load_global_config(); all other
-# parameters are stage-owned in each module's YAML, and cross-stage
-# agreements are checked by scripts/validate_config.py (which also fails if
-# a stage YAML re-introduces a key defined here).
-catalog: catalog_sandbox_5nwjwb
-schema: air_hackathon

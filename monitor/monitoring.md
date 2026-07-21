@@ -10,8 +10,9 @@ produces.
 > `monitor/monitoring_utils.py` (shared plain module) and is wired into
 > module 01; the baseline build and monitor creation are
 > `monitor/02_create_quality_monitor.py`; the config keys are in
-> `monitor/monitor.yaml` and validated by `scripts/validate_config.py`.
-> Phase 2 (§9) and the SQL alerts (§11) remain to be set up per workspace. The model is treated as a **classifier**: every request/response pair
+> `monitor/monitor.yaml` and parsed by the monitoring notebooks. SQL alert
+> provisioning and the retraining gate are modules 03 and 04. Phase 2 (§9)
+> remains future work. The model is treated as a **classifier**: every request/response pair
 follows the shape in `monitor/example_inputs.py` — a single user message whose
 prompt always ends with a fixed transaction block:
 
@@ -76,7 +77,8 @@ qwen3_4b_instruct_finetuned_requests_profile_metrics             (generated)
 qwen3_4b_instruct_finetuned_requests_drift_metrics               (generated)
         │
         ├── auto-generated AI/BI monitoring dashboard
-        └── SQL alerts on the metrics tables
+        ├── module 03: scheduled SQL alert on baseline drift
+        └── module 04: threshold gate → configured retraining Lakeflow Job
 ```
 
 Module 01 already satisfies every precondition the monitor has: change data feed
@@ -166,7 +168,7 @@ code as a number would produce meaningless numeric drift.
 
 The extraction-expression builder lives in a new **plain Python module**
 `monitor/monitoring_utils.py` (no `# Databricks notebook source` header — same
-precedent as `train/train.py`), imported by both module 01 (serving traffic) and
+precedent as the project-local training modules), imported by both module 01 (serving traffic) and
 module 02 (baseline build, §6) so the two tables are guaranteed to parse
 identically. CLAUDE.md's notebook-format rule gains this file as a documented
 exception.
@@ -199,7 +201,7 @@ features visible to it.
 | `slicing_exprs` | `["response_action"]` (config-driven) | Risk distribution conditioned on the action taken. `txn_*` columns are valid slice targets too (e.g. `txn_use_chip` to split online vs. chip transactions) — but slices multiply cost, so the default stays minimal. |
 | `baseline_table_name` | `<unpacked_table>_baseline` | Drift vs. the training distribution — features *and* labels (§6). |
 | `output_schema_name` | `<catalog>.<schema>` (same schema by default, configurable) | Metrics tables land next to the tables they describe. |
-| `assets_dir` | `/Workspace/Users/<current user>/quality_monitoring/<unpacked_table>` | Auto-generated dashboard location; derived from the current user like the MLflow experiment path — nothing hardcoded. |
+| `assets_dir` | `/Workspace/Users/<current user>/quality_monitoring/<unpacked_table>` | Auto-generated dashboard location derived from the current user. Training experiment paths are configured explicitly in each training YAML. |
 | `schedule` | *(unset)* | Refresh is orchestrated by the job that runs the unpack notebook (§8), so metrics never lag the data. |
 
 Created via the SDK (`WorkspaceClient().quality_monitors.create(...)`) from a new
@@ -229,13 +231,13 @@ carries the training-time *feature* distribution, not just the label
 distribution.
 
 `monitor/02_create_quality_monitor.py` builds the baseline table
-(`baseline_table` in `monitor.yaml`) from the SFT table (`sft_table` in
-`monitor.yaml`, agreement-checked against setup/train — the same table
-training and the load test read):
+(`baseline_table` in `monitor.yaml`) from the prepared SFT Parquet path
+(`sft_data_path` in `monitor.yaml`, aligned with `train/prep_sft.py` and the
+trainers' prepared input paths):
 
 1. Sample the SFT records (`baseline_sample_fraction`, seeded so reruns are
    stable) — distribution baselines need far fewer rows than training does,
-   and the SFT table can run to tens of millions of rows.
+   and the prepared SFT files can contain tens of millions of rows.
 2. Parse the `prompt` column with the **same** `prompt_fields` extraction from
    `monitoring_utils.py` (§4) → `txn_amount_usd`, `txn_use_chip`, ... columns.
    Baseline feature drift is therefore covariate shift measured against exactly
@@ -278,7 +280,7 @@ stats plus drift tests already flag verbosity creep.
 
 ## 8. Refresh orchestration & scheduling
 
-A single scheduled Lakeflow job (serverless) with two sequential tasks, so
+A single scheduled Lakeflow job (serverless) with three sequential tasks, so
 metrics are computed immediately after new payload rows are unpacked:
 
 1. **Unpack** — run `monitor/01_unpack_inference_table.py` (drains new payload
@@ -286,11 +288,16 @@ metrics are computed immediately after new payload rows are unpacked:
 2. **Refresh monitor** — `quality_monitors.run_refresh(table_name=...)`. The
    refresh reads the unpacked table's CDF, so it processes only changed
    partitions/rows.
+3. **Retraining gate** — run `monitor/04_trigger_retraining.py`. It queries the
+   refreshed drift table and starts `retraining_job_id` only when the shared
+   threshold predicate is breached and no active/recent run blocks it.
 
 Cadence: daily by default (matches the `1 day` granularity); hourly for
 high-traffic endpoints, with the `1 hour` granularity enabled to match.
 Rebuilding the baseline (module 02) is **not** part of this job — it reruns only
-after a retrain changes the SFT table.
+after a retrain changes the prepared SFT data.
+Run module 03 once after monitor creation, and rerun it only when its SQL
+warehouse, schedule, subscribers, or drift thresholds change.
 
 ## 9. Phase 2 — late-arriving ground truth
 
@@ -325,8 +332,8 @@ end-to-end labeled demo.
   transactions that reach the endpoint (a selection effect if upstream routing
   changes). A plain time-series monitor on the upstream transaction table covers
   the full population if that distinction matters.
-- **Failed-request visibility** — 4xx/5xx (including 429s beyond provisioned
-  concurrency) may never reach the inference table; error-rate alerting stays
+- **Failed-request visibility** — overload-related 4xx/5xx responses may never
+  reach the inference table; error-rate alerting stays
   client-side.
 - **Delivery lag** — inference logging is best-effort within ~1 hour; the most
   recent window is always partially filled. Alerts should exclude the current
@@ -334,9 +341,20 @@ end-to-end labeled demo.
 
 ## 11. Alerting
 
-SQL alerts (Databricks SQL, scheduled after the monitoring job) over the
-generated tables. Thresholds start conservative and are tuned against the first
-weeks of profile history. Suggested set:
+`monitor/03_create_drift_sql_alert.py` idempotently creates an Alerts V2 object
+over the generated drift table. Its query counts completed baseline windows
+where any configured `drift_columns` value exceeds `drift_js_threshold` or
+falls below `drift_p_value_threshold`; the alert condition is
+`breach_count > 0`. Only aggregate rows (`slice_key IS NULL`) can trigger the
+automation. Configure a Pro or Serverless warehouse, schedule, and optional
+email/notification-destination subscribers in `monitor.yaml`.
+
+`monitor/04_trigger_retraining.py` executes the identical query through Spark.
+On a breach it verifies the configured job exists, skips active or cooldown
+runs, then calls `jobs.run_now` with an idempotency token derived from the
+latest breached window. This makes repeated evaluations of one drift window
+safe. The following queries remain useful for investigation and additional
+profile-metric alerts:
 
 ```sql
 -- 1. Input feature drift vs. training baseline (covariate shift)
@@ -420,42 +438,68 @@ slicing_fields: [action]
 # Monitor windows; each granularity adds refresh cost.
 granularities: ["1 day"]
 # Baseline table name (overwritten on each run of module 02). The baseline
-# source is monitor.yaml's own sft_table, agreement-checked against
-# setup/train by scripts/validate_config.py so the baseline cannot point at
-# a different table than training read.
+# source is monitor.yaml's own sft_data_path; keep it aligned with
+# train/prep_sft.py and the prepared paths used for training.
 baseline_table: qwen3_4b_instruct_finetuned_requests_baseline
-# Fraction of the SFT table sampled into the baseline (seeded).
+# Fraction of the prepared SFT records sampled into the baseline (seeded).
 baseline_sample_fraction: 0.05
 # Where metrics tables land; empty = same catalog.schema as the monitored table.
 monitor_output_schema: ""
 # Phase 2: ground-truth column joined into the unpacked table; empty = unset.
 label_field: ""
+
+# ---- 03_create_drift_sql_alert.py and 04_trigger_retraining.py ----
+drift_columns: [txn_amount_usd, txn_use_chip, txn_merchant_state,
+                txn_merchant_category_code, txn_errors, response_risk]
+drift_lookback_days: 2
+drift_settling_hours: 1
+drift_js_threshold: 0.15
+drift_p_value_threshold: 0.01
+drift_breach_details_limit: 100
+
+# ---- 03_create_drift_sql_alert.py ----
+drift_alert_warehouse_id: ""
+drift_alert_display_name: qwen3_4b_instruct_finetuned_v2 baseline drift
+drift_alert_quartz_cron: "0 0 6 * * ?"
+drift_alert_timezone: UTC
+drift_alert_notify_on_ok: true
+drift_alert_retrigger_seconds: 86400
+drift_alert_user_emails: []
+drift_alert_destination_ids: []
+
+# ---- 04_trigger_retraining.py ----
+retraining_job_id: ""
+retraining_cooldown_hours: 24
+retraining_job_parameters: {}
 ```
 
 ### Files (implemented)
 
 - `monitor/monitoring_utils.py` — **plain Python module** (no notebook header;
-  same precedent as `train/train.py`): the `txn_*`/`response_*` extraction
+  same precedent as the project-local training modules): the `txn_*`/`response_*` extraction
   helpers plus `parse_quality_monitor_config()`, shared by modules 01 and 02 so
-  serving and baseline tables parse identically. pyspark imports stay inside
-  the DataFrame helpers so `scripts/validate_config.py` can import the parsers
-  in CI (where only pyyaml is installed). Documented as a notebook-format
-  exception in CLAUDE.md.
+  serving and baseline tables parse identically. Pyspark imports stay inside
+  the DataFrame helpers so the configuration parsers remain importable without
+  a Spark session. Documented as a notebook-format exception in CLAUDE.md.
 - `monitor/01_unpack_inference_table.py` — extended with the prompt-feature
   extraction (§4). Schema change ⇒ existing deployments delete the checkpoint
   and unpacked table and reprocess.
 - `monitor/02_create_quality_monitor.py` — Databricks notebook (serverless
-  CPU): builds the baseline table (features + labels) from the SFT table,
+  CPU): builds the baseline table (features + labels) from prepared SFT Parquet,
   creates-or-updates the monitor idempotently (keeping the existing dashboard
   on update), waits for `ACTIVE`, triggers a refresh, and prints the metrics
   table names and dashboard pointer.
-- *(Phase 2, future)* `monitor/03_join_ground_truth.py` — label MERGE task.
+- `monitor/03_create_drift_sql_alert.py` — Databricks notebook: creates or
+  updates the scheduled Alerts V2 baseline-drift query by display name.
+- `monitor/04_trigger_retraining.py` — Databricks notebook: checks refreshed
+  drift metrics and starts the configured retraining job with duplicate-run
+  protection.
+- *(Phase 2, future)* `monitor/05_join_ground_truth.py` — label MERGE task.
 
-### Validation (`scripts/validate_config.py`, implemented)
+### Runtime Configuration Checks
 
-The validator imports `monitoring_utils.parse_quality_monitor_config` — the
-same parser both notebooks use — so every rule below fails in CI exactly as it
-would fail at runtime:
+Module 02 calls `monitoring_utils.parse_quality_monitor_config` before creating
+or updating the monitor. It rejects invalid settings for these rules:
 
 - `prompt_fields` entries must be `{name, type}` mappings with identifier-safe
   unique names and a `type` in `{string, int, double, timestamp}`;
@@ -467,17 +511,19 @@ would fail at runtime:
   or `prompt_fields` entry); `granularities` must use supported window
   spellings; `baseline_sample_fraction` must be in `(0, 1]`;
   `baseline_table` is required.
-- **Warning (non-fatal)**: a `prompt_fields` name with no `- <name>: ` line in
-  `setup/02_stage_training_data.py`'s prompt template — the `txn_` column
-  would be 100% null on prompts built by this repo's setup stage. A warning
-  rather than an error because the template is example-specific.
-- catalog/schema live only in the repo-root `global.yaml` (the no-shadowing
-  check keeps stage YAMLs from re-introducing them); `sft_table` and the
-  payload-table name are stage-owned and agreement-checked by
-  `scripts/validate_config.py`.
+- Modules 03 and 04 call `parse_drift_detection_config`; drift columns must be
+  unique identifiers, lookback/detail limits must be positive, settling time
+  cannot be negative, and the p-value threshold must be in `(0, 1)`.
+
+Catalog/schema and the `sft_data_path` are owned by `monitor.yaml`. The payload
+table name must remain aligned with SFT preparation, training, and deployment
+configuration.
 
 ### Permissions
 
 The identity creating the monitor needs `USE CATALOG`/`USE SCHEMA`, `SELECT` on
-the unpacked and baseline tables, and `CREATE TABLE` on the output schema.
-Refreshes run on Databricks-managed serverless compute.
+the unpacked and baseline tables, and `CREATE TABLE` on the output schema. Alert
+setup additionally needs `CAN USE` on its SQL warehouse and access to any
+notification destinations. The scheduled retraining gate needs `SELECT` on the
+drift table and `CAN MANAGE RUN` on `retraining_job_id`. Refreshes run on
+Databricks-managed serverless compute.

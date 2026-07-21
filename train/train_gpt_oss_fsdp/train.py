@@ -15,22 +15,20 @@ Differences from ``train.py``:
   projections for gpt-oss models).
 - Full-sequence loss (response-only masking is an Unsloth feature of the DDP
   path).
-- No post-training generation evaluation: the final model is FSDP-sharded and
-  batched generation would require gathering it; set ``eval_sample_size: 0``.
+- Stepwise evaluation reports held-out loss, token accuracy, and teacher-forced
+  risk-classification metrics. Autoregressive fraud evaluation remains
+  unavailable because the model is FSDP-sharded during training and batched
+  generation would require gathering it.
 
-Everything else preserves ``train.py``'s contract, so the runner and
-registration notebooks drive both implementations interchangeably: the same
-shard-claiming data loading, the same MLflow logging (``trainer_*`` metrics,
-``adapter_output_dir`` param on the rank-0 run), and the same
-save-locally-then-copy-to-volume artifact handling.
+The project owns its runner, workload YAML, dependencies, and config helpers;
+it does not load the Qwen project's configuration.
 
 Runs two ways, like ``train.py``:
 
-- Imported by the runner notebook's ``@distributed`` cell (set
-  ``TRAINING_MODULE = "train_fsdp"`` in its configuration cell).
-- Executed directly by the AI Runtime CLI: ``air run --file train_fsdp.yaml``.
+- Imported by this project's runner notebook's ``@distributed`` cell.
+- Executed directly by the AI Runtime CLI: ``air run --file train.yaml``.
 
-Configuration comes from ``parameters.training_config`` of ``train_fsdp.yaml``
+Configuration comes from ``parameters.training_config`` of ``train.yaml``
 (via ``$HYPERPARAMETERS_PATH`` under an AIR run).
 """
 
@@ -40,17 +38,62 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("NCCL_DEBUG", "WARN")
 # Surface NCCL failures as exceptions instead of hangs.
 os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("HF_MLFLOW_LOG_ARTIFACTS", "FALSE")
+os.environ.setdefault("MLFLOW_FLATTEN_PARAMS", "TRUE")
 
 from contextlib import nullcontext
 from pathlib import Path
 
 import pandas as pd
 
-from training_utils import VOLUME_PATH_PREFIX, load_training_config, stage_model_locally
+try:
+    from .project_config import (
+        VOLUME_PATH_PREFIX,
+        claim_rank_shard_files,
+        load_project_config,
+        sample_eval_records,
+        stage_model_locally,
+    )
+except ImportError:
+    from project_config import (
+        VOLUME_PATH_PREFIX,
+        claim_rank_shard_files,
+        load_project_config,
+        sample_eval_records,
+        stage_model_locally,
+    )
 
-# Bind the shared configuration into module globals — the same names train.py
-# binds, sourced from train_fsdp.yaml instead of train.yaml.
-globals().update(load_training_config("train_fsdp.yaml"))
+try:
+    from .sft_conversion import prepare_sft_records
+    from .training_metrics import (
+        build_compute_metrics,
+        build_mlflow_metrics_callback,
+        preprocess_logits_for_metrics,
+    )
+except ImportError:
+    from sft_conversion import prepare_sft_records
+    from training_metrics import (
+        build_compute_metrics,
+        build_mlflow_metrics_callback,
+        preprocess_logits_for_metrics,
+    )
+
+
+def conversational_records(records_pdf: "pd.DataFrame") -> list[dict]:
+    """Convert normalized SFT rows to TRL's conversational format."""
+    return [
+        {
+            "messages": [
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": assistant_response},
+            ]
+        }
+        for prompt, assistant_response in zip(
+            records_pdf["prompt"], records_pdf["assistant_response"]
+        )
+    ]
+
+globals().update(load_project_config())
 
 LAUNCHED_VIA_AIR_CLI = bool(
     os.environ.get("HYPERPARAMETERS_PATH") or os.environ.get("CODE_SOURCE_PATH")
@@ -92,8 +135,8 @@ def load_fsdp_model_and_tokenizer():
     if model_source.startswith("/") and not Path(model_source).exists():
         raise FileNotFoundError(
             f"Local model path does not exist: {model_source}. If this is "
-            "model_volume_path from train_fsdp.yaml, populate the volume "
-            "first via setup/03_download_base_model_weights.py (add a "
+            "model_weights_path from train.yaml; populate the volume "
+            "first via setup/04_download_base_model_weights.py (add a "
             f"models entry for {MODEL_NAME})."
         )
     if model_source.startswith(VOLUME_PATH_PREFIX):
@@ -119,6 +162,28 @@ def load_fsdp_model_and_tokenizer():
         load_kwargs["quantization_config"] = Mxfp4Config(dequantize=True)
 
     model = AutoModelForCausalLM.from_pretrained(model_source, **load_kwargs)
+    return model, tokenizer
+
+
+def load_model_for_merge(adapter_output_dir: str):
+    """Load the PEFT adapter and base model for deployment-time merging."""
+    import torch
+    from peft import AutoPeftModelForCausalLM
+    from transformers import AutoTokenizer
+
+    adapter_source = adapter_output_dir
+    if adapter_source.startswith("/") and not Path(adapter_source).exists():
+        raise FileNotFoundError(f"Adapter output path does not exist: {adapter_source}")
+    if adapter_source.startswith(VOLUME_PATH_PREFIX):
+        adapter_source = stage_model_locally(adapter_source)
+
+    model = AutoPeftModelForCausalLM.from_pretrained(
+        adapter_source,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(adapter_source)
     return model, tokenizer
 
 
@@ -200,6 +265,7 @@ def train_fsdp(
     import tempfile
 
     import mlflow
+    import mlflow.transformers
     import torch
     from datasets import Dataset
     from peft import get_peft_model
@@ -207,30 +273,42 @@ def train_fsdp(
 
     mlflow.set_registry_uri("databricks-uc")
     is_main_process = rank == 0
-
-    if EVAL_SAMPLE_SIZE > 0 and is_main_process:
-        print(
-            "eval_sample_size > 0, but the FSDP module skips generation "
-            "evaluation (the final model is sharded across GPUs); set "
-            "eval_sample_size: 0 in train_fsdp.yaml to silence this note."
+    if is_main_process:
+        mlflow.set_experiment(EXPERIMENT_PATH)
+        mlflow.transformers.autolog(
+            log_models=False,
+            log_datasets=False,
+            exclusive=False,
         )
 
-    # TRL's conversational format: SFTTrainer applies the model's own chat
-    # template to a `messages` column. Full-sequence loss (response-only
-    # masking is an Unsloth feature of the DDP path).
-    dataset = Dataset.from_list(
-        [
-            {
-                "messages": [
-                    {"role": "user", "content": prompt},
-                    {"role": "assistant", "content": assistant_response},
-                ]
-            }
-            for prompt, assistant_response in zip(
-                examples_pdf["prompt"], examples_pdf["assistant_response"]
-            )
-        ]
+    examples_pdf = prepare_sft_records(
+        examples_pdf,
+        convert_sft=CONVERT_SFT,
+        suspicious_amount_threshold=SUSPICIOUS_AMOUNT_THRESHOLD,
     )
+    # SFTTrainer applies the model's chat template to the normalized records.
+    # This FSDP path trains with full-sequence loss.
+    dataset = Dataset.from_list(conversational_records(examples_pdf))
+
+    # Stepwise loss and teacher-forced classification metrics use the SFT eval
+    # split. Forward passes on the sharded model are collective-safe, unlike
+    # generation. Every rank draws the identical seeded sample; the Trainer's
+    # distributed sampler then splits it across ranks.
+    eval_dataset = None
+    if EVAL_SAMPLE_SIZE > 0:
+        eval_pdf = sample_eval_records(
+            EVAL_DATA_PATH,
+            EVAL_SAMPLE_SIZE,
+            SEED,
+            stratify_column="is_fraud",
+            ignore_partitions=IGNORE_PARTITIONS,
+        )
+        eval_pdf = prepare_sft_records(
+            eval_pdf,
+            convert_sft=CONVERT_SFT,
+            suspicious_amount_threshold=SUSPICIOUS_AMOUNT_THRESHOLD,
+        )
+        eval_dataset = Dataset.from_list(conversational_records(eval_pdf))
 
     model, tokenizer = load_fsdp_model_and_tokenizer()
     model = get_peft_model(model, build_peft_config())
@@ -259,17 +337,26 @@ def train_fsdp(
         learning_rate=LEARNING_RATE,
         warmup_steps=WARMUP_STEPS,
         max_steps=MAX_STEPS,
+        # TRL's chunked_nll path omits logits and returns scalar counters,
+        # which makes decoded classification metrics impossible.
+        loss_type="nll",
         lr_scheduler_type="cosine",
         bf16=True,
-        logging_steps=1,
+        logging_steps=LOGGING_STEPS,
         logging_strategy="steps",
+        eval_strategy="steps" if eval_dataset is not None else "no",
+        eval_steps=EVAL_STEPS,
+        do_eval=eval_dataset is not None,
+        prediction_loss_only=False,
+        eval_do_concat_batches=True,
         save_strategy="no",
-        report_to="none",
+        report_to=["mlflow"],
         run_name=run_name,
         seed=SEED,
         ddp_find_unused_parameters=False,
         dataloader_pin_memory=True,
         max_length=MAX_SEQ_LENGTH,
+        per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
         # Activation checkpointing below replaces gradient checkpointing.
         gradient_checkpointing=False,
         # ---- FSDP2 ----
@@ -288,7 +375,11 @@ def train_fsdp(
         model=model,
         args=training_args,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
+        compute_metrics=build_compute_metrics(tokenizer),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        callbacks=[build_mlflow_metrics_callback(eval_dataset is not None)],
     )
 
     run_context = (
@@ -310,9 +401,15 @@ def train_fsdp(
                     "world_size": world_size,
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "max_steps": MAX_STEPS,
+                    "logging_steps": LOGGING_STEPS,
+                    "eval_steps": EVAL_STEPS,
+                    "configured_eval_sample_size": EVAL_SAMPLE_SIZE,
                     "rank_0_training_record_count": len(examples_pdf),
-                    "source_table": SOURCE_TABLE,
-                    "sft_table": SFT_TABLE,
+                    "train_data_path": TRAIN_DATA_PATH,
+                    "eval_data_path": EVAL_DATA_PATH,
+                    "convert_sft": CONVERT_SFT,
+                    "ignore_partitions": IGNORE_PARTITIONS,
+                    "suspicious_amount_threshold": SUSPICIOUS_AMOUNT_THRESHOLD,
                     "lora_r": LORA_R,
                     "lora_alpha": LORA_ALPHA,
                     "lora_dropout": LORA_DROPOUT,
@@ -378,9 +475,6 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     shard-claiming here still governs which data each rank feeds it (FSDP is
     still data-parallel across ranks).
     """
-    import math
-    import random
-
     import torch
 
     if sample_fraction is None:
@@ -389,33 +483,16 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     rank, world_size, local_rank = get_distributed_context()
     torch.cuda.set_device(local_rank)
 
-    # Identical shard contract to train.py: claim the shard_id=N parquet
-    # directories where N % world_size == rank, with two-level sampling.
-    shard_dirs = sorted(Path(SFT_FILES_DIR).glob("shard_id=*"))
-    if not shard_dirs:
-        raise FileNotFoundError(
-            f"No SFT parquet shards found under {SFT_FILES_DIR}. "
-            "Run setup/02_stage_training_data.py first."
-        )
-
-    rank_shard_dirs = [
-        shard_dir
-        for shard_dir in shard_dirs
-        if int(shard_dir.name.split("=", 1)[1]) % world_size == rank
-    ]
-
-    within_shard_fraction = 1.0
-    if sample_fraction < 1.0 and rank_shard_dirs:
-        total_rank_dirs = len(rank_shard_dirs)
-        dirs_to_load = max(1, math.ceil(total_rank_dirs * sample_fraction))
-        rank_shard_dirs = sorted(random.Random(SEED).sample(rank_shard_dirs, dirs_to_load))
-        within_shard_fraction = min(1.0, sample_fraction * total_rank_dirs / dirs_to_load)
-
-    rank_files = [
-        str(parquet_file)
-        for shard_dir in rank_shard_dirs
-        for parquet_file in sorted(shard_dir.glob("*.parquet"))
-    ]
+    # Claim raw or pre-converted split shards where N % world_size == rank;
+    # conversion, when enabled, happens after loading and sampling.
+    rank_files, within_shard_fraction = claim_rank_shard_files(
+        TRAIN_DATA_PATH,
+        rank,
+        world_size,
+        sample_fraction,
+        SEED,
+        ignore_partitions=IGNORE_PARTITIONS,
+    )
 
     from datasets import load_dataset
 
@@ -425,13 +502,14 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
         examples_pdf = examples_pdf.sample(frac=within_shard_fraction, random_state=SEED)
 
     run_suffix = "-air-cli" if LAUNCHED_VIA_AIR_CLI else ""
+    data_mode = "full_dataset" if IGNORE_PARTITIONS else "rank_sharded"
 
     try:
         return train_fsdp(
             examples_pdf=examples_pdf,
             output_dir=f"{TRAINING_OUTPUT_DIR}/{world_size}gpu",
             run_name=f"{TRAINING_RUN_NAME}-fsdp-{world_size}gpu{run_suffix}",
-            training_mode=f"fsdp_{world_size}_gpu_rank_sharded_sample",
+            training_mode=f"fsdp_{world_size}_gpu_{data_mode}_sample",
             num_gpus=world_size,
             save_artifacts=True,
             rank=rank,

@@ -7,10 +7,8 @@ This module owns the Unsloth LoRA training implementation and runs two ways:
 - Executed directly as ``python train.py`` by the AI Runtime CLI
   (``air run --file train.yaml``), where each GPU worker runs this file.
 
-Configuration comes from the ``parameters.training_config`` section of
-``train.yaml`` (the same file that defines the AI Runtime CLI workload;
-under an AIR run it arrives via ``$HYPERPARAMETERS_PATH``) and shared
-helpers from ``training_utils.py``, both in the same directory as this file.
+Configuration and helper code live beside this file. Under an AIR run the
+submitted configuration arrives through ``$HYPERPARAMETERS_PATH``.
 """
 
 import os
@@ -18,6 +16,8 @@ import os
 # These must be set before unsloth is imported.
 os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ.setdefault("HF_MLFLOW_LOG_ARTIFACTS", "FALSE")
+os.environ.setdefault("MLFLOW_FLATTEN_PARAMS", "TRUE")
 
 from contextlib import nullcontext
 
@@ -29,17 +29,44 @@ from trl import SFTTrainer, SFTConfig
 
 from pathlib import Path
 
-# The helpers module is deliberately NOT named `utils`: the Databricks AI base
-# environment's nvidia_cutlass_dsl package registers its own top-level `utils`
-# module once the torch/CUDA stack loads, which shadows any local utils.py.
-from training_utils import VOLUME_PATH_PREFIX, load_training_config, stage_model_locally
+try:
+    from .project_config import (
+        VOLUME_PATH_PREFIX,
+        claim_rank_shard_files,
+        load_project_config,
+        sample_eval_records,
+        stage_model_locally,
+    )
+except ImportError:
+    from project_config import (
+        VOLUME_PATH_PREFIX,
+        claim_rank_shard_files,
+        load_project_config,
+        sample_eval_records,
+        stage_model_locally,
+    )
 
-# Bind the shared configuration into module globals: typed training_config
-# values (MODEL_NAME, MAX_SEQ_LENGTH, hyperparameters, SEED, ...), derived
-# names (SOURCE_TABLE, SFT_TABLE, TRAINING_OUTPUT_DIR, TRAINING_RUN_NAME), and
-# quoted SQL identifiers (sft_table_q) — the same names the runner notebook
-# binds into its session.
-globals().update(load_training_config())
+try:
+    from .sft_conversion import prepare_sft_records
+    from .training_metrics import (
+        build_compute_metrics,
+        build_mlflow_metrics_callback,
+        preprocess_logits_for_metrics,
+    )
+except ImportError:
+    from sft_conversion import prepare_sft_records
+    from training_metrics import (
+        build_compute_metrics,
+        build_mlflow_metrics_callback,
+        preprocess_logits_for_metrics,
+    )
+
+globals().update(load_project_config())
+if RESPONSE_INSTRUCTION_PART is None or RESPONSE_PART is None:
+    raise ValueError(
+        "train.yaml must define response_instruction_part and response_part "
+        "for response-only loss masking"
+    )
 
 # The AI Runtime CLI launch wrapper exports these before running the script;
 # neither is present under the notebook's @distributed path. Used to label
@@ -53,15 +80,15 @@ LAUNCHER = "air-cli" if LAUNCHED_VIA_AIR_CLI else "notebook"
 
 def load_unsloth_model(model_name: str, device_map=None):
     # model_name is either a Hugging Face repo id or a local directory — the
-    # UC volume snapshot of the base weights (model_volume_path in train.yaml)
+    # UC volume snapshot configured by model_weights_path in train.yaml.
     # or a trained adapter dir. Fail fast on a missing local path so the error
     # isn't unsloth/transformers treating it as a repo id and dying with an
     # HF 401/404.
     if model_name.startswith("/") and not Path(model_name).exists():
         raise FileNotFoundError(
             f"Local model path does not exist: {model_name}. If this is "
-            "model_volume_path from train.yaml, populate the volume first by "
-            "running setup/03_download_base_model_weights.py (or `hf download "
+            "model_weights_path from train.yaml; populate the volume first by "
+            "running setup/04_download_base_model_weights.py (or `hf download "
             f"{MODEL_NAME} --local-dir {model_name}`)."
         )
     if model_name.startswith(VOLUME_PATH_PREFIX):
@@ -80,6 +107,11 @@ def load_unsloth_model(model_name: str, device_map=None):
     if device_map is not None:
         load_kwargs["device_map"] = device_map
     return FastLanguageModel.from_pretrained(**load_kwargs)
+
+
+def load_model_for_merge(adapter_output_dir: str):
+    """Load this project's adapter for the deployment merge notebook."""
+    return load_unsloth_model(adapter_output_dir)
 
 
 def _restore_saved_adapter_base_path(output_dir: str) -> None:
@@ -160,7 +192,7 @@ def binary_classification_metrics(
 
 
 def evaluate_fraud_classification(model, tokenizer, eval_pdf, batch_size: int = 16) -> dict:
-    """Score the fine-tuned model as a binary fraud classifier on held-out rows.
+    """Score the fine-tuned model as a binary fraud classifier on eval-split rows.
 
     Generates a completion for each held-out prompt, parses the ``risk``
     field, and treats ``likely_fraud`` as the positive prediction against the
@@ -230,50 +262,56 @@ def train_qwen3_unsloth(
     world_size: int = 1,
 ) -> str | None:
     import mlflow
+    import mlflow.transformers
     import torch
     from datasets import Dataset
 
     mlflow.set_registry_uri("databricks-uc")
     is_main_process = rank == 0
     save_artifacts = save_artifacts and is_main_process
+    if is_main_process:
+        mlflow.set_experiment(EXPERIMENT_PATH)
+        mlflow.transformers.autolog(
+            log_models=False,
+            log_datasets=False,
+            exclusive=False,
+        )
 
-    # Hold out rows on rank 0 for post-training fraud-classification metrics
-    # (accuracy/precision/recall/F1 against is_fraud). Stratified: at the
-    # natural ~1% fraud rate a small random sample would carry almost no
-    # positives, leaving recall/precision meaningless. Held-out rows are
-    # dropped from this rank's training data, so the metrics are honest.
-    eval_pdf = None
-    if EVAL_SAMPLE_SIZE > 0 and is_main_process:
-        if "is_fraud" not in examples_pdf.columns:
-            print(
-                "eval_sample_size is set but the SFT records carry no is_fraud "
-                "column — skipping fraud-classification evaluation."
-            )
-        elif len(examples_pdf) > EVAL_SAMPLE_SIZE:
-            fraud_pdf = examples_pdf[examples_pdf["is_fraud"] == 1]
-            non_fraud_pdf = examples_pdf[examples_pdf["is_fraud"] != 1]
-            fraud_count = min(EVAL_SAMPLE_SIZE // 2, len(fraud_pdf))
-            non_fraud_count = min(EVAL_SAMPLE_SIZE - fraud_count, len(non_fraud_pdf))
-            eval_pdf = pd.concat(
-                [
-                    fraud_pdf.sample(n=fraud_count, random_state=SEED),
-                    non_fraud_pdf.sample(n=non_fraud_count, random_state=SEED),
-                ]
-            )
-            examples_pdf = examples_pdf.drop(eval_pdf.index)
-        else:
-            print(
-                f"Rank slice has only {len(examples_pdf)} rows — not holding out "
-                f"{EVAL_SAMPLE_SIZE} for evaluation; skipping."
-            )
-
+    examples_pdf = prepare_sft_records(
+        examples_pdf,
+        convert_sft=CONVERT_SFT,
+        suspicious_amount_threshold=SUSPICIOUS_AMOUNT_THRESHOLD,
+    )
     dataset = Dataset.from_pandas(
         examples_pdf[["prompt", "assistant_response"]],
         preserve_index=False,
     )
 
+    eval_pdf = None
+    eval_dataset = None
+    if EVAL_SAMPLE_SIZE > 0:
+        eval_pdf = sample_eval_records(
+            EVAL_DATA_PATH,
+            EVAL_SAMPLE_SIZE,
+            SEED,
+            stratify_column="is_fraud",
+            ignore_partitions=IGNORE_PARTITIONS,
+        )
+        eval_pdf = prepare_sft_records(
+            eval_pdf,
+            convert_sft=CONVERT_SFT,
+            suspicious_amount_threshold=SUSPICIOUS_AMOUNT_THRESHOLD,
+        )
+        eval_dataset = Dataset.from_pandas(
+            eval_pdf[["prompt", "assistant_response"]],
+            preserve_index=False,
+        )
+
     model, tokenizer = load_unsloth_model(MODEL_LOAD_PATH, device_map=device_map)
 
+    # Raw records are converted above when configured; pre-converted records
+    # pass through unchanged. The loaded model's own chat template is always
+    # applied here so model-specific formatting remains local to the trainer.
     def formatting_prompts_func(examples):
         texts = [
             render_chat_messages(
@@ -295,6 +333,12 @@ def train_qwen3_unsloth(
         batched=True,
         remove_columns=dataset.column_names,
     )
+    if eval_dataset is not None:
+        eval_dataset = eval_dataset.map(
+            formatting_prompts_func,
+            batched=True,
+            remove_columns=eval_dataset.column_names,
+        )
 
     peft_kwargs = {
         "r": LORA_R,
@@ -337,18 +381,28 @@ def train_qwen3_unsloth(
         gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
         warmup_steps=WARMUP_STEPS,
         max_steps=MAX_STEPS,
+        # TRL's chunked_nll path omits logits and returns scalar counters,
+        # which makes decoded classification metrics impossible.
+        loss_type="nll",
         learning_rate=LEARNING_RATE,
         fp16=not is_bfloat16_supported(),
         bf16=is_bfloat16_supported(),
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=1,
+        logging_steps=LOGGING_STEPS,
+        logging_strategy="steps",
+        eval_strategy="steps" if eval_dataset is not None else "no",
+        eval_steps=EVAL_STEPS,
+        do_eval=eval_dataset is not None,
+        prediction_loss_only=False,
+        eval_do_concat_batches=True,
+        per_device_eval_batch_size=PER_DEVICE_EVAL_BATCH_SIZE,
         optim="adamw_8bit",
         weight_decay=0.01,
         lr_scheduler_type="linear",
         seed=SEED,
         output_dir=local_output_dir,
-        report_to="none",
+        report_to=["mlflow"],
         run_name=run_name,
         save_strategy="steps",
         save_steps=max(5, MAX_STEPS // 2),
@@ -362,8 +416,12 @@ def train_qwen3_unsloth(
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
         args=training_args,
+        compute_metrics=build_compute_metrics(tokenizer),
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+        callbacks=[build_mlflow_metrics_callback(eval_dataset is not None)],
     )
 
     try:
@@ -405,9 +463,15 @@ def train_qwen3_unsloth(
                     "world_size": world_size,
                     "max_seq_length": MAX_SEQ_LENGTH,
                     "max_steps": MAX_STEPS,
+                    "logging_steps": LOGGING_STEPS,
+                    "eval_steps": EVAL_STEPS,
+                    "configured_eval_sample_size": EVAL_SAMPLE_SIZE,
                     "rank_0_training_record_count": len(examples_pdf),
-                    "source_table": SOURCE_TABLE,
-                    "sft_table": SFT_TABLE,
+                    "train_data_path": TRAIN_DATA_PATH,
+                    "eval_data_path": EVAL_DATA_PATH,
+                    "convert_sft": CONVERT_SFT,
+                    "ignore_partitions": IGNORE_PARTITIONS,
+                    "suspicious_amount_threshold": SUSPICIOUS_AMOUNT_THRESHOLD,
                     "lora_r": LORA_R,
                     "lora_alpha": LORA_ALPHA,
                     "lora_dropout": LORA_DROPOUT,
@@ -438,9 +502,13 @@ def train_qwen3_unsloth(
                     shutil.copy2(artifact_file, volume_dir / artifact_file.name)
             mlflow.log_param("adapter_output_dir", output_dir)
 
-        # Held-out fraud-classification quality of the fine-tuned model. A
-        # failed evaluation logs eval_error but keeps the run FINISHED — a
-        # completed training (and its adapter) should stay deployable.
+        # Fraud-classification quality of the fine-tuned model on the staged
+        # eval split (split=eval, never trained on by any rank). Stratified
+        # half fraud / half non-fraud: at the natural ~1% fraud rate a small
+        # random sample would carry almost no positives, leaving
+        # recall/precision meaningless. A failed evaluation logs eval_error
+        # but keeps the run FINISHED — a completed training (and its adapter)
+        # should stay deployable.
         if eval_pdf is not None:
             try:
                 fraud_metrics = evaluate_fraud_classification(model, tokenizer, eval_pdf)
@@ -489,7 +557,7 @@ def get_distributed_context() -> tuple[int, int, int]:
 
 
 def run_rank_training(sample_fraction: float | None = None) -> str | None:
-    """Train this rank's shard slice of the exported SFT parquet files.
+    """Train this rank's shard slice of the staged train split.
 
     ``sample_fraction`` overrides the ``training_sample_fraction`` value from
     the config — the runner notebook passes it from its training cell so the
@@ -507,48 +575,20 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
     rank, world_size, local_rank = get_distributed_context()
     torch.cuda.set_device(local_rank)
 
-    import math
-    import random
-
-    # Read the SFT records as parquet shard files from the UC volume instead
-    # of querying Delta through Spark on the GPU workers, per the AIR
-    # data-loading guidance for large Delta tables:
+    # Read raw or pre-converted records as parquet shard files from the UC
+    # volume instead of querying Delta
+    # through Spark on the GPU workers, per the AIR data-loading guidance:
     # https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
-    # Ingestion writes one shard_id=N directory per stable hash shard; each
-    # rank claims the shards where N % world_size == rank, preserving the
-    # original Delta rank-sharding contract.
-    shard_dirs = sorted(Path(SFT_FILES_DIR).glob("shard_id=*"))
-    if not shard_dirs:
-        raise FileNotFoundError(
-            f"No SFT parquet shards found under {SFT_FILES_DIR}. "
-            "Run setup/02_stage_training_data.py first (after "
-            "setup/01_load_dataset.py) to build and export the SFT records."
-        )
-
-    rank_shard_dirs = [
-        shard_dir
-        for shard_dir in shard_dirs
-        if int(shard_dir.name.split("=", 1)[1]) % world_size == rank
-    ]
-
-    # Two-level sampling. shard_id is a uniform hash, so loading a subset of
-    # shard directories is statistically equivalent to row sampling — and it
-    # keeps the HF datasets Arrow conversion ("Generating train split")
-    # proportional to sample_fraction instead of always materializing the
-    # rank's full slice. Row-level sampling within the loaded shards then
-    # lands on the exact requested fraction.
-    within_shard_fraction = 1.0
-    if sample_fraction < 1.0 and rank_shard_dirs:
-        total_rank_dirs = len(rank_shard_dirs)
-        dirs_to_load = max(1, math.ceil(total_rank_dirs * sample_fraction))
-        rank_shard_dirs = sorted(random.Random(SEED).sample(rank_shard_dirs, dirs_to_load))
-        within_shard_fraction = min(1.0, sample_fraction * total_rank_dirs / dirs_to_load)
-
-    rank_files = [
-        str(parquet_file)
-        for shard_dir in rank_shard_dirs
-        for parquet_file in sorted(shard_dir.glob("*.parquet"))
-    ]
+    # Training reads only the train split; the eval split feeds the
+    # post-training fraud-classification evaluation on rank 0.
+    rank_files, within_shard_fraction = claim_rank_shard_files(
+        TRAIN_DATA_PATH,
+        rank,
+        world_size,
+        sample_fraction,
+        SEED,
+        ignore_partitions=IGNORE_PARTITIONS,
+    )
 
     dataset = load_dataset("parquet", data_files=rank_files, split="train")
     examples_pdf = dataset.to_pandas()
@@ -556,13 +596,14 @@ def run_rank_training(sample_fraction: float | None = None) -> str | None:
         examples_pdf = examples_pdf.sample(frac=within_shard_fraction, random_state=SEED)
 
     run_suffix = "-air-cli" if LAUNCHED_VIA_AIR_CLI else ""
+    data_mode = "full_dataset" if IGNORE_PARTITIONS else "rank_sharded"
 
     try:
         return train_qwen3_unsloth(
             examples_pdf=examples_pdf,
             output_dir=f"{TRAINING_OUTPUT_DIR}/{world_size}gpu",
             run_name=f"{TRAINING_RUN_NAME}-{world_size}gpu{run_suffix}",
-            training_mode=f"{world_size}_gpu_rank_sharded_sample",
+            training_mode=f"{world_size}_gpu_{data_mode}_sample",
             num_gpus=world_size,
             device_map={"": local_rank},
             save_artifacts=rank == 0,

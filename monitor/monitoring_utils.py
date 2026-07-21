@@ -1,20 +1,20 @@
 """Shared helpers for the monitoring stage.
 
 This is a plain Python module (NOT a Databricks notebook), like
-``train/training_utils.py``: the monitor notebooks insert this directory into
+``monitor/utils.py``: the monitor notebooks insert this directory into
 ``sys.path`` and import it — never ``%run`` it, and never add the notebook
 header (notebook-formatted files cannot be imported in the workspace).
 
-Both monitor notebooks parse model traffic through these helpers:
+The monitor notebooks share parsing and drift-query helpers from this module:
 ``01_unpack_inference_table.py`` applies them to serving requests and
 ``02_create_quality_monitor.py`` applies them to the SFT training records
 when building the monitor's baseline table — one implementation, so the two
 tables are guaranteed to extract identical columns, the property baseline
-drift comparisons depend on.
+drift comparisons depend on. Modules 03 and 04 share one threshold query so
+alerting and retraining make the same decision.
 
-``scripts/validate_config.py`` imports the ``parse_*`` functions to validate
-``monitor.yaml`` in CI without a Spark session, which is why the pyspark
-imports stay inside the DataFrame helpers.
+Pyspark imports stay inside the DataFrame helpers so the configuration parsers
+remain importable without a Spark session.
 """
 
 from __future__ import annotations
@@ -107,9 +107,8 @@ def parse_quality_monitor_config(config: dict) -> dict:
     """Validate and normalize the monitor.yaml keys module 02 consumes.
 
     Returns a dict of normalized values; slicing fields are resolved to the
-    extracted column names they refer to. Exercised by
-    ``scripts/validate_config.py`` so misconfigurations fail before any
-    workspace time is spent.
+    extracted column names they refer to. Module 02 calls this before creating
+    or updating the monitor.
     """
     response_json_fields = parse_response_json_fields(config)
     prompt_fields = parse_prompt_fields(config)
@@ -195,6 +194,107 @@ def parse_quality_monitor_config(config: dict) -> dict:
         "monitor_output_schema": str(config.get("monitor_output_schema") or "").strip(),
         "label_field": str(config.get("label_field") or "").strip(),
     }
+
+
+def parse_drift_detection_config(config: dict) -> dict:
+    """Normalize the drift thresholds shared by alerting and retraining."""
+    raw_columns = config.get("drift_columns") or []
+    if not isinstance(raw_columns, list) or not raw_columns:
+        raise ValueError("drift_columns must be a non-empty list")
+
+    columns: list[str] = []
+    for raw_column in raw_columns:
+        column = str(raw_column).strip()
+        if not _FIELD_NAME_PATTERN.fullmatch(column):
+            raise ValueError(f"Invalid drift column name: {column!r}")
+        if column in columns:
+            raise ValueError(f"Duplicate drift column: {column!r}")
+        columns.append(column)
+
+    try:
+        lookback_days = int(config.get("drift_lookback_days", 2))
+        settling_hours = int(config.get("drift_settling_hours", 1))
+        details_limit = int(config.get("drift_breach_details_limit", 100))
+        js_threshold = float(config.get("drift_js_threshold", 0.15))
+        p_value_threshold = float(config.get("drift_p_value_threshold", 0.01))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Drift thresholds and window settings must be numeric") from exc
+
+    if lookback_days <= 0:
+        raise ValueError("drift_lookback_days must be greater than zero")
+    if settling_hours < 0:
+        raise ValueError("drift_settling_hours cannot be negative")
+    if details_limit <= 0:
+        raise ValueError("drift_breach_details_limit must be greater than zero")
+    if js_threshold <= 0:
+        raise ValueError("drift_js_threshold must be greater than zero")
+    if not 0 < p_value_threshold < 1:
+        raise ValueError("drift_p_value_threshold must be between zero and one")
+
+    return {
+        "columns": columns,
+        "lookback_days": lookback_days,
+        "settling_hours": settling_hours,
+        "details_limit": details_limit,
+        "js_threshold": js_threshold,
+        "p_value_threshold": p_value_threshold,
+    }
+
+
+def quote_qualified_identifier(identifier: str) -> str:
+    """Quote every component of a catalog-qualified SQL identifier."""
+    parts = [part.strip() for part in identifier.split(".")]
+    if not parts or any(not part for part in parts):
+        raise ValueError(f"Invalid qualified identifier: {identifier!r}")
+    return ".".join(f"`{part.replace('`', '``')}`" for part in parts)
+
+
+def _sql_string(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _drift_breach_where(settings: dict) -> str:
+    columns_sql = ", ".join(_sql_string(column) for column in settings["columns"])
+    return f"""
+drift_type = 'BASELINE'
+AND slice_key IS NULL
+AND column_name IN ({columns_sql})
+AND window.start >= current_timestamp() - INTERVAL {settings['lookback_days']} DAYS
+AND window.end <= current_timestamp() - INTERVAL {settings['settling_hours']} HOURS
+AND (
+  COALESCE(js_distance, 0.0) > {settings['js_threshold']}
+  OR COALESCE(chi_squared_test.pvalue, 1.0) < {settings['p_value_threshold']}
+  OR COALESCE(ks_test.pvalue, 1.0) < {settings['p_value_threshold']}
+)
+""".strip()
+
+
+def build_drift_breach_summary_query(drift_table: str, settings: dict) -> str:
+    """Return one row used by both Alerts V2 and the retraining gate."""
+    return f"""
+SELECT
+  COUNT(*) AS breach_count,
+  MAX(window.end) AS latest_window_end
+FROM {quote_qualified_identifier(drift_table)}
+WHERE {_drift_breach_where(settings)}
+""".strip()
+
+
+def build_drift_breach_details_query(drift_table: str, settings: dict) -> str:
+    """Return recent metric rows that breached the configured thresholds."""
+    return f"""
+SELECT
+  window.start AS window_start,
+  window.end AS window_end,
+  column_name,
+  js_distance,
+  chi_squared_test.pvalue AS chi_squared_pvalue,
+  ks_test.pvalue AS ks_pvalue
+FROM {quote_qualified_identifier(drift_table)}
+WHERE {_drift_breach_where(settings)}
+ORDER BY window_end DESC, column_name
+LIMIT {settings['details_limit']}
+""".strip()
 
 
 def prompt_field_pattern(name: str) -> str:

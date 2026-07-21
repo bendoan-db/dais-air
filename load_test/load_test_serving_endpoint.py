@@ -25,7 +25,7 @@
 # MAGIC
 # MAGIC The notebook uses `aiohttp` for asynchronous HTTP requests. The Databricks SDK is not used for the hot path because the load test needs connection pooling, high concurrency, and precise request pacing.
 # MAGIC
-# MAGIC This stage deliberately does **not** install `train/requirements.txt`: the consolidated file carries the GPU training and vLLM serving stack (Unsloth, torch, vllm), none of which belongs on a CPU load-generator cluster. Only the lightweight HTTP/data packages above are needed.
+# MAGIC This stage deliberately does **not** install a training project's `requirements.txt`: those files carry GPU training and vLLM serving packages (Unsloth or FSDP dependencies, torch, vllm), none of which belongs on a CPU load-generator cluster. Only the lightweight HTTP/data packages above are needed.
 
 # COMMAND ----------
 
@@ -39,18 +39,17 @@
 
 # COMMAND ----------
 
-# training_utils is a plain Python module in train/ (not a notebook), so
-# it is imported rather than %run. The notebook's working directory is the
-# notebook's folder on serverless, so ../train resolves to the module's
-# directory.
+# utils.py is a plain load-test module, not a notebook. The notebook's working
+# directory is its folder on serverless, so add that directory explicitly.
 import sys
 from pathlib import Path
 
-TRAIN_MODULE_DIR = str((Path.cwd().parent / "train").resolve())
-if TRAIN_MODULE_DIR not in sys.path:
-    sys.path.insert(0, TRAIN_MODULE_DIR)
+LOAD_TEST_MODULE_DIR = str(Path.cwd().resolve())
+if LOAD_TEST_MODULE_DIR not in sys.path:
+    sys.path.insert(0, LOAD_TEST_MODULE_DIR)
 
-from training_utils import (
+from utils import (
+    FRAUD_RECORD_COLUMNS,
     config_bool,
     config_float,
     config_int,
@@ -58,8 +57,8 @@ from training_utils import (
     ensure_uc_object,
     full_name,
     get_spark_session,
-    load_global_config,
     load_yaml_config,
+    render_fraud_prompt,
 )
 
 # COMMAND ----------
@@ -81,12 +80,9 @@ from pyspark.sql import functions as F
 
 config_path, load_test_config = load_yaml_config("serving_load_test.yaml", base_dir=Path.cwd())
 
-# Stage keys come from serving_load_test.yaml; catalog/schema come from the
-# repo-root global.yaml.
-_, global_config = load_global_config()
-UC_CATALOG = config_str(global_config, "catalog")
-UC_SCHEMA = config_str(global_config, "schema")
-SFT_TABLE_NAME = config_str(load_test_config, "sft_table")
+UC_CATALOG = config_str(load_test_config, "catalog")
+UC_SCHEMA = config_str(load_test_config, "schema")
+RAW_DATA_PATH = config_str(load_test_config, "raw_data_path")
 ENDPOINT_NAME = config_str(load_test_config, "endpoint_name")
 RESULTS_TABLE_NAME = config_str(load_test_config, "results_table")
 
@@ -115,7 +111,6 @@ if WORKER_CONCURRENCY <= 0:
     raise ValueError("worker_concurrency must be greater than zero.")
 
 schema_q = full_name(UC_CATALOG, UC_SCHEMA)
-sft_table_q = full_name(UC_CATALOG, UC_SCHEMA, SFT_TABLE_NAME)
 results_table_q = full_name(UC_CATALOG, UC_SCHEMA, RESULTS_TABLE_NAME)
 
 spark = get_spark_session()
@@ -131,7 +126,7 @@ print(
 
 config_summary = {
     "config_path": str(config_path),
-    "sft_table": f"{UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}",
+    "raw_data_path": RAW_DATA_PATH,
     "endpoint_name": ENDPOINT_NAME,
     "results_table": f"{UC_CATALOG}.{UC_SCHEMA}.{RESULTS_TABLE_NAME}",
     "target_qps": TARGET_QPS,
@@ -231,25 +226,32 @@ if "READY" not in ready_state.upper():
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Build request payloads from SFT prompts
+# MAGIC ## Build request payloads from staged transaction records
 # MAGIC
-# MAGIC The load test uses prompts from the prepared SFT Delta table so the request shape matches the prompts used during fine-tuning.
+# MAGIC The staged Parquet export holds raw transaction records (prompt text is rendered at training time, not stored), so the load test samples eval-split rows and renders each prompt with the same template training uses (`utils.render_fraud_prompt`; keep it synchronized with `train/prep_sft.py` and each trainer) — the request shape matches fine-tuning exactly, while the traffic itself is data the model never trained on.
 # MAGIC Each request sends a chat payload with one user message, plus deterministic generation settings.
 # MAGIC
 # MAGIC With `disable_thinking: true` (the default), every payload also carries `chat_template_kwargs: {"enable_thinking": false}` — vLLM forwards it into the model's chat template, keeping hybrid reasoning models (base Qwen3) from spending the entire `max_tokens` budget on a reasoning block before the JSON answer. This mirrors training, which renders its chat templates with `enable_thinking=False`.
 
 # COMMAND ----------
 
-prompt_pdf = (
-    spark.table(sft_table_q)
-    .select("prompt")
+record_pdf = (
+    spark.read.parquet(RAW_DATA_PATH)
+    .where(F.col("split") == "eval")
+    .select(*FRAUD_RECORD_COLUMNS)
     .sample(withReplacement=False, fraction=PROMPT_SAMPLE_FRACTION, seed=3407)
     .limit(PROMPT_SAMPLE_SIZE)
     .toPandas()
 )
 
-if prompt_pdf.empty:
-    raise ValueError(f"No prompt records were loaded from {UC_CATALOG}.{UC_SCHEMA}.{SFT_TABLE_NAME}.")
+if record_pdf.empty:
+    raise ValueError(
+        f"No eval-split records were loaded from {RAW_DATA_PATH}. "
+        "Run setup/02_stage_training_data.py to (re)stage the raw Parquet "
+        "export with train/eval splits."
+    )
+
+prompts = [render_fraud_prompt(record) for record in record_pdf.to_dict("records")]
 
 def build_chat_payload(prompt: str) -> dict:
     payload = {
@@ -272,7 +274,7 @@ def build_chat_payload(prompt: str) -> dict:
     return payload
 
 
-payload_templates = [build_chat_payload(prompt) for prompt in prompt_pdf["prompt"].tolist()]
+payload_templates = [build_chat_payload(prompt) for prompt in prompts]
 
 display(
     pd.DataFrame(
@@ -375,7 +377,7 @@ if (smoke_test_pdf["status_code"] >= 400).any():
 # MAGIC The load test divides `target_qps` across `load_generator_workers` Spark tasks.
 # MAGIC Each task uses asynchronous HTTP requests with bounded concurrency and attempts to pace requests at its assigned share of the target rate.
 # MAGIC
-# MAGIC The achieved QPS may be lower than the target if the load-generator compute, network path, endpoint queue, or provisioned endpoint replicas become saturated.
+# MAGIC The achieved QPS may be lower than the target if the load-generator compute, network path, endpoint queue, or fixed endpoint replicas become saturated.
 # MAGIC The summary metrics below make that gap visible.
 # MAGIC
 # MAGIC **Inference logging captures this traffic too**: deployment always enables AI Gateway inference tables, so every load-test request/response lands in the endpoint's `<inference_table_prefix>_payload` table (delivery within ~1 hour) and flows into the monitoring stage's unpacked table on its next run. Large tests inflate both tables — and at sustained very high throughput (roughly >70 MB/s of payloads), log delivery may degrade; consider that when sizing `target_qps` or interpreting monitor metrics for load-test windows.
@@ -607,7 +609,7 @@ display(spark.table(results_table_q))
 # MAGIC If the endpoint does not sustain the configured target, use the result tables to separate load-generator limits from serving limits:
 # MAGIC
 # MAGIC - High client-side failures or exceptions usually indicate the load generator needs more workers, more concurrency, or a longer timeout.
-# MAGIC - HTTP `429`, `503`, or long tail latency usually indicates endpoint queueing or insufficient provisioned serving capacity — raise `serving_provisioned_concurrency` in `train/train.yaml`'s `deploy_config` and rerun the deployment notebook (capacity is fixed during the custom LLM serving beta; requests beyond it are rejected with instant 429s).
+# MAGIC - HTTP `429`, `503`, or long tail latency usually indicates endpoint queueing or insufficient serving capacity — increase `serving_workload_size` (`Small` → `Medium` → `Large`) or select a larger supported `serving_workload_type` in `train/train_qwen_unsloth/train.yaml`, then rerun the deployment notebook. Capacity is fixed during the custom LLM serving beta.
 # MAGIC - Low achieved QPS with low endpoint latency usually indicates the notebook load generator is saturated before the endpoint.
 # MAGIC
 # MAGIC For production capacity testing, run this notebook against each endpoint size you plan to evaluate and compare the persisted summaries in the results table.

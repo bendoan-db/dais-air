@@ -1,9 +1,10 @@
-# Stage-specific configuration for the monitoring stage. catalog/schema
-# come from the repo-root global.yaml
-# (training_utils.load_global_config()). inference_table must equal
-# train/train.yaml deploy_config's inference_table_prefix + '_payload' (the
-# table the endpoint's AI Gateway inference logging writes), and sft_table
-# must match setup/train; scripts/validate_config.py checks both.
+# Stage-specific configuration for the monitoring stage.
+catalog: catalog_sandbox_5nwjwb
+schema: air_hackathon_v2
+
+# inference_table must equal
+# train/train_qwen_unsloth/train.yaml deploy_config's inference_table_prefix + '_payload' (the
+# table the endpoint's AI Gateway inference logging writes).
 
 # ---- 01_unpack_inference_table.py ----
 # Raw payload table written by the endpoint (AI Gateway inference table).
@@ -11,7 +12,7 @@ inference_table: qwen3_4b_instruct_finetuned_v2_payload
 # Delta table receiving one unpacked row per request. Created on first run
 # with change data feed enabled (required for efficient incremental monitor
 # refreshes) and partitioned by request_date.
-unpacked_table: qwen3_4b_instruct_finetuned_requests
+unpacked_table: qwen3_4b_instruct_finetuned_v2_requests
 # UC volume holding the streaming checkpoint that makes unpacking
 # incremental: each run processes only payload rows it has not seen yet.
 # Deleting the checkpoint directory reprocesses the full payload table.
@@ -71,15 +72,16 @@ slicing_fields:
 # daily unpack-and-refresh job.
 granularities:
   - 1 day
-# SFT table the baseline samples from (must match setup/train; validated).
-sft_table: fraud_sft_dataset
+# Prepared SFT Parquet used for the training baseline. Keep this aligned with
+# train/prep_sft.py's OUTPUT_SFT_PARQUET_PATH and trainer input paths.
+sft_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset
 # Table (in the same catalog.schema) receiving the training-set baseline —
 # the SFT records parsed through the same field extraction as serving
 # traffic. Overwritten on every module-02 run; rerun after a retrain.
-baseline_table: qwen3_4b_instruct_finetuned_requests_baseline
+baseline_table: qwen3_4b_instruct_finetuned_v2_requests_baseline
 # Fraction of the SFT table sampled into the baseline (seeded, so reruns are
 # stable). Distribution baselines need far fewer rows than training does;
-# raise toward 1.0 for small SFT tables.
+# raise toward 1.0 for small SFT datasets.
 baseline_sample_fraction: 0.05
 # Where the monitor's metrics tables land; empty = the same catalog.schema
 # as the monitored table.
@@ -89,3 +91,45 @@ monitor_output_schema: ''
 # classification quality metrics (precision/recall/confusion) for windows
 # where labels are present. Empty = drift-only monitoring.
 label_field: ''
+
+# ---- 03_create_drift_sql_alert.py and 04_trigger_retraining.py ----
+# Baseline-drift signals that can alert and request retraining. JS distance
+# applies to categorical columns; chi-square/KS p-values cover categorical and
+# numeric columns respectively. Null-inapplicable metrics are ignored.
+drift_columns:
+  - txn_amount_usd
+  - txn_use_chip
+  - txn_merchant_state
+  - txn_merchant_category_code
+  - txn_errors
+  - response_risk
+drift_lookback_days: 2
+# Wait for inference-table delivery and monitor refreshes to settle before
+# evaluating a completed window.
+drift_settling_hours: 1
+drift_js_threshold: 0.15
+drift_p_value_threshold: 0.01
+drift_breach_details_limit: 100
+
+# ---- 03_create_drift_sql_alert.py ----
+# Required to create the alert. Use the ID of a running Pro or Serverless SQL
+# warehouse on which the alert owner has CAN USE.
+drift_alert_warehouse_id: ''
+drift_alert_display_name: qwen3_4b_instruct_finetuned_v2 baseline drift
+drift_alert_quartz_cron: '0 0 6 * * ?'
+drift_alert_timezone: UTC
+drift_alert_notify_on_ok: true
+drift_alert_retrigger_seconds: 86400
+# Subscribers are optional. Destination IDs refer to workspace notification
+# destinations (for example Slack or PagerDuty).
+drift_alert_user_emails: []
+drift_alert_destination_ids: []
+
+# ---- 04_trigger_retraining.py ----
+# Set this to the Lakeflow Job ID that performs model retraining. Empty keeps
+# automatic retraining disabled while still allowing SQL alert creation.
+retraining_job_id: ''
+# Do not launch another run when this job has run within the cooldown window.
+retraining_cooldown_hours: 24
+# Optional overrides for job-level parameters defined on the target job.
+retraining_job_parameters: {}
