@@ -10,6 +10,7 @@
 .claude/
 .codex/
 .mcp.json
+.isaac
 
 # Python environments and caches
 .venv/
