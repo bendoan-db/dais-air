@@ -149,21 +149,36 @@ def local_staging_dir(name: str) -> Path:
     restart clears Python state. It also deliberately stays off ``/Volumes``,
     where large safetensors writes have failed with EAGAIN.
     """
+    import os
     import tempfile
 
+    # A directory left behind by an earlier session can be owned by a different
+    # uid and not traversable, so `name` is not always usable even under a
+    # writable root. The uid-scoped variant is the deterministic escape hatch.
+    candidates = (name, f"{name}-{os.getuid()}")
+    failures = []
+
     for root in (Path("/local_disk0/tmp"), Path("/local_disk0"), Path(tempfile.gettempdir())):
-        try:
-            root.mkdir(parents=True, exist_ok=True)
-            probe = root / ".air_write_probe"
-            probe.write_text("ok")
-            probe.unlink()
-        except Exception:
-            continue
-        return root / name
+        for candidate in candidates:
+            target = root / candidate
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+                # Probe the directory the caller actually uses, not just its
+                # root: a writable root says nothing about a pre-existing
+                # subdirectory's owner or mode, and on EACCES `Path.exists()`
+                # raises rather than returning False (pathlib only ignores
+                # ENOENT/ENOTDIR/EBADF/ELOOP), so the failure surfaces as a bare
+                # PermissionError from the caller's first stat().
+                probe = target / ".air_write_probe"
+                probe.write_text("ok")
+                probe.unlink()
+            except OSError as err:
+                failures.append(f"{target}: {type(err).__name__}: {err}")
+                continue
+            return target
 
     raise RuntimeError(
-        "No writable local staging directory found (tried /local_disk0 and the "
-        "system temp dir)."
+        "No writable local staging directory found. Tried:\n  " + "\n  ".join(failures)
     )
 
 
