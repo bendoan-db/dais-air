@@ -1,5 +1,5 @@
-catalog: doan
-schema: air_dais
+catalog: ssa_team_sandbox_classic_catalog
+schema: air
 sft_table: fraud_sft_dataset
 endpoint_name: qwen35_4b_finetuned_lora
 results_table: serving_load_test_results

@@ -146,6 +146,103 @@ def load_adapter_model(adapter_dir: str, device_map=None):
     return model, tokenizer
 
 
+def _graft_text_weights(text_state_dict, composite_model):
+    """Copy a merged text backbone's tensors onto a composite model in place.
+
+    The composite model nests the backbone one level deeper
+    (``model.layers.*`` -> ``model.language_model.layers.*``), so keys are
+    remapped by trying the plausible prefixes and confirming the shape.
+    """
+    composite_sd = composite_model.state_dict()
+    remapped = {}
+    unmatched = []
+    for key, tensor in text_state_dict.items():
+        for candidate in (
+            key,
+            key.replace("model.", "model.language_model.", 1),
+            f"model.{key}",
+        ):
+            if candidate in composite_sd and composite_sd[candidate].shape == tensor.shape:
+                remapped[candidate] = tensor
+                break
+        else:
+            unmatched.append(key)
+
+    # Keys left alone keep the base checkpoint's pretrained values, so they are
+    # always initialized and never a load-time failure. That is intended for the
+    # vision tower and for Qwen3.5's MTP head (neither exists in the text
+    # backbone, and vLLM only reads the MTP weights for speculative decoding).
+    # A *text* key left behind would silently serve base weights in place of the
+    # fine-tune, so that still fails loudly.
+    carried_from_base = ("model.visual.", "mtp.")
+    untouched = sorted(set(composite_sd) - set(remapped))
+    stray = [key for key in untouched if not key.startswith(carried_from_base)]
+    if unmatched or stray:
+        raise RuntimeError(
+            f"Could not map the merged adapter onto {type(composite_model).__name__}. "
+            f"Unmapped merged tensors: {unmatched[:10]} ({len(unmatched)} total). "
+            f"Non-vision tensors left at base values: {stray[:10]} ({len(stray)} total)."
+        )
+
+    composite_model.load_state_dict(remapped, strict=False)
+    return len(remapped), untouched
+
+
+def merge_adapter_to_serving_checkpoint(adapter_dir: str, output_dir: str) -> dict:
+    """Merge the LoRA adapter and write the checkpoint vLLM can actually serve.
+
+    Training and merging both work on Qwen3.5's text backbone
+    (``AutoPeftModelForCausalLM`` -> ``Qwen3_5ForCausalLM``), but vLLM 0.24.0
+    implements that class without registering it: architecture normalisation
+    rewrites the ``ForCausalLM`` suffix until a registered name matches, so a
+    text-only checkpoint silently builds ``Qwen3_5ForConditionalGeneration`` and
+    dies with ``'Qwen3_5TextConfig' object has no attribute 'vision_config'``.
+
+    So the merged backbone is saved back into the base model's composite
+    (vision + text) shape, which the registry does know. ``--language-model-only``
+    then keeps the vision tower idle at serve time, but its weights must still be
+    present: vLLM's loader raises on any parameter missing from the checkpoint.
+    """
+    import transformers
+    from transformers import AutoConfig, AutoProcessor
+
+    model, tokenizer = load_adapter_model(adapter_dir)
+    merged = model.merge_and_unload()
+
+    base_config = AutoConfig.from_pretrained(MODEL_NAME)
+    composite_arch = (getattr(base_config, "architectures", None) or [None])[0]
+    if not hasattr(base_config, "vision_config"):
+        # Text-only base: nothing to wrap, and vLLM will have a registry entry
+        # for whatever architecture the checkpoint declares.
+        merged.save_pretrained(output_dir, safe_serialization=True)
+        tokenizer.save_pretrained(output_dir)
+        return {
+            "architecture": merged.config.architectures[0],
+            "grafted_tensors": len(merged.state_dict()),
+            "vision_tensors_from_base": 0,
+        }
+
+    composite = getattr(transformers, composite_arch).from_pretrained(
+        MODEL_NAME, dtype=preferred_dtype()
+    )
+    grafted, untouched = _graft_text_weights(merged.state_dict(), composite)
+
+    composite.save_pretrained(output_dir, safe_serialization=True)
+    tokenizer.save_pretrained(output_dir)
+    # vLLM builds the multimodal processor even with the modality limits zeroed,
+    # so the preprocessor configs have to travel with the weights.
+    try:
+        AutoProcessor.from_pretrained(MODEL_NAME).save_pretrained(output_dir)
+    except Exception as err:  # noqa: BLE001 - optional scaffolding, never fatal
+        print(f"WARNING: could not save the multimodal processor config: {err}")
+
+    return {
+        "architecture": composite_arch,
+        "grafted_tensors": grafted,
+        "vision_tensors_from_base": len(untouched),
+    }
+
+
 def train_qwen3_sft(
     *,
     examples_pdf: pd.DataFrame,

@@ -236,11 +236,13 @@ print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
 # MAGIC
 # MAGIC This cell merges the rank-0 LoRA adapter into the base weights and writes plain Hugging Face weights to `/local_disk0`, which survives the `%restart_python` below and avoids the EAGAIN failures that large safetensors writes hit on `/Volumes`.
 # MAGIC
+# MAGIC The merged weights are saved in the base model's **composite (vision + text) shape**, not the text-only shape training used. vLLM 0.24.0 implements `Qwen3_5ForCausalLM` but never registers it, and its architecture normalisation rewrites the `ForCausalLM` suffix until a registered name matches — so a text-only checkpoint silently builds `Qwen3_5ForConditionalGeneration` and crashes with `'Qwen3_5TextConfig' object has no attribute 'vision_config'`. Saving the composite shape makes the architecture match; `--language-model-only` then keeps the vision tower idle, but its weights must still ship because vLLM's loader raises on any parameter missing from the checkpoint.
+# MAGIC
 # MAGIC Splitting registration from training also makes reruns cheap: if training succeeds but registration or deployment fails, rerun only these cells.
 
 # COMMAND ----------
 
-from train import load_adapter_model
+from train import merge_adapter_to_serving_checkpoint
 from training_utils import local_staging_dir
 
 CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen35_fraud_model"
@@ -254,15 +256,16 @@ MERGE_METADATA_PATH = MERGE_WORK_ROOT / "merge_metadata.json"
 def merge_adapter_to_local_disk(adapter_output_dir: str) -> Path:
     import shutil
 
-    model, tokenizer = load_adapter_model(adapter_output_dir)
-    merged_model = model.merge_and_unload()
-
     if MERGED_MODEL_DIR.exists():
         shutil.rmtree(MERGED_MODEL_DIR)
     MERGED_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    merged_model.save_pretrained(MERGED_MODEL_DIR, safe_serialization=True)
-    tokenizer.save_pretrained(MERGED_MODEL_DIR)
+    summary = merge_adapter_to_serving_checkpoint(adapter_output_dir, str(MERGED_MODEL_DIR))
+    print(
+        f"Merged checkpoint: {summary['architecture']} — "
+        f"{summary['grafted_tensors']} fine-tuned tensors, "
+        f"{summary['vision_tensors_from_base']} carried from the base vision tower"
+    )
     return MERGED_MODEL_DIR
 
 
@@ -374,8 +377,10 @@ def register_custom_llm_model(merge_metadata: dict):
             f"--model {CUSTOM_LLM_MODEL_ARTIFACT_NAME} "
             f"--served-model-name {SERVED_MODEL_NAME} "
             "--host 0.0.0.0 --port 8080 "
-            # Qwen3.5 checkpoints carry a vision tower; this fraud task is
-            # text-only, and skipping it saves GPU memory and startup time.
+            # Qwen3.5 checkpoints carry a vision tower and this fraud task is
+            # text-only. The flag zeroes the per-prompt modality limits (and
+            # enables a fused qwen3-next kernel) — it does NOT skip the tower,
+            # which is why the merged checkpoint still ships its weights.
             "--language-model-only "
             # All fraud prompts share the same instruction header, so prefix
             # caching skips most prefill work (explicit for visibility; the
