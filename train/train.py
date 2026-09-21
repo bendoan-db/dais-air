@@ -146,6 +146,87 @@ def load_adapter_model(adapter_dir: str, device_map=None):
     return model, tokenizer
 
 
+# The upstream Qwen3.5 chat template opens a `<think>` block unless the caller
+# passes enable_thinking=False, so any client that forgets the kwarg gets a
+# prompt ending in '<think>\n' -- a state the fine-tune never saw, and the model
+# spends its whole token budget reasoning instead of emitting JSON. Rather than
+# relying on every caller, invert the default in the served checkpoint:
+# suppressed unless the request explicitly opts in with enable_thinking=true.
+# Both constants are the verbatim template text, where `\n` is the two-character
+# sequence a Jinja string literal escapes, not a newline.
+_UPSTREAM_THINKING_BRANCH = (
+    "{%- if enable_thinking is defined and enable_thinking is false %}\n"
+    "        {{- '<think>\\n\\n</think>\\n\\n' }}\n"
+    "    {%- else %}\n"
+    "        {{- '<think>\\n' }}\n"
+    "    {%- endif %}"
+)
+_SUPPRESSED_THINKING_BRANCH = (
+    "{%- if enable_thinking is defined and enable_thinking is true %}\n"
+    "        {{- '<think>\\n' }}\n"
+    "    {%- else %}\n"
+    "        {{- '<think>\\n\\n</think>\\n\\n' }}\n"
+    "    {%- endif %}"
+)
+
+
+def _patch_thinking_default(template: str) -> tuple[str | None, str]:
+    """Invert a chat template's thinking default. Returns (patched, status)."""
+    if _SUPPRESSED_THINKING_BRANCH in template:
+        return None, "already defaults to thinking off"
+    if _UPSTREAM_THINKING_BRANCH in template:
+        patched = template.replace(
+            _UPSTREAM_THINKING_BRANCH, _SUPPRESSED_THINKING_BRANCH, 1
+        )
+        return patched, "patched: thinking is now opt-in"
+    if "enable_thinking" not in template:
+        return None, "no enable_thinking switch to invert"
+    raise RuntimeError(
+        "The chat template has an enable_thinking switch in an unrecognised form, "
+        "so thinking-off cannot be made the default. Serving it as-is would let "
+        "any client that omits chat_template_kwargs get a reasoning preamble. "
+        "Re-read the template and update _UPSTREAM_THINKING_BRANCH."
+    )
+
+
+def default_thinking_off(output_dir: str) -> str:
+    """Make thinking opt-in in a saved checkpoint's chat template.
+
+    vLLM loads the chat template straight out of the model directory, so
+    patching the file here makes suppression a property of the endpoint: the AI
+    Playground, curl, and any client that forgets ``chat_template_kwargs`` all
+    get the same render training used. Callers can still opt back in per request
+    with ``chat_template_kwargs={"enable_thinking": true}``.
+    """
+    import json
+
+    out = Path(output_dir)
+    jinja_path = out / "chat_template.jinja"
+    config_path = out / "tokenizer_config.json"
+
+    if jinja_path.exists():
+        patched, status = _patch_thinking_default(jinja_path.read_text())
+        if patched is not None:
+            jinja_path.write_text(patched)
+        return f"{jinja_path.name}: {status}"
+
+    # Older transformers embedded the template in tokenizer_config.json instead.
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+        template = config.get("chat_template")
+        if isinstance(template, str):
+            patched, status = _patch_thinking_default(template)
+            if patched is not None:
+                config["chat_template"] = patched
+                config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+            return f"tokenizer_config.json: {status}"
+
+    raise RuntimeError(
+        f"No chat template found under {output_dir}; serving would fall back to "
+        "vLLM's default and lose thinking suppression."
+    )
+
+
 def _graft_text_weights(text_state_dict, composite_model):
     """Copy a merged text backbone's tensors onto a composite model in place.
 
@@ -220,6 +301,7 @@ def merge_adapter_to_serving_checkpoint(adapter_dir: str, output_dir: str) -> di
             "architecture": merged.config.architectures[0],
             "grafted_tensors": len(merged.state_dict()),
             "vision_tensors_from_base": 0,
+            "chat_template": default_thinking_off(output_dir),
         }
 
     composite = getattr(transformers, composite_arch).from_pretrained(
@@ -240,6 +322,7 @@ def merge_adapter_to_serving_checkpoint(adapter_dir: str, output_dir: str) -> di
         "architecture": composite_arch,
         "grafted_tensors": grafted,
         "vision_tensors_from_base": len(untouched),
+        "chat_template": default_thinking_off(output_dir),
     }
 
 

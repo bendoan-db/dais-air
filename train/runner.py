@@ -156,7 +156,7 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # MAGIC
 # MAGIC This section fine-tunes `Qwen/Qwen3.5-4B` with PEFT LoRA adapters through TRL's `SFTTrainer`.
 # MAGIC Qwen3.5 runs in thinking mode by default and ships no non-thinking variant, so every render passes `enable_thinking=False` and the endpoint sends the matching `chat_template_kwargs`. Without that the model emits a reasoning preamble and the compact JSON gets truncated at `max_tokens`.
-# MAGIC Only the text backbone is loaded (`Qwen3_5ForCausalLM`); the checkpoint's vision tower is irrelevant to this task and is skipped at serving time with `--language-model-only`.
+# MAGIC Only the text backbone is loaded (`Qwen3_5ForCausalLM`); the checkpoint's vision tower is irrelevant to this task, and `--language-model-only` keeps it out of the request path at serving time (it does not skip loading it — see the merge cell).
 # MAGIC It uses bf16/16-bit LoRA for accuracy; the 4B model fits comfortably in GPU memory without quantization. Qwen3.5's 3:1 hybrid stack means the adapter lands on the Gated Attention layers' `q/k/v/o_proj` plus every layer's MLP projections — the Gated DeltaNet layers' `linear_attn.*` are left alone.
 # MAGIC Loss is computed on the assistant response only: each SFT row becomes a `prompt`/`completion` pair rendered through the chat template, and `completion_only_loss` masks the prompt.
 # MAGIC
@@ -336,7 +336,12 @@ if NOTEBOOK_DIR not in sys.path:
 import mlflow
 import pandas as pd
 
-from training_utils import load_training_config, local_staging_dir, resolve_experiment_path
+from training_utils import (
+    fraud_response_format,
+    load_training_config,
+    local_staging_dir,
+    resolve_experiment_path,
+)
 
 # The restart wiped the bindings from the configuration cell; reload them so the
 # registration and deployment cells see the same constants as training did.
@@ -401,9 +406,12 @@ def register_custom_llm_model(merge_metadata: dict):
         ],
         "max_tokens": 64,
         "temperature": 0.0,
-        # Qwen3.5 thinks by default and has no non-thinking variant; training
-        # rendered with enable_thinking=False, so serving must match.
+        # Belt: the merged checkpoint's chat template already suppresses thinking
+        # by default, and this keeps working for clients that send the kwarg.
         "chat_template_kwargs": {"enable_thinking": False},
+        # Braces: grammar-constrained decoding admits only tokens that fit the
+        # risk/action/reason schema, so no reasoning preamble is representable.
+        "response_format": fraud_response_format(),
     }
 
     with mlflow.start_run(
@@ -630,10 +638,15 @@ serving_payload = {
     ],
     "max_tokens": 64,
     "temperature": 0.0,
-    # Qwen3.5 thinks by default; training rendered with enable_thinking=False, so
-    # every request must suppress it too or the JSON arrives truncated behind a
-    # reasoning preamble. The load test sends the same field.
+    # The served checkpoint's chat template defaults to thinking off, so this is
+    # belt-and-braces rather than load-bearing -- it keeps the payload explicit
+    # about the contract, and it is what the load test sends too. Note that
+    # chat_template_kwargs must sit at the TOP level of the request body: nesting
+    # it under extra_body (a client-side-only concept in the OpenAI SDK) is
+    # silently ignored by vLLM and the response fills with reasoning.
     "chat_template_kwargs": {"enable_thinking": False},
+    # Grammar-constrained decoding pins the JSON contract regardless.
+    "response_format": fraud_response_format(),
 }
 
 print(f"Registered model name: {FULL_MODEL_NAME}")

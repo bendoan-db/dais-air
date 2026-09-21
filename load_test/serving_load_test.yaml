@@ -28,4 +28,8 @@ max_latency_samples_per_worker: 10000
 # preamble would blow this budget.
 max_tokens: 64
 enable_thinking: false
+# Constrain decoding to the risk/action/reason schema. Belt and braces next
+# to enable_thinking: grammar decoding cannot emit a reasoning preamble at
+# all, so the JSON contract holds even if a client forgets the kwarg.
+enforce_json_schema: true
 temperature: 0.0

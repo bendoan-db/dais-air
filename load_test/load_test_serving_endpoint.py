@@ -51,6 +51,7 @@ from training_utils import (
     config_float,
     config_int,
     config_str,
+    fraud_response_format,
     full_name,
     get_spark_session,
     load_yaml_config,
@@ -98,6 +99,10 @@ TEMPERATURE = config_float(load_test_config, "temperature")
 # with enable_thinking=False, so the load test must send the matching
 # chat_template_kwargs or every response wastes its token budget on reasoning.
 ENABLE_THINKING = config_bool(load_test_config, "enable_thinking")
+# Grammar-constrained decoding against the risk/action/reason schema. This
+# guarantees parseable JSON even if the chat template ever reverts to
+# thinking-on, because no non-conforming token can be sampled.
+ENFORCE_JSON_SCHEMA = config_bool(load_test_config, "enforce_json_schema")
 
 if TARGET_QPS <= 0:
     raise ValueError("target_qps must be greater than zero.")
@@ -125,6 +130,7 @@ config_summary = {
     "worker_concurrency": WORKER_CONCURRENCY,
     "planned_requests": TARGET_QPS * DURATION_SECONDS,
     "enable_thinking": ENABLE_THINKING,
+    "enforce_json_schema": ENFORCE_JSON_SCHEMA,
 }
 
 display(pd.DataFrame([config_summary]))
@@ -246,6 +252,7 @@ payload_templates = [
         "max_tokens": MAX_TOKENS,
         "temperature": TEMPERATURE,
         "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
+        **({"response_format": fraud_response_format()} if ENFORCE_JSON_SCHEMA else {}),
     }
     for prompt in prompt_pdf["prompt"].tolist()
 ]
@@ -494,6 +501,7 @@ summary_row = {
     "duration_seconds": DURATION_SECONDS,
     "planned_requests": TARGET_QPS * DURATION_SECONDS,
     "enable_thinking": ENABLE_THINKING,
+    "enforce_json_schema": ENFORCE_JSON_SCHEMA,
     "actual_elapsed_seconds": load_test_elapsed_seconds,
     "request_count": total_requests,
     "success_count": success_count,

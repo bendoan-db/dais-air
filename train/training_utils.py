@@ -65,6 +65,42 @@ def config_bool(config: dict, key: str) -> bool:
     raise ValueError(f"Config key must be boolean-like: {key}")
 
 
+# Serving-side mirror of the prompt contract. Ingestion emits compact JSON with
+# exactly these keys and enum values (``risk_col``/``action_col`` in
+# setup/01_load_tabformer_dataset.py), so constraining requests to this schema
+# guarantees a parseable response independently of the chat template: grammar
+# decoding admits only schema-conforming tokens, so a reasoning preamble cannot
+# be generated in the first place. Keep the enums in step with ingestion.
+FRAUD_RESPONSE_JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "risk": {
+            "type": "string",
+            "enum": ["legitimate", "suspicious", "likely_fraud"],
+        },
+        "action": {
+            "type": "string",
+            "enum": ["approve", "step_up_authentication", "decline_and_escalate"],
+        },
+        "reason": {"type": "string"},
+    },
+    "required": ["risk", "action", "reason"],
+    "additionalProperties": False,
+}
+
+
+def fraud_response_format() -> dict:
+    """OpenAI-style ``response_format`` pinning the fraud JSON contract."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "fraud_decision",
+            "schema": FRAUD_RESPONSE_JSON_SCHEMA,
+            "strict": True,
+        },
+    }
+
+
 def quote_identifier(identifier: str) -> str:
     return f"`{identifier.replace('`', '``')}`"
 
