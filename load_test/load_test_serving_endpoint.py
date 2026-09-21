@@ -47,6 +47,7 @@ if TRAIN_MODULE_DIR not in sys.path:
     sys.path.insert(0, TRAIN_MODULE_DIR)
 
 from training_utils import (
+    config_bool,
     config_float,
     config_int,
     config_str,
@@ -93,6 +94,10 @@ MAX_LATENCY_SAMPLES_PER_WORKER = config_int(load_test_config, "max_latency_sampl
 
 MAX_TOKENS = config_int(load_test_config, "max_tokens")
 TEMPERATURE = config_float(load_test_config, "temperature")
+# Qwen3.5 thinks by default and has no non-thinking variant. Training rendered
+# with enable_thinking=False, so the load test must send the matching
+# chat_template_kwargs or every response wastes its token budget on reasoning.
+ENABLE_THINKING = config_bool(load_test_config, "enable_thinking")
 
 if TARGET_QPS <= 0:
     raise ValueError("target_qps must be greater than zero.")
@@ -119,6 +124,7 @@ config_summary = {
     "load_generator_workers": LOAD_GENERATOR_WORKERS,
     "worker_concurrency": WORKER_CONCURRENCY,
     "planned_requests": TARGET_QPS * DURATION_SECONDS,
+    "enable_thinking": ENABLE_THINKING,
 }
 
 display(pd.DataFrame([config_summary]))
@@ -239,6 +245,7 @@ payload_templates = [
         ],
         "max_tokens": MAX_TOKENS,
         "temperature": TEMPERATURE,
+        "chat_template_kwargs": {"enable_thinking": ENABLE_THINKING},
     }
     for prompt in prompt_pdf["prompt"].tolist()
 ]
@@ -486,6 +493,7 @@ summary_row = {
     "target_qps": TARGET_QPS,
     "duration_seconds": DURATION_SECONDS,
     "planned_requests": TARGET_QPS * DURATION_SECONDS,
+    "enable_thinking": ENABLE_THINKING,
     "actual_elapsed_seconds": load_test_elapsed_seconds,
     "request_count": total_requests,
     "success_count": success_count,

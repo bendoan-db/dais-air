@@ -75,10 +75,77 @@ def full_name(*parts: str) -> str:
 
 def get_spark_session():
     """Return the active Spark session, attaching a serverless Databricks
-    Connect session when none exists yet (local scripts, GPU workers)."""
+    Connect session when none exists yet (local scripts, GPU workers).
+
+    Order matters. Inside a Databricks notebook or job there is already a
+    session, and it must be reused: the runtime's bundled ``databricks.connect``
+    Builder has no ``serverless()`` method (that exists only on the standalone
+    client used from a laptop), so calling it there fails with
+    ``AttributeError: 'Builder' object has no attribute 'serverless'``.
+    """
+    try:
+        from pyspark.sql import SparkSession
+
+        active = SparkSession.getActiveSession()
+        if active is not None:
+            return active
+    except Exception:
+        pass
+
     from databricks.connect import DatabricksSession
 
-    return DatabricksSession.builder.serverless().getOrCreate()
+    builder = DatabricksSession.builder
+    if hasattr(builder, "serverless"):
+        return builder.serverless().getOrCreate()
+    return builder.getOrCreate()
+
+
+def local_staging_dir(name: str) -> Path:
+    """Return a deterministic, writable local directory for large intermediates.
+
+    Prefers ``/local_disk0`` (fast node-local storage on Databricks compute) and
+    falls back to the system temp dir, because serverless notebook compute does
+    not always expose a writable ``/local_disk0`` — a hardcoded path there fails
+    with ``PermissionError: [Errno 13]``.
+
+    The path is deterministic rather than randomized on purpose: callers on both
+    sides of a ``%restart_python`` must resolve the *same* directory, since the
+    restart clears Python state. It also deliberately stays off ``/Volumes``,
+    where large safetensors writes have failed with EAGAIN.
+    """
+    import tempfile
+
+    for root in (Path("/local_disk0/tmp"), Path("/local_disk0"), Path(tempfile.gettempdir())):
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            probe = root / ".air_write_probe"
+            probe.write_text("ok")
+            probe.unlink()
+        except Exception:
+            continue
+        return root / name
+
+    raise RuntimeError(
+        "No writable local staging directory found (tried /local_disk0 and the "
+        "system temp dir)."
+    )
+
+
+def resolve_experiment_path(experiment_name: str) -> str:
+    """Resolve an MLflow experiment name the way the AI Runtime CLI does.
+
+    AIR resolves a workload's ``experiment_name`` to
+    ``/Users/<current user>/<experiment_name>``; notebook runs resolve the same
+    name through this helper so both launchers log to one experiment. A value
+    that is already a workspace path is returned unchanged.
+    """
+    if experiment_name.startswith("/"):
+        return experiment_name
+
+    from databricks.sdk import WorkspaceClient
+
+    user_name = WorkspaceClient().current_user.me().user_name
+    return f"/Users/{user_name}/{experiment_name}"
 
 
 def load_training_config() -> dict:
@@ -88,11 +155,12 @@ def load_training_config() -> dict:
     at ``$HYPERPARAMETERS_PATH`` (which reflects ``air run --override``
     values); otherwise they are read from ``train.yaml`` next to this file.
 
-    Returns a flat dict of typed config values, derived UC names/paths, and
-    quoted SQL identifiers, intended to be bound into the caller's namespace
-    with ``globals().update(load_training_config())``. Used by the training
-    runner notebook and by train.py; deliberately a function (not top-level
-    code) so that importing this module has no side effects.
+    Returns a flat dict of typed config values, the workload's
+    ``experiment_name``, derived UC names/paths, and quoted SQL identifiers,
+    intended to be bound into the caller's namespace with
+    ``globals().update(load_training_config())``. Used by the training runner
+    notebook and by train.py; deliberately a function (not top-level code) so
+    that importing this module has no side effects.
     """
     import os
 
@@ -104,11 +172,23 @@ def load_training_config() -> dict:
         # The AIR CLI docs say HYPERPARAMETERS_PATH holds just the
         # `parameters` dict, but v0.1.0b1 points it at the full workload
         # YAML — accept either shape.
+        workload_config = loaded if "parameters" in loaded else {}
         parameters = loaded.get("parameters", loaded)
     else:
         config_path, workload_config = load_yaml_config("train.yaml")
         parameters = config_value(workload_config, "parameters")
     config = config_value(parameters, "training_config")
+
+    # experiment_name is a top-level AIR workload field rather than part of
+    # training_config, and it is the only place the MLflow experiment is named:
+    # AIR resolves it for CLI runs, and the runner notebook resolves the same
+    # name through resolve_experiment_path(). When $HYPERPARAMETERS_PATH carries
+    # only the parameters dict, read it from the train.yaml in the snapshot.
+    if "experiment_name" in workload_config:
+        experiment_name = config_str(workload_config, "experiment_name")
+    else:
+        _, snapshot_workload_config = load_yaml_config("train.yaml")
+        experiment_name = config_str(snapshot_workload_config, "experiment_name")
 
     uc_catalog = config_str(config, "catalog")
     uc_schema = config_str(config, "schema")
@@ -122,6 +202,7 @@ def load_training_config() -> dict:
 
     return {
         "CONFIG_PATH": config_path,
+        "EXPERIMENT_NAME": experiment_name,
         "UC_CATALOG": uc_catalog,
         "UC_SCHEMA": uc_schema,
         "SOURCE_TABLE_NAME": source_table_name,

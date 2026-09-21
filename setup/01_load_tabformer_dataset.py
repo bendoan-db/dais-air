@@ -619,7 +619,7 @@ print(f"Overwrote SFT Delta table {full_sft_table_name}")
 # MAGIC AI Runtime's data-loading guidance recommends exporting large Delta tables to a UC volume and reading the files directly during training, which avoids Spark overhead on the GPU workers:
 # MAGIC https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes
 # MAGIC
-# MAGIC Parquet is used because the training code (Unsloth) consumes Hugging Face `datasets`, which loads Parquet natively as memory-mapped Arrow tables.
+# MAGIC Parquet is used because the training code consumes Hugging Face `datasets`, which loads Parquet natively as memory-mapped Arrow tables.
 # MAGIC The export is partitioned by `shard_id`, so the existing rank-sharding contract carries over: each GPU worker claims the `shard_id=N` directories where `N % world_size == rank` and reads only its own files.
 
 # COMMAND ----------

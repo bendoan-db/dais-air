@@ -9,8 +9,9 @@ The demo uses the IBM TabFormer credit-card dataset and prepares a supervised fi
 | Path | Purpose |
 | --- | --- |
 | `setup/01_load_tabformer_dataset.py` | Databricks notebook that downloads TabFormer, cleans transaction data, and overwrites Delta tables. |
-| `setup/setup.yaml` | Ingestion configuration: catalog, schema, table names, staging volume, source URL, and SFT shard count. |
-| `train/runner.py` | Databricks notebook for AIR fine-tuning with Unsloth, MLflow registration, and Model Serving deployment. |
+| `setup/02_load_model_weights_to_volume.py` | Databricks notebook that mirrors the base model weights from the Hugging Face Hub into a Unity Catalog volume. |
+| `setup/setup.yaml` | Ingestion configuration: catalog, schema, table names, staging volume, source URL, SFT shard count, and the base-model mirror settings. |
+| `train/runner.py` | Databricks notebook for AIR fine-tuning with Hugging Face TRL, MLflow registration, and Model Serving deployment. |
 | `train/train.py` | Standalone training module: imported by the notebook's `@distributed` cell and runnable directly via the AI Runtime CLI. |
 | `train/train.yaml` | AI Runtime CLI workload definition (`air run --file train.yaml`) plus the training, registration, and serving configuration (`parameters.training_config` section). |
 | `load_test/load_test_serving_endpoint.py` | Databricks notebook that simulates high-QPS traffic against the deployed serving endpoint. |
@@ -40,17 +41,21 @@ Update these files before running the demo:
   - `sft_volume` (volume for the Parquet export of the SFT table)
   - `staging_volume`
   - `source_url`
+  - `model_name` (Hugging Face repo id of the base checkpoint; must match `train.yaml`'s `model_name`)
+  - `model_volume` and `model_revision` (destination volume and Hub revision for the mirrored weights)
 
 - `train/train.yaml` (`parameters.training_config` section; the top-level fields configure the AI Runtime CLI workload)
+  - `experiment_name` (top level): the MLflow experiment used by both the notebook and the CLI
   - `catalog`, `schema`, `source_table`, and `sft_table`
   - `checkpoint_volume`
   - `uc_model_name`
   - `endpoint_name`
-  - training parameters such as `max_steps`, batch size, and learning rate
+  - training parameters such as `max_steps`, `training_sample_fraction`, batch size, and learning rate
   - serving parameters such as `serving_workload_type`, `serving_workload_size`, and `serving_scale_to_zero`
 
 - `load_test/serving_load_test.yaml`
-  - `endpoint_name`
+  - `endpoint_name` (must match `train.yaml`)
+  - `enable_thinking` (must match the training render)
   - `target_qps`
   - `duration_seconds`
   - load-generator worker and concurrency settings
@@ -71,34 +76,46 @@ Update these files before running the demo:
    - Exports the SFT records to a Unity Catalog volume as Parquet files partitioned by `shard_id`, per the [AI Runtime data-loading guidance](https://docs.databricks.com/aws/en/machine-learning/ai-runtime/dataloading#load-large-delta-tables-using-volumes).
    - Overwrites target tables on each run.
 
-2. Fine-tune with AI Runtime.
+2. Mirror the base model weights into Unity Catalog (optional).
+
+   Run `setup/02_load_model_weights_to_volume.py` on Databricks serverless compute. The notebook:
+
+   - Creates the configured model volume if it does not exist.
+   - Resolves `model_revision` to a commit SHA and downloads every file of that snapshot except the `model_ignore_patterns` matches.
+   - Copies each file to the volume one at a time, deleting the local copy in between, so local disk use stays bounded and volume writes stay sequential.
+   - Skips files already mirrored at the size the Hub reports, unless `force_model_download` is set.
+   - Writes a provenance JSON beside the weights directory and verifies the snapshot (config, tokenizer, and every safetensors shard named in the index).
+
+   Point training at the mirror by setting `train/train.yaml`'s `model_name` to the printed `/Volumes/...` path; leaving it as the Hub repo id makes each training run download the weights itself.
+
+3. Fine-tune with AI Runtime.
 
    Run `train/runner.py` on Databricks Serverless GPU with AI Runtime. The notebook:
 
    - Installs `train/requirements.txt`.
    - Reads the rank-sharded SFT Parquet files from the Unity Catalog volume with Hugging Face `datasets` (no Spark on the GPU workers).
-   - Fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with Unsloth LoRA.
+   - Fine-tunes `Qwen/Qwen3.5-4B` (text backbone only) with TRL supervised fine-tuning and PEFT LoRA, computing loss on the assistant response only, with thinking suppressed via `enable_thinking=False`.
    - Uses the `@distributed` decorator so the same training cell can run on one GPU or multiple GPUs by changing the `gpus` parameter.
    - Saves rank-0 adapter artifacts to a Unity Catalog volume.
    - Logs training metrics to MLflow.
 
    The training implementation lives in `train/train.py` and can also run without the notebook through the AI Runtime CLI — see [Training via the AI Runtime CLI](#training-via-the-ai-runtime-cli).
 
-3. Register the custom LLM.
+4. Register the custom LLM.
 
-   The training notebook includes a separate registration section that:
+   The training notebook includes a separate registration section, split into three cells because the training and serving environments cannot coexist in one Python session:
 
-   - Loads the saved adapter artifacts.
-   - Merges the adapter into the base model.
-   - Saves merged Hugging Face weights into an MLflow artifact.
-   - Configures a vLLM OpenAI-compatible server entrypoint for `llm/v1/chat`.
-   - Registers the MLflow model to Unity Catalog using the Databricks Model Serving environment pack.
+   - **Merge**: loads the saved adapter, merges it into the base model, and writes merged Hugging Face weights to `/local_disk0`.
+   - **Install the serving stack**: two `pip` passes — `vllm==0.24.0`, `transformers==5.13.0`, `mlflow==3.14.0`, `flashinfer-cubin`, then `opencv-python-headless==4.12.0.88` on top (pip warns about the conflict; that is expected, and anything `>=4.13` fails the OpenSSL FIPS self-test on Model Serving pods) — followed by `%restart_python`.
+   - **Register**: configures a vLLM OpenAI-compatible server entrypoint for `llm/v1/chat` with `--language-model-only`, and registers the MLflow model to Unity Catalog with `env_pack="databricks_model_serving"`, which captures the environment installed above.
 
-4. Deploy the serving endpoint.
+   Note for anyone reusing this pin set: `opencv-python-headless<4.13` carries a known RCE CVE, which is why the managed Foundation Model path does not ship this combination.
+
+5. Deploy the serving endpoint.
 
    If `deploy_endpoint: true` in `train/train.yaml`'s `training_config`, the training notebook creates or updates the configured Model Serving endpoint and routes 100% of traffic to the registered model version.
 
-5. Load test the endpoint.
+6. Load test the endpoint.
 
    Run `load_test/load_test_serving_endpoint.py` after the endpoint is ready. The notebook:
 
@@ -149,7 +166,7 @@ The same training code that the notebook's `@distributed` cell runs can be submi
                                    # otherwise reruns the same broken workload)
    ```
 
-Runs land in the same MLflow experiment as notebook runs (AIR resolves `experiment_name` to `/Users/<you>/<experiment_name>`), with two markers distinguishing the launch path: the run name carries an `-air-cli` suffix and the run is tagged `submitted_via: air-cli` (notebook runs are tagged `submitted_via: notebook`). Filter with `tags.submitted_via = 'air-cli'` in the MLflow UI.
+Runs land in the same MLflow experiment as notebook runs — AIR resolves `experiment_name` to `/Users/<you>/<experiment_name>`, and the notebook resolves that same field through `training_utils.resolve_experiment_path()` — with two markers distinguishing the launch path: the run name carries an `-air-cli` suffix and the run is tagged `submitted_via: air-cli` (notebook runs are tagged `submitted_via: notebook`). Filter with `tags.submitted_via = 'air-cli'` in the MLflow UI.
 
 To scale up, edit `compute` in `train.yaml` (for example `num_accelerators: 8` with `accelerator_type: GPU_8xH100`) — `train.py` resolves rank and world size from the runtime, and each rank loads only its own `shard_id` directories from the Parquet export. The CLI path runs training only; model registration and endpoint deployment remain in the notebook's later cells, which read the adapter directory that training writes to the checkpoint volume.
 

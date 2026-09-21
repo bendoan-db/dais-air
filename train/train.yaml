@@ -10,9 +10,20 @@
 # serving settings). AIR also exposes it on the cluster via
 # $HYPERPARAMETERS_PATH, which load_training_config() prefers so that
 # `air run --override` values reach the training script.
-experiment_name: unsloth_qwen3_4b_instruct_training
+
+# MLflow experiment for BOTH launch paths. AIR resolves this name to
+# /Users/<user>/<experiment_name>; the runner notebook resolves the same name
+# through training_utils.resolve_experiment_path(), so notebook and CLI runs
+# land in one experiment. Keep it alphanumeric/-/_ — it also becomes a Jobs API
+# task key.
+experiment_name: qwen35_4b_sft_training
 environment:
-  version: '5'
+  # Serverless GPU environment version 6 (Public Preview): Python 3.12, CUDA 13,
+  # transformers 5.8, trl 0.24, peft 0.19, accelerate 1.13, datasets 4.8.
+  # https://docs.databricks.com/aws/en/release-notes/serverless/environment-version/six-gpu
+  # v6 dropped bitsandbytes, xformers, and unsloth from the base image, and no
+  # longer bundles torch in any base environment — hence the explicit torch pin.
+  version: 'databricks_ai_v6'
   # Keep in sync with train/requirements.txt.
   dependencies:
     - pyyaml>=6.0.2
@@ -20,24 +31,22 @@ environment:
     - databricks-connect>=17.0.0
     - databricks-sdk>=0.102.0
     - mlflow>=3.12.0
+    # Must match the CUDA 13 build that environment v6 targets.
+    - torch==2.11.0
     - accelerate>=1.11.0
-    - bitsandbytes>=0.46.0
     - datasets>=3.6.0
     - einops>=0.8.1
     - hf_transfer>=0.1.9
     - peft>=0.19.1
     - safetensors>=0.5.0
-    - transformers>=5.0.0
+    # Qwen3.5 (Qwen3_5ForCausalLM) needs a newer transformers than env v6's 5.8.1.
+    - transformers>=5.13.0
     - trl>=0.24.0
-    - unsloth
-    - unsloth_zoo>=2026.4.8
-    - torchao>=0.16.0
-    - xformers>=0.0.31.post1
 compute:
-  num_accelerators: 1
+  num_accelerators: 8
   # GPU_1xA10 is enough for the 4B LoRA validation run; switch to GPU_8xH100
   # for the scaled multi-GPU demo run.
-  accelerator_type: GPU_1xA10
+  accelerator_type: GPU_8xH100
 env_variables:
   # AIR CLI nodes don't set this, but the runtime image's bundled
   # databricks-connect needs it to substitute its 'DBCONNECT_VERSION'
@@ -50,30 +59,38 @@ code_source:
   type: snapshot
   snapshot:
     root_path: .
-command: python $CODE_SOURCE_PATH/train.py
+# One process per GPU. `--nproc_per_node=gpu` follows whatever
+# compute.num_accelerators allocates, so `--override compute.num_accelerators=N`
+# still works, and it keeps HF Trainer on DDP: a single process holding every GPU
+# falls back to nn.DataParallel, which crashes Qwen3.5's Gated DeltaNet path and
+# reads only rank 0's shard slice. `--standalone` is right for a single-node
+# allocation; a multi-node workload needs real rendezvous arguments instead.
+command: torchrun --standalone --nproc_per_node=gpu $CODE_SOURCE_PATH/train.py
 
 # Demo configuration, carried in the workload's `parameters` field.
 parameters:
   training_config:
-    catalog: doan
-    schema: air_dais
+    catalog: ssa_team_sandbox_classic_catalog
+    schema: air
     source_table: fraud_dataset
     sft_table: fraud_sft_dataset
     # Volume holding the parquet export of the SFT table (written by setup);
     # must match setup.yaml's sft_volume.
     sft_volume: training_data
     checkpoint_volume: checkpoints
-    uc_model_name: qwen3_4b_instruct_finetuned
-    endpoint_name: qwen3_4b_instruct_finetuned_lora
+    uc_model_name: qwen35_4b_finetuned
+    endpoint_name: qwen35_4b_finetuned_lora
 
-    model_name: unsloth/Qwen3-4B-Instruct-2507
+    model_name: Qwen/Qwen3.5-4B
     max_seq_length: 2048
     max_steps: 10
     per_device_train_batch_size: 2
     gradient_accumulation_steps: 4
     learning_rate: 2e-4
-    # Default for AIR CLI runs only — notebook runs set TRAINING_SAMPLE_FRACTION
-    # directly in the runner's training cell, which overrides this value.
+    # Fraction of each rank's shard slice to train on (1.0 = every row), used by
+    # BOTH launchers: the runner notebook passes this value into
+    # run_rank_training(), and CLI runs can change it per run with
+    # `air run --override parameters.training_config.training_sample_fraction=...`.
     training_sample_fraction: 0.001
     register_model: true
     deploy_endpoint: true
@@ -85,7 +102,7 @@ parameters:
     # us-west-2 + beta enrollment required).
     serving_workload_size: Large
     serving_scale_to_zero: false
-    served_model_name: qwen3_4b_instruct_finetuned
+    served_model_name: qwen35_4b_finetuned
     vllm_dtype: float16
     vllm_max_model_len: 2048
     vllm_gpu_memory_utilization: 0.9

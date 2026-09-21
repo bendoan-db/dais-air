@@ -7,17 +7,18 @@ databricks-connect>=17.0.0
 databricks-sdk>=0.102.0
 mlflow>=3.12.0
 
-# Hugging Face and Unsloth fine-tuning stack.
+# GPU training stack (only needed on serverless GPU compute, not for local
+# Databricks Connect runs). Serverless GPU environment v6 no longer bundles
+# torch, so it is pinned here to the CUDA 13 build that v6 targets.
+torch==2.11.0
+
+# Hugging Face fine-tuning stack: TRL supervised fine-tuning + PEFT LoRA.
 accelerate>=1.11.0
-bitsandbytes>=0.46.0
 datasets>=3.6.0
 einops>=0.8.1
 hf_transfer>=0.1.9
 peft>=0.19.1
 safetensors>=0.5.0
-transformers>=5.0.0
+# Qwen3.5 (Qwen3_5ForCausalLM) needs a newer transformers than env v6's 5.8.1.
+transformers>=5.13.0
 trl>=0.24.0
-unsloth
-unsloth_zoo>=2026.4.8
-torchao>=0.16.0
-xformers>=0.0.31.post1

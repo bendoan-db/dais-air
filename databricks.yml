@@ -10,10 +10,15 @@ targets:
     mode: development
     default: true
     workspace:
-      host: https://fe-vm-vdm-classic-hkbucz.cloud.databricks.com
+      host: https://fevm-ssa-team-sandbox-classic.cloud.databricks.com
+      # Three profiles in ~/.databrickscfg share this host (DEFAULT,
+      # serverless-sandbox, fevm-ssa-team-sandbox-classic), and the CLI refuses
+      # to guess — naming one here keeps `databricks bundle ...` working from the
+      # repo directory without DATABRICKS_CONFIG_PROFILE set.
+      profile: fevm-ssa-team-sandbox-classic
 
   ## Optionally, there could be 'staging' or 'prod' targets here.
   #
   # prod:
   #   workspace:
-  #     host: https://fe-vm-vdm-classic-hkbucz.cloud.databricks.com
+  #     host: https://fevm-ssa-team-sandbox-classic.cloud.databricks.com

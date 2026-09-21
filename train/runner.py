@@ -23,7 +23,11 @@ NOTEBOOK_DIR = str(Path.cwd())
 if NOTEBOOK_DIR not in sys.path:
     sys.path.insert(0, NOTEBOOK_DIR)
 
-from training_utils import init_training_workspace, load_training_config
+from training_utils import (
+    init_training_workspace,
+    load_training_config,
+    resolve_experiment_path,
+)
 
 # COMMAND ----------
 
@@ -36,8 +40,9 @@ from training_utils import init_training_workspace, load_training_config
 # MAGIC - `catalog`, `schema`, and `source_table` point to the governed transaction Delta table.
 # MAGIC - `sft_table` points to the prepared prompt/response Delta table.
 # MAGIC - `checkpoint_volume` controls where adapters and model artifacts are written.
+# MAGIC - The workload's top-level `experiment_name` names the MLflow experiment, so this notebook and AI Runtime CLI runs log to the same place.
 # MAGIC - `max_steps`, batch size, and learning rate control the training cost and runtime.
-# MAGIC - The sampling fraction is set directly in the training cell below (`TRAINING_SAMPLE_FRACTION`), so it can be adjusted live during the demo; `train.yaml`'s `training_sample_fraction` only serves as the AI Runtime CLI default.
+# MAGIC - `training_sample_fraction` controls how much of each rank's shard slice is trained on (`1.0` uses every row); this notebook and AI Runtime CLI runs both read it from `train.yaml`.
 # MAGIC
 # MAGIC The demo uses one training cell. Run it first with `@distributed(gpus=1, gpu_type="h100")`, then change only `gpus` to a larger value such as `8` to distribute the same training workflow.
 # MAGIC For a short walkthrough, keep `max_steps` low. For a real experiment, increase `max_steps`, broaden the sampled dataset, and compare runs in MLflow.
@@ -59,6 +64,8 @@ training_context = load_training_config()
 globals().update(training_context)
 
 print(f"Training config: {CONFIG_PATH}")
+print(f"MLflow experiment name: {EXPERIMENT_NAME}")
+print(f"Training sample fraction: {TRAINING_SAMPLE_FRACTION}")
 print(f"Source table: {SOURCE_TABLE}")
 print(f"SFT table: {SFT_TABLE}")
 print(f"Base model: {MODEL_NAME}")
@@ -78,16 +85,16 @@ print(f"SFT table: {sft_table_q}")
 
 # COMMAND ----------
 
-# DBTITLE 1,AI Runtime fraud fine-tuning with Qwen3 4B and Unsloth
+# DBTITLE 1,AI Runtime fraud fine-tuning with Qwen3.5 4B and Hugging Face TRL
 # MAGIC %md
-# MAGIC # Fine-tune Qwen3 4B for fraud decisions with AI Runtime
+# MAGIC # Fine-tune Qwen3.5 4B for fraud decisions with AI Runtime
 # MAGIC
 # MAGIC ![](/Workspace/Users/ben.doan@databricks.com/dais-air/train/images/Screenshot 2026-06-11 at 12.04.39 PM.png)
 # MAGIC
 # MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime. 
 # MAGIC
 # MAGIC The workflow uses the IBM TabFormer credit-card dataset loaded and prepared by `setup/01_load_tabformer_dataset.py`.
-# MAGIC The setup notebook creates both a cleaned transaction table and a supervised fine-tuning table with prompt/response records. This notebook samples or shards those SFT rows, fine-tunes with Unsloth LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
+# MAGIC The setup notebook creates both a cleaned transaction table and a supervised fine-tuning table with prompt/response records. This notebook samples or shards those SFT rows, fine-tunes with Hugging Face TRL supervised fine-tuning and PEFT LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
 # MAGIC
 # MAGIC **Features demonstrated in this notebook**
 # MAGIC
@@ -102,7 +109,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC %md
 # MAGIC ## Business scenario and model contract
 # MAGIC
-# MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it. We will finetune Qwen3-4B-Instruct-2507` to emit a structured fraud decision with additional triage steps.
+# MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it. We will finetune `Qwen/Qwen3.5-4B` to emit a structured fraud decision with additional triage steps.
 # MAGIC
 # MAGIC The output contract is a compact JSON object with:
 # MAGIC
@@ -117,13 +124,13 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC %md
 # MAGIC ## Compute: attach to AI Runtime serverless GPU
 # MAGIC
-# MAGIC Attach this notebook to **Serverless GPU** from the notebook compute picker and choose the **AI v5** environment.
+# MAGIC Attach this notebook to **Serverless GPU** from the notebook compute picker and choose the **AI v6** environment.
 # MAGIC AI Runtime is designed for deep learning workloads on Databricks serverless GPU compute, so the notebook can focus on model development instead of cluster provisioning, driver setup, or GPU library management.
 # MAGIC
 # MAGIC Recommended compute:
 # MAGIC
 # MAGIC - Accelerator: `1xH100` or `1xA10` for the validation path, or `8xH100` to demonstrate multi-GPU scaling.
-# MAGIC - Base environment: `AI v5`.
+# MAGIC - Base environment: `AI v6` (Public Preview).
 # MAGIC
 # MAGIC If `1xH100` is not available in the workspace, `1xA10` is enough for this 4B bf16 LoRA workflow.
 # MAGIC The model is intentionally small so the notebook highlights the platform workflow: governed data, GPU-backed training, experiment tracking, and production handoff.
@@ -145,13 +152,13 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC <img src="/Workspace/Users/ben.doan@databricks.com/dais-air/train/images/unsloth_green_sticker_cME6ryC59BlZg-VtqGN4p.avif" alt="drawing" width="200"/>
+# MAGIC ## Fine-tune Qwen3.5 4B with Hugging Face TRL
 # MAGIC
-# MAGIC ## Fine-tune Qwen3 4B Instruct with Unsloth
-# MAGIC
-# MAGIC This section fine-tunes `unsloth/Qwen3-4B-Instruct-2507` with LoRA adapters.
-# MAGIC The Instruct-2507 variant is non-thinking: it answers directly instead of emitting reasoning tokens first, which keeps served responses inside the compact JSON contract and the per-request generation budget. (Base Qwen3 is a hybrid reasoning model whose serving-time chat template defaults to thinking mode.)
-# MAGIC It uses bf16/16-bit LoRA for accuracy; the 4B model fits comfortably in GPU memory without quantization.
+# MAGIC This section fine-tunes `Qwen/Qwen3.5-4B` with PEFT LoRA adapters through TRL's `SFTTrainer`.
+# MAGIC Qwen3.5 runs in thinking mode by default and ships no non-thinking variant, so every render passes `enable_thinking=False` and the endpoint sends the matching `chat_template_kwargs`. Without that the model emits a reasoning preamble and the compact JSON gets truncated at `max_tokens`.
+# MAGIC Only the text backbone is loaded (`Qwen3_5ForCausalLM`); the checkpoint's vision tower is irrelevant to this task and is skipped at serving time with `--language-model-only`.
+# MAGIC It uses bf16/16-bit LoRA for accuracy; the 4B model fits comfortably in GPU memory without quantization. Qwen3.5's 3:1 hybrid stack means the adapter lands on the Gated Attention layers' `q/k/v/o_proj` plus every layer's MLP projections — the Gated DeltaNet layers' `linear_attn.*` are left alone.
+# MAGIC Loss is computed on the assistant response only: each SFT row becomes a `prompt`/`completion` pair rendered through the chat template, and `completion_only_loss` masks the prompt.
 # MAGIC
 # MAGIC The implementation highlights the production workflow around training:
 # MAGIC
@@ -169,25 +176,35 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 # MAGIC
 # MAGIC This is the only training cell in the demo: a thin wrapper that imports `train.py` on each GPU worker and runs one rank of training.
 # MAGIC Run it first with `gpus=1` to validate the workflow, then change the decorator to `gpus=8` and rerun the same cell to distribute training across multiple GPUs.
-# MAGIC `TRAINING_SAMPLE_FRACTION` at the top of the cell controls how much of each rank's shard slice is used — raise it here to broaden the dataset between runs without touching `train.yaml`.
+# MAGIC `train.yaml`'s `training_sample_fraction` controls how much of each rank's shard slice is used — raise it there to broaden the dataset between runs (or pass `--override parameters.training_config.training_sample_fraction=...` to `air run`).
 # MAGIC
 # MAGIC Each worker reads its rank-assigned `shard_id=N` parquet directories from the UC volume inside `run_rank_training`, so nothing large ships from the notebook driver to the GPU workers.
 # MAGIC The same function runs without a notebook through the AI Runtime CLI: `air run --file train.yaml` executes `python train.py` on serverless GPUs.
 
 # COMMAND ----------
 
+# train.yaml's top-level `experiment_name` is the only place the experiment is
+# named: the AI Runtime CLI resolves it to /Users/<user>/<experiment_name>, and
+# resolve_experiment_path derives the same path here so notebook runs and CLI
+# runs share one experiment.
 import mlflow
-mlflow.set_experiment("/Users/ben.doan@databricks.com/unsloth_qwen3_4b_training")
+
+MLFLOW_EXPERIMENT_PATH = resolve_experiment_path(EXPERIMENT_NAME)
+mlflow.set_experiment(MLFLOW_EXPERIMENT_PATH)
+
+print(f"MLflow experiment: {MLFLOW_EXPERIMENT_PATH}")
 
 # COMMAND ----------
 
 from serverless_gpu import distributed
 
-# Override sampling fraction (set to 1.0 to use all data). Notebook runs use
-# this value; train.yaml's training_sample_fraction is only the AIR CLI default.
-TRAINING_SAMPLE_FRACTION = 0.001
+# TRAINING_SAMPLE_FRACTION comes from train.yaml's `training_sample_fraction`
+# (bound above by load_training_config), so notebook and AI Runtime CLI runs
+# train on the same slice of data; set 1.0 there to use every row. Uncomment the
+# line below only for a one-off experiment that should not change the config.
+# TRAINING_SAMPLE_FRACTION = 0.01
 
-@distributed(gpus=8, gpu_type="h100")
+@distributed(gpus=1, gpu_type="h100")
 def run_training_job():
     import sys
 
@@ -196,7 +213,10 @@ def run_training_job():
 
     from train import run_rank_training
 
-    return run_rank_training(sample_fraction=TRAINING_SAMPLE_FRACTION)
+    return run_rank_training(
+        sample_fraction=TRAINING_SAMPLE_FRACTION,
+        experiment_path=MLFLOW_EXPERIMENT_PATH,
+    )
 
 distributed_run_ids = run_training_job.distributed()
 TRAINING_RUN_ID = next((run_id for run_id in distributed_run_ids if run_id), None)
@@ -209,50 +229,129 @@ print(f"Trained adapter output dir: {TRAINED_ADAPTER_OUTPUT_DIR}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Register the trained model for custom LLM serving
+# MAGIC ## Merge the trained adapter
 # MAGIC
-# MAGIC Registration is separate from training so the distributed training cell stays focused on GPU optimization and adapter checkpointing.
-# MAGIC This cell loads the rank-0 adapter artifacts saved by training, merges them with the base model, packages the merged Hugging Face weights into an MLflow model artifact, and registers that model to Unity Catalog.
+# MAGIC Registration is split into three cells — merge, install the serving stack, register — because the training and serving environments cannot share one Python session.
+# MAGIC vLLM requires `opencv-python-headless>=4.13`, whose bundled OpenSSL aborts with `FATAL FIPS SELFTEST FAILURE` on Model Serving's FIPS pods, so opencv must be forced back to `4.12.0.88` in a second `pip` pass. A single `pip_requirements` list is resolved in one pass and cannot express that conflict, so the environment is built here in the notebook and captured by `env_pack` instead.
 # MAGIC
-# MAGIC Databricks custom LLM serving runs a vLLM OpenAI-compatible server from a custom MLflow entrypoint. The important serving choices are visible below:
+# MAGIC This cell merges the rank-0 LoRA adapter into the base weights and writes plain Hugging Face weights to `/local_disk0`, which survives the `%restart_python` below and avoids the EAGAIN failures that large safetensors writes hit on `/Volumes`.
 # MAGIC
-# MAGIC - `task` is `llm/v1/chat`, matching the chat request contract used by the serving endpoint.
-# MAGIC - The vLLM process listens on port `8080`, which is the port Model Serving expects.
-# MAGIC - The entrypoint launches from the MLflow model's `artifacts/` folder, so the `--model` path is the bare artifact name relative to that folder.
-# MAGIC - Registration uses `env_pack="databricks_model_serving"` so Databricks can build the express serving environment.
-# MAGIC - The serving container installs vLLM from `pip_requirements`, not from `requirements.txt`. The pins `vllm==0.11.0`, `transformers<5`, and `opencv-python-headless==4.12.0.88` are the combination that runs on Model Serving's FIPS-enabled pods, and the base model architecture (`Qwen3ForCausalLM`) is in this vLLM's supported model list.
-# MAGIC
-# MAGIC Keeping registration as a separate step also makes reruns cheaper: if training succeeds but registration or deployment fails, rerun only this section.
+# MAGIC Splitting registration from training also makes reruns cheap: if training succeeds but registration or deployment fails, rerun only these cells.
 
 # COMMAND ----------
 
-from train import load_unsloth_model
+from train import load_adapter_model
+from training_utils import local_staging_dir
 
-CUSTOM_LLM_TASK = "llm/v1/chat"
-CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen3_fraud_model"
-
-
-def local_model_work_dir() -> Path:
-    import tempfile
-
-    local_disk_tmp = Path("/local_disk0/tmp")
-    if local_disk_tmp.exists():
-        return Path(tempfile.mkdtemp(prefix="air-custom-llm-", dir=local_disk_tmp))
-    return Path(tempfile.mkdtemp(prefix="air-custom-llm-"))
+CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen35_fraud_model"
+# Node-local staging, resolved the same way on both sides of the %restart_python
+# below. Not /Volumes: large safetensors writes there have failed with EAGAIN.
+MERGE_WORK_ROOT = local_staging_dir("air-demo-merged")
+MERGED_MODEL_DIR = MERGE_WORK_ROOT / CUSTOM_LLM_MODEL_ARTIFACT_NAME
+MERGE_METADATA_PATH = MERGE_WORK_ROOT / "merge_metadata.json"
 
 
-def register_custom_llm_model(adapter_output_dir: str, run_name: str):
+def merge_adapter_to_local_disk(adapter_output_dir: str) -> Path:
     import shutil
 
-    import mlflow
+    model, tokenizer = load_adapter_model(adapter_output_dir)
+    merged_model = model.merge_and_unload()
 
+    if MERGED_MODEL_DIR.exists():
+        shutil.rmtree(MERGED_MODEL_DIR)
+    MERGED_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    merged_model.save_pretrained(MERGED_MODEL_DIR, safe_serialization=True)
+    tokenizer.save_pretrained(MERGED_MODEL_DIR)
+    return MERGED_MODEL_DIR
+
+
+if REGISTER_MODEL:
+    if "TRAINED_ADAPTER_OUTPUT_DIR" not in globals() or not TRAINED_ADAPTER_OUTPUT_DIR:
+        raise ValueError("Run the training cell before merging the adapter.")
+
+    merge_adapter_to_local_disk(TRAINED_ADAPTER_OUTPUT_DIR)
+    # %restart_python clears the session, so hand the registration cell what it
+    # needs through a file rather than Python state.
+    MERGE_METADATA_PATH.write_text(
+        json.dumps(
+            {
+                "adapter_output_dir": TRAINED_ADAPTER_OUTPUT_DIR,
+                "training_run_id": TRAINING_RUN_ID,
+                "merged_model_dir": str(MERGED_MODEL_DIR),
+            }
+        )
+    )
+    print(f"Merged weights: {MERGED_MODEL_DIR}")
+else:
+    print("Merge skipped because register_model is false in train.yaml.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Install the serving stack (two pip passes)
+# MAGIC
+# MAGIC These pins mirror a Custom LLM Serving deployment validated on a live workspace, and the order matters:
+# MAGIC
+# MAGIC 1. **vLLM first.** `vllm==0.24.0` is the version proven on Custom LLM Serving and new enough to register Qwen3.5's architecture. `mlflow==3.12` is uninstallable beside it (starlette conflict), hence `mlflow==3.14.0`.
+# MAGIC 2. **opencv second**, downgrading what vLLM just pulled in. `pip` prints a dependency-conflict warning and that is expected. Anything `>=4.13` bundles an OpenSSL that fails the FIPS self-test and aborts vLLM at startup.
+# MAGIC 3. `flashinfer-cubin` is **not** pinned here: vLLM depends on an exact version (`vllm==0.24.0` requires `flashinfer-cubin==0.6.12`), so pinning one yourself is an instant `ResolutionImpossible`. Databricks' starter notebook pins `0.5.2` because it pairs with `vllm==0.11.2`. Either way the precompiled cubins arrive, which is what stops the sampler JIT-compiling in a container with no `ninja`/`nvcc`.
+# MAGIC
+# MAGIC `env_pack="databricks_model_serving"` packs this environment into the registered model version, which is why the serving stack is installed here instead of declared as `pip_requirements`.
+# MAGIC
+# MAGIC **Security note for anyone reusing this pattern:** `opencv-python-headless<4.13` carries a known RCE CVE. That is precisely why the managed Foundation Model path will not ship this combination centrally, and it should be called out to customers alongside the recipe.
+
+# COMMAND ----------
+
+# MAGIC %pip install vllm==0.24.0 transformers==5.13.0 mlflow==3.14.0 openai==2.17.0 hf_transfer==0.1.9 databricks-sdk>=0.102.0
+# MAGIC %pip install opencv-python-headless==4.12.0.88
+# MAGIC %restart_python
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Register the merged model for custom LLM serving
+# MAGIC
+# MAGIC `%restart_python` cleared the session, so this cell re-derives its configuration from `train.yaml` and reads the merge hand-off file. The serving choices worth seeing:
+# MAGIC
+# MAGIC - `task` is `llm/v1/chat`, matching the request contract the endpoint and the load test use.
+# MAGIC - The vLLM process listens on port `8080`, the port Model Serving expects.
+# MAGIC - The entrypoint launches from the model's `artifacts/` folder, so `--model` is the bare artifact name. An `artifacts/` prefix makes vLLM treat it as a Hugging Face repo id and fail with a 401.
+# MAGIC - `--language-model-only` serves Qwen3.5's text backbone and skips the vision tower this task never uses.
+# MAGIC - Registration requires `env_pack="databricks_model_serving"`: custom LLM serving runs on [Serverless Optimized Deployments](https://docs.databricks.com/aws/en/machine-learning/model-serving/serverless-optimized-deployments).
+
+# COMMAND ----------
+
+import json
+import sys
+from pathlib import Path
+
+NOTEBOOK_DIR = str(Path.cwd())
+if NOTEBOOK_DIR not in sys.path:
+    sys.path.insert(0, NOTEBOOK_DIR)
+
+import mlflow
+import pandas as pd
+
+from training_utils import load_training_config, local_staging_dir, resolve_experiment_path
+
+# The restart wiped the bindings from the configuration cell; reload them so the
+# registration and deployment cells see the same constants as training did.
+globals().update(load_training_config())
+mlflow.set_experiment(resolve_experiment_path(EXPERIMENT_NAME))
+
+CUSTOM_LLM_TASK = "llm/v1/chat"
+CUSTOM_LLM_MODEL_ARTIFACT_NAME = "qwen35_fraud_model"
+MERGE_METADATA_PATH = local_staging_dir("air-demo-merged") / "merge_metadata.json"
+
+
+def register_custom_llm_model(merge_metadata: dict):
     mlflow.set_registry_uri("databricks-uc")
 
     # Defined inline (not in train.py/training_utils.py) on purpose: cloudpickle
     # serializes notebook-local classes BY VALUE, so the serving container can
-    # unpickle the model without any repo code and no code_paths are needed in
-    # log_model. If this class ever moves into a module or imports repo helpers,
-    # registration must add code_paths=["train.py", "training_utils.py"].
+    # unpickle the model without any repo code and no code_paths are needed.
+    # Serving runs the vLLM entrypoint, never this predict method.
     class CustomLlmEntrypointPlaceholder(mlflow.pyfunc.PythonModel):
         def predict(self, context, model_input, params=None):
             return {
@@ -275,6 +374,9 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
             f"--model {CUSTOM_LLM_MODEL_ARTIFACT_NAME} "
             f"--served-model-name {SERVED_MODEL_NAME} "
             "--host 0.0.0.0 --port 8080 "
+            # Qwen3.5 checkpoints carry a vision tower; this fraud task is
+            # text-only, and skipping it saves GPU memory and startup time.
+            "--language-model-only "
             # All fraud prompts share the same instruction header, so prefix
             # caching skips most prefill work (explicit for visibility; the
             # vLLM v1 engine defaults it on).
@@ -294,65 +396,45 @@ def register_custom_llm_model(adapter_output_dir: str, run_name: str):
         ],
         "max_tokens": 64,
         "temperature": 0.0,
+        # Qwen3.5 thinks by default and has no non-thinking variant; training
+        # rendered with enable_thinking=False, so serving must match.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
-    temp_dir = local_model_work_dir()
-    try:
-        merged_model_dir = temp_dir / CUSTOM_LLM_MODEL_ARTIFACT_NAME
-
-        model, tokenizer = load_unsloth_model(adapter_output_dir)
-
-        merged_model = model.merge_and_unload()
-        merged_model.save_pretrained(merged_model_dir, safe_serialization=True)
-        tokenizer.save_pretrained(merged_model_dir)
-
-        with mlflow.start_run(run_name=run_name, log_system_metrics=True) as run:
-            mlflow.log_params(
-                {
-                    "base_model": MODEL_NAME,
-                    "adapter_output_dir": adapter_output_dir,
-                    "registered_model_name": FULL_MODEL_NAME,
-                    "source_training_run_id": TRAINING_RUN_ID,
-                    "custom_llm_task": CUSTOM_LLM_TASK,
-                    "custom_llm_model_artifact": CUSTOM_LLM_MODEL_ARTIFACT_NAME,
-                    "served_model_name": SERVED_MODEL_NAME,
-                    "vllm_dtype": VLLM_DTYPE,
-                    "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
-                    "vllm_gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
-                }
-            )
-            model_info = mlflow.pyfunc.log_model(
-                name="model",
-                python_model=CustomLlmEntrypointPlaceholder(),
-                artifacts={CUSTOM_LLM_MODEL_ARTIFACT_NAME: str(merged_model_dir)},
-                input_example=input_example,
-                pip_requirements=[
-                    "mlflow>=3.12.0",
-                    # FIPS-safe combination for Model Serving pods: vllm 0.11.0 is
-                    # the newest vLLM whose opencv floor (>=4.11) still admits
-                    # opencv 4.12.0.88 — the 4.13+ builds bundle an OpenSSL that
-                    # dies with FATAL FIPS SELFTEST FAILURE (vllm>=0.15 floors
-                    # opencv at 4.13, so it cannot be made FIPS-safe). vLLM of
-                    # this era also needs transformers 4.x: transformers 5 removed
-                    # tokenizer attributes (all_special_tokens_extended) it reads.
-                    "vllm==0.11.0",
-                    "transformers>=4.56.0,<5",
-                    "opencv-python-headless==4.12.0.88",
-                    "accelerate>=1.11.0",
-                    "safetensors>=0.5.0",
-                    "torch",
-                ],
-                metadata=metadata,
-            )
-            model_version = mlflow.register_model(
-                model_uri=model_info.model_uri,
-                name=FULL_MODEL_NAME,
-                await_registration_for=3600,
-                env_pack="databricks_model_serving"
-
-            )
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+    with mlflow.start_run(
+        run_name=f"{TRAINING_RUN_NAME}-registration", log_system_metrics=True
+    ) as run:
+        mlflow.log_params(
+            {
+                "base_model": MODEL_NAME,
+                "adapter_output_dir": merge_metadata["adapter_output_dir"],
+                "registered_model_name": FULL_MODEL_NAME,
+                "source_training_run_id": merge_metadata["training_run_id"],
+                "custom_llm_task": CUSTOM_LLM_TASK,
+                "custom_llm_model_artifact": CUSTOM_LLM_MODEL_ARTIFACT_NAME,
+                "served_model_name": SERVED_MODEL_NAME,
+                "vllm_dtype": VLLM_DTYPE,
+                "vllm_max_model_len": VLLM_MAX_MODEL_LEN,
+                "vllm_gpu_memory_utilization": VLLM_GPU_MEMORY_UTILIZATION,
+            }
+        )
+        model_info = mlflow.pyfunc.log_model(
+            name="model",
+            python_model=CustomLlmEntrypointPlaceholder(),
+            artifacts={CUSTOM_LLM_MODEL_ARTIFACT_NAME: merge_metadata["merged_model_dir"]},
+            input_example=input_example,
+            # Deliberately NOT pip_requirements: the environment installed above
+            # (vLLM 0.24 with opencv held at 4.12.0.88) is what env_pack captures,
+            # and a single requirements list cannot express that conflicting pair.
+            extra_pip_requirements=["mlflow==3.14.0"],
+            metadata=metadata,
+        )
+        model_version = mlflow.register_model(
+            model_uri=model_info.model_uri,
+            name=FULL_MODEL_NAME,
+            await_registration_for=3600,
+            env_pack="databricks_model_serving",
+        )
 
     return {
         "registration_run_id": run.info.run_id,
@@ -368,12 +450,11 @@ registration_result = None
 REGISTERED_MODEL_VERSION = None
 
 if REGISTER_MODEL:
-    if "TRAINED_ADAPTER_OUTPUT_DIR" not in globals() or not TRAINED_ADAPTER_OUTPUT_DIR:
-        raise ValueError("Run the training cell before registering the model.")
+    if not MERGE_METADATA_PATH.exists():
+        raise ValueError("Run the merge cell before registering the model.")
 
     registration_result = register_custom_llm_model(
-        adapter_output_dir=TRAINED_ADAPTER_OUTPUT_DIR,
-        run_name=f"{TRAINING_RUN_NAME}-registration",
+        json.loads(MERGE_METADATA_PATH.read_text())
     )
     REGISTERED_MODEL_VERSION = str(registration_result["model_version"])
     display(pd.DataFrame([registration_result]))
@@ -395,7 +476,7 @@ else:
 # MAGIC - `serving_workload_size` controls provisioned capacity behind the endpoint.
 # MAGIC - `serving_scale_to_zero` is useful for demos and development, but should be disabled for latency-sensitive production traffic.
 # MAGIC
-# MAGIC The served entity also sets `VLLM_USE_FLASHINFER_SAMPLER=0`: the serving container cannot JIT-compile FlashInfer kernels (no `ninja`/`nvcc`), so vLLM must use its native PyTorch sampler.
+# MAGIC The served entity also sets `VLLM_USE_FLASHINFER_SAMPLER=0`: the serving container cannot JIT-compile FlashInfer kernels (no `ninja`/`nvcc`), so vLLM falls back to its native PyTorch sampler. Now that `flashinfer-cubin` is installed with the serving stack, the precompiled kernels are present and this variable can be dropped to get the faster sampler back — worth testing once the endpoint is otherwise healthy.
 # MAGIC
 # MAGIC Custom LLM serving is currently a fixed-capacity serving path during beta. Size the workload for the traffic target before running a high-QPS load test.
 
@@ -544,6 +625,10 @@ serving_payload = {
     ],
     "max_tokens": 64,
     "temperature": 0.0,
+    # Qwen3.5 thinks by default; training rendered with enable_thinking=False, so
+    # every request must suppress it too or the JSON arrives truncated behind a
+    # reasoning preamble. The load test sends the same field.
+    "chat_template_kwargs": {"enable_thinking": False},
 }
 
 print(f"Registered model name: {FULL_MODEL_NAME}")
@@ -569,7 +654,7 @@ print(json.dumps(serving_payload, indent=2))
 # MAGIC
 # MAGIC - Databricks AI Runtime: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/
 # MAGIC - Serverless GPU H100 starter: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-api-h100-starter
-# MAGIC - Databricks Unsloth example: https://docs.databricks.com/aws/en/machine-learning/ai-runtime/examples/tutorials/sgc-finetune-llama-unsloth
 # MAGIC - Custom LLM serving with vLLM: https://docs.databricks.com/aws/en/machine-learning/model-serving/serve-custom-llms
-# MAGIC - Unsloth Qwen3: https://unsloth.ai/docs/models/qwen3
-# MAGIC - Unsloth Qwen3 fine-tuning: https://unsloth.ai/docs/models/qwen3/fine-tune
+# MAGIC - TRL supervised fine-tuning: https://huggingface.co/docs/trl/en/sft_trainer
+# MAGIC - PEFT LoRA: https://huggingface.co/docs/peft/en/developer_guides/lora
+# MAGIC - Qwen3.5-4B: https://huggingface.co/Qwen/Qwen3.5-4B

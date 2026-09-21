@@ -1,5 +1,5 @@
-catalog: doan
-schema: air_dais
+catalog: ssa_team_sandbox_classic_catalog
+schema: air
 table: fraud_dataset
 sft_table: fraud_sft_dataset
 staging_volume: setup_assets
@@ -10,3 +10,24 @@ archive_filename: transactions.tgz
 force_download: false
 suspicious_amount_threshold: 500.0
 sft_shards: 128
+
+# Base model weights mirrored from Hugging Face into a Unity Catalog volume by
+# 02_load_model_weights_to_volume.py. `model_name` must stay equal to
+# train.yaml's parameters.training_config.model_name — the mirror is only useful
+# if it holds the checkpoint training and serving actually load.
+model_name: Qwen/Qwen3.5-4B
+model_volume: qwen_35_base
+# Branch, tag, or commit SHA on the Hub. Pin a SHA for a reproducible mirror.
+model_revision: main
+force_model_download: false
+# Repo files skipped by the mirror (fnmatch patterns against the repo-relative
+# path): alternate weight formats and consolidated duplicates that neither
+# transformers nor vLLM reads.
+model_ignore_patterns:
+  - "*.pth"
+  - "*.msgpack"
+  - "*.h5"
+  - "*.gguf"
+  - "*.onnx"
+  - "original/*"
+  - ".gitattributes"

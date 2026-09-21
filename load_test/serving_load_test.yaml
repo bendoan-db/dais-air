@@ -1,7 +1,7 @@
 catalog: doan
 schema: air_dais
 sft_table: fraud_sft_dataset
-endpoint_name: qwen3_4b_instruct_finetuned_lora
+endpoint_name: qwen35_4b_finetuned_lora
 results_table: serving_load_test_results
 
 target_qps: 1000
@@ -22,6 +22,10 @@ smoke_test_requests: 5
 max_latency_samples_per_worker: 10000
 
 # The fraud JSON answer needs ~50-60 tokens; a tight cap raises endpoint
-# throughput almost linearly (decode-bound) and trims latency.
+# throughput almost linearly (decode-bound) and trims latency. This only holds
+# while thinking is suppressed: Qwen3.5 has no non-thinking variant, so every
+# request sends chat_template_kwargs={"enable_thinking": false} and a reasoning
+# preamble would blow this budget.
 max_tokens: 64
+enable_thinking: false
 temperature: 0.0
