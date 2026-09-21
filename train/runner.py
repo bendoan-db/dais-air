@@ -527,9 +527,9 @@ def create_or_update_custom_llm_endpoint(model_version: str) -> dict:
         entity_name=FULL_MODEL_NAME,
         entity_version=str(model_version),
         workload_type=workload_type,
-        workload_size=SERVING_WORKLOAD_SIZE,
-        #min_provisioned_concurrency=256,
-        #max_provisioned_concurrency=256,
+        #workload_size=SERVING_WORKLOAD_SIZE,
+        min_provisioned_concurrency=4,
+        max_provisioned_concurrency=4,
         environment_vars={
             # The serving container has no ninja/nvcc, so FlashInfer (shipped in
             # the Databricks AI base env) cannot JIT-compile its sampling kernels
@@ -652,6 +652,45 @@ serving_payload = {
 print(f"Registered model name: {FULL_MODEL_NAME}")
 print(f"Serving endpoint name: {ENDPOINT_NAME}")
 print(json.dumps(serving_payload, indent=2))
+
+# COMMAND ----------
+
+import json
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+w = WorkspaceClient()
+
+response = w.serving_endpoints.query(
+    name="qwen35_4b_finetuned_lora",
+    messages=[
+        ChatMessage(
+            role=ChatMessageRole.USER,
+            content=(
+                "You are a fraud decision model for a credit-card transaction stream. "
+                "Classify the transaction as legitimate, suspicious, or likely_fraud. "
+                "Return only compact JSON with keys risk, action, and reason.\n\n"
+                "Transaction:\n"
+                "- user_id: 492\n"
+                "- card_id: 3\n"
+                "- timestamp: 2026-06-08 13:45:00\n"
+                "- amount_usd: 2499.99\n"
+                "- use_chip: Online Transaction\n"
+                "- merchant_city: Miami\n"
+                "- merchant_state: FL\n"
+                "- merchant_category_code: 5732\n"
+                "- errors: Bad PIN"
+            ),
+        )
+    ],
+    max_tokens=64,
+    temperature=0.0,
+    extra_params={"chat_template_kwargs": {"enable_thinking": False}},
+)
+
+# COMMAND ----------
+
+response.as_dict()['choices'][0]['message']['content']
 
 # COMMAND ----------
 
