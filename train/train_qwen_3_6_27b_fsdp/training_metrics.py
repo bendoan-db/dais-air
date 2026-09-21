@@ -3,7 +3,10 @@
 import re
 from collections.abc import Callable
 
-RISK_LABELS = ("legitimate", "suspicious", "likely_fraud")
+# The label set comes from the module that writes the training targets, so
+# scoring cannot drift from what the model is trained to emit.
+from sft_conversion import RISK_LABELS
+
 RISK_PATTERN = re.compile(
     r"""["']risk["']\s*:\s*["']([^"']+)["']""", re.IGNORECASE
 )

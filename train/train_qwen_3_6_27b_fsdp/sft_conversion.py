@@ -1,4 +1,10 @@
-"""Normalize raw fraud records or validate pre-converted SFT records."""
+"""Normalize raw fraud records or validate pre-converted SFT records.
+
+This module owns the fraud decision contract for the whole project: the prompt
+text, the three risk labels, and the action/reason attached to each label.
+``training_metrics.py`` imports ``RISK_LABELS`` from here so scoring can never
+drift from what training targets actually contain.
+"""
 
 import json
 
@@ -16,6 +22,25 @@ RAW_RECORD_COLUMNS = (
     "has_error_signal",
 )
 SFT_COLUMNS = ("prompt", "assistant_response")
+
+# risk label -> (action, reason). Ordered least to most severe; the metric
+# module iterates this to emit per-label precision/recall/F1.
+RISK_DECISIONS: dict[str, tuple[str, str]] = {
+    "legitimate": (
+        "approve",
+        "The historical label is non-fraud and no strong review signal is present.",
+    ),
+    "suspicious": (
+        "step_up_authentication",
+        "The transaction is not labeled fraud, but amount or error signals "
+        "warrant review.",
+    ),
+    "likely_fraud": (
+        "decline_and_escalate",
+        "The historical label marks this transaction as fraud.",
+    ),
+}
+RISK_LABELS = tuple(RISK_DECISIONS)
 
 
 def _require_columns(records_pdf, columns: tuple[str, ...], mode: str) -> None:
@@ -45,22 +70,19 @@ def render_fraud_prompt(record) -> str:
     )
 
 
-def render_fraud_response(record, suspicious_amount_threshold: float) -> str:
+def classify_risk(record, suspicious_amount_threshold: float) -> str:
+    """Assign one RISK_LABELS value to a raw record."""
+    if int(record["is_fraud"] or 0) == 1:
+        return "likely_fraud"
     needs_review = bool(record["has_error_signal"]) or (
         float(record["amount_usd"]) >= suspicious_amount_threshold
     )
-    if int(record["is_fraud"] or 0) == 1:
-        risk, action = "likely_fraud", "decline_and_escalate"
-        reason = "The historical label marks this transaction as fraud."
-    elif needs_review:
-        risk, action = "suspicious", "step_up_authentication"
-        reason = (
-            "The transaction is not labeled fraud, but amount or error signals "
-            "warrant review."
-        )
-    else:
-        risk, action = "legitimate", "approve"
-        reason = "The historical label is non-fraud and no strong review signal is present."
+    return "suspicious" if needs_review else "legitimate"
+
+
+def render_fraud_response(record, suspicious_amount_threshold: float) -> str:
+    risk = classify_risk(record, suspicious_amount_threshold)
+    action, reason = RISK_DECISIONS[risk]
     return json.dumps(
         {"risk": risk, "action": action, "reason": reason}, separators=(",", ":")
     )

@@ -6,7 +6,7 @@ experiment_name: air_hackathon_qwen_3_6_27b_fsdp
 mlflow_experiment_directory: /Workspace/Shared
 
 environment:
-  version: '5'
+  version: '6'
   dependencies:
     - -r requirements.txt
 
@@ -33,6 +33,22 @@ parameters:
 
     model_name: Qwen/Qwen3.6-27B
     model_weights_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3.6-27b
+    # Accepted AutoModelForCausalLM classes; loading anything else fails fast.
+    # Both the 3.5 and 3.6 text classes are listed because the pinned
+    # Transformers build reports Qwen3_5ForCausalLM for this config. Narrow this
+    # to one entry once the checkpoint's config.json architectures is confirmed.
+    expected_model_classes:
+      - Qwen3_5ForCausalLM
+      - Qwen3_6ForCausalLM
+    # Decoder block classes offered to FSDP2 auto-wrap. Only the classes the
+    # loaded model actually contains are wrapped; no match is an error.
+    fsdp_wrap_classes:
+      - Qwen3_5DecoderLayer
+      - Qwen3_5MoeDecoderLayer
+      - Qwen3_6DecoderLayer
+      - Qwen3_6MoeDecoderLayer
+      - Qwen3DecoderLayer
+      - Qwen2DecoderLayer
     train_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=train
     eval_data_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon_v2/sft_staging/fraud_sft_dataset/split=eval
     # false reads pre-converted prompt/assistant_response rows. When true,
@@ -71,7 +87,6 @@ parameters:
     best_run_metric_goal: minimize
 
     uc_model_name: qwen_3_6_27b_full_finetuned
-    served_model_name: qwen_3_6_27b_full_finetuned
     serving_requirements_file: requirements.txt
     serving_dtype: bfloat16
     serving_continuous_batching: true
