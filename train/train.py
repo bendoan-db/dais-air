@@ -22,6 +22,7 @@ from contextlib import nullcontext
 
 import pandas as pd
 from peft import LoraConfig
+from transformers import TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
 from pathlib import Path
@@ -91,6 +92,81 @@ LORA_TARGET_MODULES = [
     "up_proj",
     "down_proj",
 ]
+
+
+class MLflowStepMetricsCallback(TrainerCallback):
+    """Mirror the Trainer's per-step logs into the active MLflow run.
+
+    ``report_to="none"`` keeps Hugging Face's own ``MLflowCallback`` out of the
+    way: it re-logs every ``TrainingArguments`` field as a parameter and manages
+    the run's lifecycle, which collides with the run this module opens. This
+    forwards only metrics, keyed on ``global_step``.
+
+    Metric names are deliberately not hardcoded — whatever the installed
+    transformers/TRL emit per step is forwarded as-is, so ``loss``,
+    ``mean_token_accuracy``, ``grad_norm``, ``learning_rate``, ``entropy``,
+    ``num_tokens`` and ``epoch`` all land in MLflow (plus ``aux_loss`` on MoE
+    checkpoints) without this callback tracking TRL's metric set per version.
+    Two derived series are added because they are what a GPU-scaling demo is
+    actually judged on: tokens/second and CUDA memory.
+    """
+
+    def __init__(self):
+        self._last_tokens = None
+        self._last_time = None
+        self._warned = False
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        # Only rank 0 has an MLflow run open (see train_qwen3_sft); the other
+        # ranks would log into whatever run their process happened to inherit.
+        if not logs or not state.is_world_process_zero:
+            return
+
+        import math
+        import time
+
+        import mlflow
+
+        now = time.time()
+        metrics = {}
+        for key, value in logs.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if math.isfinite(value):
+                metrics[key] = float(value)
+
+        # Throughput from the cumulative token counter TRL maintains. The first
+        # log has no previous sample to difference against.
+        tokens = metrics.get("num_tokens")
+        if tokens is not None and self._last_tokens is not None:
+            elapsed = now - self._last_time
+            if elapsed > 0 and tokens >= self._last_tokens:
+                metrics["tokens_per_second"] = (tokens - self._last_tokens) / elapsed
+        if tokens is not None:
+            self._last_tokens, self._last_time = tokens, now
+
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                metrics["cuda_memory_allocated_gb"] = (
+                    torch.cuda.memory_allocated() / 1024**3
+                )
+                metrics["cuda_max_memory_allocated_gb"] = (
+                    torch.cuda.max_memory_allocated() / 1024**3
+                )
+        except Exception:  # noqa: BLE001 - telemetry must not fail a run
+            pass
+
+        if not metrics:
+            return
+
+        try:
+            mlflow.log_metrics(metrics, step=state.global_step)
+        except Exception as err:  # noqa: BLE001 - see above
+            if not self._warned:
+                self._warned = True
+                print(f"WARNING: per-step MLflow metric logging failed: {err}")
 
 
 def preferred_dtype():
@@ -441,6 +517,10 @@ def train_qwen3_sft(
         lr_scheduler_type="linear",
         seed=SEED,
         output_dir=output_dir,
+        # Per-step metrics reach MLflow through MLflowStepMetricsCallback rather
+        # than report_to="mlflow": HF's built-in callback also re-logs every
+        # TrainingArguments field as a param and owns the run lifecycle, which
+        # collides with the run opened below.
         report_to="none",
         run_name=run_name,
         save_strategy="steps",
@@ -462,6 +542,9 @@ def train_qwen3_sft(
         train_dataset=dataset,
         processing_class=tokenizer,
         peft_config=lora_config,
+        # logging_steps=1 above means this fires every step; the callback is a
+        # no-op on non-zero ranks.
+        callbacks=[MLflowStepMetricsCallback()],
     )
 
     run_context = (
