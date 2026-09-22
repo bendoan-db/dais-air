@@ -90,12 +90,6 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC # Fine-tune Qwen3.5 4B for fraud decisions with AI Runtime
 # MAGIC
 # MAGIC ![](/Workspace/Users/ben.doan@databricks.com/dais-air/train/images/Screenshot 2026-06-11 at 12.04.39 PM.png)
-# MAGIC
-# MAGIC This notebook shows how to fine-tune a small language model for real-time credit-card fraud decisions on Databricks AI Runtime. 
-# MAGIC
-# MAGIC The workflow uses the IBM TabFormer credit-card dataset loaded and prepared by `setup/01_load_tabformer_dataset.py`.
-# MAGIC The setup notebook creates both a cleaned transaction table and a supervised fine-tuning table with prompt/response records. This notebook samples or shards those SFT rows, fine-tunes with Hugging Face TRL supervised fine-tuning and PEFT LoRA, logs with MLflow, and optionally registers the model to Unity Catalog for serving.
-# MAGIC
 # MAGIC **Features demonstrated in this notebook**
 # MAGIC
 # MAGIC - **On-demand GPU access:** run deep learning workloads on serverless GPU compute without provisioning or maintaining GPU clusters.
@@ -103,10 +97,7 @@ print(f"SFT table: {sft_table_q}")
 # MAGIC - **Unified data and governance:** read source transactions from Unity Catalog Delta tables and write checkpoints, adapters, and models to governed Unity Catalog assets.
 # MAGIC - **Simple scaling path:** start with `@distributed(gpus=1)`, then change that single decorator parameter to use multiple GPUs while the training code stays the same.
 # MAGIC - **Operational handoff:** use MLflow and Unity Catalog to move from experimentation toward managed custom LLM serving.
-
-# COMMAND ----------
-
-# MAGIC %md
+# MAGIC
 # MAGIC ## Business scenario and model contract
 # MAGIC
 # MAGIC Fraud detection is a high-volume, low-latency decision problem. A production payment system needs a clear response for each transaction: approve it, ask for additional authentication, or decline and escalate it. We will finetune `Qwen/Qwen3.5-4B` to emit a structured fraud decision with additional triage steps.
@@ -147,7 +138,7 @@ print(f"SFT table: {sft_table_q}")
 
 # COMMAND ----------
 
-display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd', 'user_id_text', 'card_id_text', 'transaction_ts_text', 'merchant_city_text', 'merchant_state_text', 'mcc_text', 'errors_text', 'has_error_signal'))
+display(spark.table(sft_table_q).select('messages_json', 'assistant_response'))
 
 # COMMAND ----------
 
@@ -171,31 +162,6 @@ display(spark.table(sft_table_q).select('fraud_label', 'is_fraud', 'amount_usd',
 
 # COMMAND ----------
 
-# MAGIC %md
-# MAGIC ## Scale training by changing one decorator parameter
-# MAGIC
-# MAGIC This is the only training cell in the demo: a thin wrapper that imports `train.py` on each GPU worker and runs one rank of training.
-# MAGIC Run it first with `gpus=1` to validate the workflow, then change the decorator to `gpus=8` and rerun the same cell to distribute training across multiple GPUs.
-# MAGIC `train.yaml`'s `training_sample_fraction` controls how much of each rank's shard slice is used — raise it there to broaden the dataset between runs (or pass `--override parameters.training_config.training_sample_fraction=...` to `air run`).
-# MAGIC
-# MAGIC Each worker reads its rank-assigned `shard_id=N` parquet directories from the UC volume inside `run_rank_training`, so nothing large ships from the notebook driver to the GPU workers.
-# MAGIC The same function runs without a notebook through the AI Runtime CLI: `air run --file train.yaml` executes `python train.py` on serverless GPUs.
-
-# COMMAND ----------
-
-# train.yaml's top-level `experiment_name` is the only place the experiment is
-# named: the AI Runtime CLI resolves it to /Users/<user>/<experiment_name>, and
-# resolve_experiment_path derives the same path here so notebook runs and CLI
-# runs share one experiment.
-import mlflow
-
-MLFLOW_EXPERIMENT_PATH = resolve_experiment_path(EXPERIMENT_NAME)
-mlflow.set_experiment(MLFLOW_EXPERIMENT_PATH)
-
-print(f"MLflow experiment: {MLFLOW_EXPERIMENT_PATH}")
-
-# COMMAND ----------
-
 from serverless_gpu import distributed
 
 # TRAINING_SAMPLE_FRACTION comes from train.yaml's `training_sample_fraction`
@@ -203,6 +169,13 @@ from serverless_gpu import distributed
 # train on the same slice of data; set 1.0 there to use every row. Uncomment the
 # line below only for a one-off experiment that should not change the config.
 # TRAINING_SAMPLE_FRACTION = 0.01
+
+import mlflow
+
+MLFLOW_EXPERIMENT_PATH = resolve_experiment_path(EXPERIMENT_NAME)
+mlflow.set_experiment(MLFLOW_EXPERIMENT_PATH)
+
+print(f"MLflow experiment: {MLFLOW_EXPERIMENT_PATH}")
 
 @distributed(gpus=1, gpu_type="h100")
 def run_training_job():
@@ -256,7 +229,7 @@ MERGE_METADATA_PATH = MERGE_WORK_ROOT / "merge_metadata.json"
 def merge_adapter_to_local_disk(adapter_output_dir: str) -> Path:
     import shutil
 
-    if MERGED_MODEL_DIR.exists():
+    if MERGED_MODEL_DIR.exists() and os.access(MERGED_MODEL_DIR, os.W_OK):
         shutil.rmtree(MERGED_MODEL_DIR)
     MERGED_MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
