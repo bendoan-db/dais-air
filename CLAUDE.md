@@ -22,6 +22,8 @@ Training is intentionally split into independent directories:
 - `train/train_gpt_oss_fsdp/`: TRL + PEFT + FSDP2 for GPT-OSS 120B.
 - `train/train_qwen_3_6_27b_fsdp/`: full-weight TRL + FSDP2 for Qwen3.6 27B.
 - `train/train_qwen3_4b_fsdp/`: full-weight TRL + FSDP2 for Qwen3 4B.
+- `train/train_qwen_3_5_trl/`: TRL `SFTTrainer` + PEFT LoRA + DDP for
+  Qwen3.5-4B on serverless GPU environment v6 (no Unsloth).
 
 Each project contains `01_runner.py`, `train.py`, `train.yaml`,
 `project_config.py`, and `requirements.txt`. Its YAML owns all runtime inputs:
@@ -43,10 +45,15 @@ cd train/train_phi_4_unsloth && COPYFILE_DISABLE=1 air run --file train.yaml --w
 cd train/train_gpt_oss_fsdp && COPYFILE_DISABLE=1 air run --file train.yaml --watch
 cd train/train_qwen_3_6_27b_fsdp && COPYFILE_DISABLE=1 air run --file train.yaml --watch
 cd train/train_qwen3_4b_fsdp && COPYFILE_DISABLE=1 air run --file train.yaml --watch
+cd train/train_qwen_3_5_trl && COPYFILE_DISABLE=1 air run --file train.yaml --watch
 ```
 
 The workload snapshot must remain rooted at `.` and execute
-`$CODE_SOURCE_PATH/train.py`. `$HYPERPARAMETERS_PATH` may contain either the
+`$CODE_SOURCE_PATH/train.py`. AIR runs `command` once per node and sets
+`WORLD_SIZE` but not `RANK`; the Qwen3.5 project therefore launches through
+`torchrun --nproc_per_node=gpu` and its `get_distributed_context()` prefers
+`RANK`/`WORLD_SIZE` over `serverless_gpu`, which reports the workload rank in
+every torchrun process. `$HYPERPARAMETERS_PATH` may contain either the
 full workload or only `parameters`; project loaders support both shapes.
 
 ## Data and Artifact Contracts
@@ -59,7 +66,7 @@ containing `shard_id=N/*.parquet`. Each rank claims shards where
 worked example produces them with `train/prep_sft.py` in a separate UC volume.
 `convert_sft: true` requires the raw fraud columns defined in each project's
 `sft_conversion.py` and converts each rank's loaded sample once before trainer
-construction. Keep `train/prep_sft.py`, the five project-local converters, and
+construction. Keep `train/prep_sft.py`, every project-local converter, and
 the load-test renderer synchronized when changing the worked example.
 
 `ignore_partitions: false` preserves rank-to-shard assignment.
@@ -131,6 +138,16 @@ projects select `model_output_dir` and package the complete checkpoint
 directly. Qwen3 4B uses vLLM; Qwen3.6 uses the Transformers 5 OpenAI-compatible
 server because vLLM 0.11 does not support it.
 
+Qwen3.5 serves on vLLM 0.24, which implements but does not register
+`Qwen3_5ForCausalLM`. Its merge therefore grafts the fine-tuned text backbone
+back into the base `Qwen3_5ForConditionalGeneration` checkpoint (vision tower
+included) and serves with `--language-model-only`. The merge also rewrites the
+saved chat template so thinking is off unless a request opts in. Its
+`02_register_and_deploy.py` merges in the training environment, installs
+`serving_requirements.txt` and then `opencv-python-headless==4.12.0.88` as a
+second pip pass, restarts Python, and registers with `env_pack` plus only the
+MLflow pin; state crosses the restart through `merge_metadata.json`.
+
 Keep these serving requirements unless the platform constraints are retested:
 
 - `transformers==4.57.6`
@@ -142,14 +159,17 @@ Keep these serving requirements unless the platform constraints are retested:
 - `VLLM_USE_FLASHINFER_SAMPLER=0`
 
 These pins apply to every project except Qwen3.6, which owns a separate
-Transformers 5 serving environment in its local `requirements.txt`.
+Transformers 5 serving environment in its local `requirements.txt`, and
+Qwen3.5, whose `serving_requirements.txt` pins `vllm==0.24.0`,
+`transformers==5.13.0`, and `mlflow==3.14.0` (3.12 conflicts with that vLLM).
 
 The entrypoint listens on port 8080 and receives the bare MLflow artifact name,
 not an `artifacts/`-prefixed path. Custom LLM registration uses
 `env_pack="databricks_model_serving"`. During beta, `GPU_XLARGE` requires
 enrollment, is AWS `us-west-2` only, and cannot use scale-to-zero.
 Qwen3.5 is not supported by the pinned FIPS-safe serving stack; the worked
-example uses the non-thinking Qwen3 Instruct variant.
+example uses the non-thinking Qwen3 Instruct variant, and only
+`train_qwen_3_5_trl/` uses the separate vLLM 0.24 stack above.
 
 ## Configuration Ownership
 

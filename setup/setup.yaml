@@ -55,3 +55,5 @@ models:
     volume_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/microsoft-phi-4
   - huggingface_path: Qwen/Qwen3.6-27B
     volume_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3.6-27b
+  - huggingface_path: Qwen/Qwen3.5-4B
+    volume_path: /Volumes/catalog_sandbox_5nwjwb/air_hackathon/model_weights/qwen3.5-4b

@@ -1,0 +1,16 @@
+# First pip pass of the Qwen3.5 serving environment that
+# 02_register_and_deploy.py installs and env_pack captures. vLLM 0.24 is the
+# version proven on custom LLM serving that registers Qwen3.5's architecture;
+# mlflow 3.12 cannot install beside it (starlette conflict).
+#
+# The second pass lives in the notebook, not here: it forces
+# opencv-python-headless==4.12.0.88 because >=4.13 fails Model Serving's FIPS
+# self-test. pip resolves this file in one pass, and vLLM's opencv>=4.13 floor
+# makes that pin unsatisfiable alongside it. Do not pin flashinfer-cubin; vLLM
+# requires one exact version and pulls it itself.
+vllm==0.24.0
+transformers==5.13.0
+mlflow==3.14.0
+openai==2.17.0
+hf_transfer==0.1.9
+databricks-sdk>=0.102.0

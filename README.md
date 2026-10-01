@@ -5,13 +5,14 @@ training open-source LLMs, registering models in Unity Catalog, deploying them
 through custom LLM serving, load testing, and monitoring serving traffic.
 
 The worked example classifies IBM TabFormer credit-card transactions with a
-fine-tuned Qwen3 model. Training is split into five independent projects:
+fine-tuned Qwen3 model. Training is split into six independent projects:
 
 - `train/train_qwen_unsloth/`: Qwen3-4B with Unsloth LoRA and DDP.
 - `train/train_phi_4_unsloth/`: Microsoft Phi-4 with Unsloth LoRA and DDP.
 - `train/train_gpt_oss_fsdp/`: GPT-OSS 120B with TRL, PEFT, and FSDP2.
 - `train/train_qwen_3_6_27b_fsdp/`: Qwen3.6 27B full-weight training with FSDP2.
 - `train/train_qwen3_4b_fsdp/`: Qwen3 4B full-weight training with FSDP2.
+- `train/train_qwen_3_5_trl/`: Qwen3.5-4B with TRL, PEFT LoRA, and DDP on AI v6.
 
 Each project owns its runner notebook, trainer, metric adapter, requirements,
 workload YAML, and config loader. Its YAML contains the catalog, schema,
@@ -33,6 +34,7 @@ or another training project.
 | `train/train_gpt_oss_fsdp/` | Standalone GPT-OSS FSDP training and deployment project. |
 | `train/train_qwen_3_6_27b_fsdp/` | Standalone Qwen3.6 full-weight FSDP training and deployment project. |
 | `train/train_qwen3_4b_fsdp/` | Standalone Qwen3 4B full-weight FSDP training and deployment project. |
+| `train/train_qwen_3_5_trl/` | Standalone Qwen3.5 TRL LoRA training and vLLM 0.24 deployment project. |
 | `load_test/` | Paced asynchronous serving load test with stage-local `utils.py`. |
 | `monitor/01_unpack_inference_table.py` | Incrementally unpack AI Gateway inference payloads. |
 | `monitor/02_create_quality_monitor.py` | Build the training baseline and data quality monitor. |
@@ -120,6 +122,7 @@ Notebook entrypoints:
 - `train/train_gpt_oss_fsdp/01_runner.py`
 - `train/train_qwen_3_6_27b_fsdp/01_runner.py`
 - `train/train_qwen3_4b_fsdp/01_runner.py`
+- `train/train_qwen_3_5_trl/01_runner.py`
 
 AIR CLI entrypoints:
 
@@ -137,6 +140,9 @@ cd ../train_qwen_3_6_27b_fsdp
 COPYFILE_DISABLE=1 air run --file train.yaml --watch
 
 cd ../train_qwen3_4b_fsdp
+COPYFILE_DISABLE=1 air run --file train.yaml --watch
+
+cd ../train_qwen_3_5_trl
 COPYFILE_DISABLE=1 air run --file train.yaml --watch
 ```
 
@@ -211,8 +217,14 @@ Each project's serving environment is its local `requirements.txt`. All
 projects except Qwen3.6 retain the FIPS-safe `transformers==4.57.6`,
 `vllm==0.11.2`, and `opencv-python-headless==4.12.0.88` stack. Qwen3.6 is not
 supported by that vLLM version, so its standalone project pins Transformers 5
-and serves through `transformers serve`. Do not unify these environments
-without retesting model architecture support and the target serving image.
+and serves through `transformers serve`. Qwen3.5 needs vLLM 0.24, which
+conflicts with the FIPS-safe OpenCV pin in a single resolve, so its project
+installs `serving_requirements.txt` and then `opencv-python-headless==4.12.0.88`
+in two pip passes and registers that environment with `env_pack`. Its merge
+saves the base composite (vision + text) checkpoint shape that vLLM 0.24
+registers and makes thinking opt-in in the served chat template. Do not unify
+these environments without retesting model architecture support and the
+target serving image.
 
 ## Local Development
 
